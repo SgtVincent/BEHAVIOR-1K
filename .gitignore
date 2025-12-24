@@ -1,3 +1,9 @@
+**/build/
+**/__pycache__/
+**/*.pyc
+**/*.egg
+**/*.egg-info/
+.github/
 gha-creds-*.json
 /site
 .vscode
@@ -6,3 +12,4 @@ gha-creds-*.json
 # training
 outputs/
 /*.ipynb
+eval_logs/**
