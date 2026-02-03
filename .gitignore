@@ -7,9 +7,12 @@
 gha-creds-*.json
 /site
 .vscode
+.trae/
 .DS_Store
 
 # training
 outputs/
 /*.ipynb
 eval_logs/**
+*_logs*/
+*_reports*/

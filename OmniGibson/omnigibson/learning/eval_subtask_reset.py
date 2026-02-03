@@ -23,6 +23,7 @@ import h5py
 import hydra
 import json
 import logging
+import math
 import numpy as np
 import omnigibson as og
 import omnigibson.utils.transform_utils as T
@@ -38,6 +39,7 @@ from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.eval_utils import (
     ROBOT_CAMERA_NAMES,
     PROPRIOCEPTION_INDICES,
+    PROPRIO_QPOS_INDICES,
     TASK_NAMES_TO_INDICES,
     flatten_obs_dict,
 )
@@ -111,8 +113,139 @@ class SubTaskEvaluator(Evaluator):
         self._video_primitive_progress = None
         self._video_primitive_idx = None
         self._video_n_primitives = None
+
+        # Debug / reporting for primitive-level success criteria
+        self._last_primitive_state_errors: Optional[Dict[str, float]] = None
+        self._last_primitive_success_reason: Optional[str] = None
         
         logger.info("SubTaskEvaluator initialized with primitive evaluation support")
+
+    def _get_cfg_float(self, key: str, default: float) -> float:
+        val = self.cfg.get(key, default)
+        if val is None:
+            return float(default)
+        try:
+            return float(val)
+        except Exception:
+            return float(default)
+
+    def get_primitive_success_thresholds(self) -> Dict[str, float]:
+        """Return thresholds used by the primitive-level state-match success check."""
+        return {
+            "base_pos": self._get_cfg_float("primitive_success_base_pos_threshold", 0.15),
+            "yaw": self._get_cfg_float("primitive_success_yaw_threshold", 0.35),
+            "eef_pos": self._get_cfg_float("primitive_success_eef_pos_threshold", 0.12),
+            "gripper_qpos": self._get_cfg_float("primitive_success_gripper_qpos_threshold", 0.03),
+            "std_joint_qpos_rmse": self._get_cfg_float("primitive_success_std_joint_qpos_rmse_threshold", 0.25),
+            # Fallback when EEF slices are missing / not comparable
+            "joint_qpos_rmse": self._get_cfg_float("primitive_success_joint_qpos_rmse_threshold", 0.25),
+        }
+
+    @staticmethod
+    def _wrap_to_pi(x: float) -> float:
+        # Map angle to [-pi, pi]
+        return (x + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _get_demo_state_at_frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        if self.current_demo_data is None:
+            return None
+        if frame_idx < 0 or frame_idx >= len(self.current_demo_data):
+            return None
+        try:
+            state = self.current_demo_data.iloc[frame_idx]["observation.state"]
+        except Exception:
+            return None
+        try:
+            arr = np.asarray(state, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        return arr
+
+    def _get_current_proprio_state(self) -> Optional[np.ndarray]:
+        """Get current robot proprio state vector (should match demo `observation.state` layout)."""
+        if getattr(self, "obs", None) is None:
+            return None
+        proprio = self.obs.get("robot_r1::proprio", None)
+        if proprio is None:
+            return None
+        try:
+            # torch tensor
+            if hasattr(proprio, "detach"):
+                proprio = proprio.detach().cpu().numpy()
+            arr = np.asarray(proprio, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        return arr
+
+    def compute_primitive_state_errors(self, primitive: Dict) -> Optional[Dict[str, float]]:
+        """Compute state-match errors between current state and the demo end state of this primitive."""
+        if self.current_demo_data is None:
+            return None
+        cur = self._get_current_proprio_state()
+        if cur is None:
+            return None
+
+        try:
+            _, end_frame = primitive["frame_duration"]
+        except Exception:
+            return None
+
+        end_frame = int(end_frame)
+        end_frame = max(0, min(end_frame, len(self.current_demo_data) - 1))
+        tgt = self._get_demo_state_at_frame(end_frame)
+        if tgt is None or tgt.shape != cur.shape:
+            return None
+
+        # Core pose / arm / gripper errors (task-agnostic, but aligned to demo boundaries)
+        robot_pos_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("robot_pos", None)
+        robot_yaw_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("robot_2d_ori", None)
+        eef_left_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("eef_left_pos", None)
+        eef_right_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("eef_right_pos", None)
+        grip_left_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("gripper_left_qpos", None)
+        grip_right_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("gripper_right_qpos", None)
+        joint_qpos_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("joint_qpos", None)
+
+        errors: Dict[str, float] = {}
+
+        if robot_pos_slice is not None:
+            errors["base_pos_err"] = float(np.linalg.norm(cur[robot_pos_slice] - tgt[robot_pos_slice]))
+        if robot_yaw_slice is not None:
+            dyaw = float(cur[robot_yaw_slice][0] - tgt[robot_yaw_slice][0])
+            errors["yaw_err"] = abs(self._wrap_to_pi(dyaw))
+
+        if eef_left_slice is not None:
+            errors["eef_left_pos_err"] = float(np.linalg.norm(cur[eef_left_slice] - tgt[eef_left_slice]))
+        if eef_right_slice is not None:
+            errors["eef_right_pos_err"] = float(np.linalg.norm(cur[eef_right_slice] - tgt[eef_right_slice]))
+        if grip_left_slice is not None:
+            errors["gripper_left_qpos_err"] = float(np.linalg.norm(cur[grip_left_slice] - tgt[grip_left_slice]))
+        if grip_right_slice is not None:
+            errors["gripper_right_qpos_err"] = float(np.linalg.norm(cur[grip_right_slice] - tgt[grip_right_slice]))
+
+        if joint_qpos_slice is not None:
+            dq = cur[joint_qpos_slice] - tgt[joint_qpos_slice]
+            errors["joint_qpos_rmse"] = float(np.sqrt(np.mean(np.square(dq))))
+
+            # "Standard-track" subset of qpos (excludes privileged / global base pose).
+            # These indices are defined relative to the `joint_qpos` vector layout.
+            try:
+                cur_qpos = cur[joint_qpos_slice]
+                tgt_qpos = tgt[joint_qpos_slice]
+                std_parts_cur = []
+                std_parts_tgt = []
+                for sl in PROPRIO_QPOS_INDICES.get("R1Pro", {}).values():
+                    std_parts_cur.append(cur_qpos[sl])
+                    std_parts_tgt.append(tgt_qpos[sl])
+                if std_parts_cur and std_parts_tgt:
+                    std_cur = np.concatenate([np.asarray(x, dtype=np.float32).reshape(-1) for x in std_parts_cur])
+                    std_tgt = np.concatenate([np.asarray(x, dtype=np.float32).reshape(-1) for x in std_parts_tgt])
+                    if std_cur.shape == std_tgt.shape and std_cur.size > 0:
+                        dstd = std_cur - std_tgt
+                        errors["std_joint_qpos_rmse"] = float(np.sqrt(np.mean(np.square(dstd))))
+            except Exception:
+                pass
+
+        return errors
 
     def _unwrap_env(self):
         """Return the innermost OmniGibson Environment, unwrapping any EnvironmentWrapper layers."""
@@ -623,7 +756,13 @@ class SubTaskEvaluator(Evaluator):
         timeout = int(duration * self.primitive_timeout_multiplier)
         return max(timeout, 100)  # Minimum 100 steps
 
-    def check_primitive_success(self, primitive: Dict, current_step: int, terminated: bool) -> Tuple[bool, str]:
+    def check_primitive_success(
+        self,
+        primitive: Dict,
+        current_step: int,
+        terminated: bool,
+        timeout_steps: Optional[int] = None,
+    ) -> Tuple[bool, str]:
         """
         Check if the current primitive has been completed successfully.
         
@@ -638,15 +777,57 @@ class SubTaskEvaluator(Evaluator):
         Returns:
             Tuple of (is_done, result) where result is "success", "timeout", or "failed"
         """
-        timeout = self.get_primitive_timeout(primitive)
-        
+        timeout = int(timeout_steps) if timeout_steps is not None else self.get_primitive_timeout(primitive)
+
+        # Reset debug state each call
+        self._last_primitive_success_reason = None
+        self._last_primitive_state_errors = None
+
         if terminated:
-            # If environment terminated successfully, this primitive succeeded
-            return True, "success"
-            
+            # Environment termination corresponds to full task completion.
+            self._last_primitive_success_reason = "env_terminated"
+            return True, "success_env"
+
+        # Primitive-level success: state-match against demo end frame.
+        # This is intentionally generic / task-agnostic, and can be refined per-task.
+        if bool(self.cfg.get("primitive_success_use_state_match", True)):
+            errors = self.compute_primitive_state_errors(primitive)
+            self._last_primitive_state_errors = errors
+            if errors is not None:
+                thr = self.get_primitive_success_thresholds()
+                # Primary success check: match the standard-track joint subset.
+                std_rmse = errors.get("std_joint_qpos_rmse", float("inf"))
+                if np.isfinite(std_rmse) and std_rmse <= thr["std_joint_qpos_rmse"]:
+                    self._last_primitive_success_reason = "state_match_std_joint_qpos"
+                    return True, "success_state"
+
+                # Secondary: EEF/gripper-based matching if available.
+                eef_errs = [
+                    errors.get("eef_left_pos_err", float("inf")),
+                    errors.get("eef_right_pos_err", float("inf")),
+                ]
+                grip_errs = [
+                    errors.get("gripper_left_qpos_err", float("inf")),
+                    errors.get("gripper_right_qpos_err", float("inf")),
+                ]
+                has_eef = any(np.isfinite(x) for x in eef_errs)
+                has_grip = any(np.isfinite(x) for x in grip_errs)
+                if has_eef and has_grip:
+                    eef_ok = min(eef_errs) <= thr["eef_pos"]
+                    grip_ok = min(grip_errs) <= thr["gripper_qpos"]
+                    if eef_ok and grip_ok:
+                        self._last_primitive_success_reason = "state_match_eef_gripper"
+                        return True, "success_state"
+
+                # Last-resort fallback: full joint RMSE.
+                jq = errors.get("joint_qpos_rmse", float("inf"))
+                if np.isfinite(jq) and jq <= thr["joint_qpos_rmse"]:
+                    self._last_primitive_success_reason = "state_match_joint_rmse"
+                    return True, "success_state"
+
         if current_step >= timeout:
             return True, "timeout"
-            
+
         return False, "in_progress"
 
     def step_primitive(self, primitive: Dict, max_steps: Optional[int] = None) -> Tuple[bool, str]:
@@ -678,15 +859,24 @@ class SubTaskEvaluator(Evaluator):
             if self.cfg.write_video:
                 self._write_video()
 
-            if terminated:
-                # Task completed successfully
-                logger.info(f"Primitive '{primitive_desc}' succeeded at step {step}")
-                return True, "success"
-
             if truncated:
                 # Environment truncated (shouldn't happen within primitive)
                 logger.warning(f"Environment truncated during primitive '{primitive_desc}'")
                 return False, "truncated"
+
+            done, result_type = self.check_primitive_success(
+                primitive=primitive,
+                current_step=step + 1,
+                terminated=terminated,
+                timeout_steps=max_steps,
+            )
+            if done:
+                success = str(result_type).startswith("success")
+                if success:
+                    logger.info(f"Primitive '{primitive_desc}' succeeded at step {step}")
+                else:
+                    logger.info(f"Primitive '{primitive_desc}' finished with result={result_type} at step {step}")
+                return success, str(result_type)
                 
         logger.info(f"Primitive '{primitive_desc}' timed out after {max_steps} steps")
         return False, "timeout"
@@ -900,7 +1090,8 @@ if __name__ == "__main__":
     register_omegaconf_resolvers()
     
     # Load config
-    with hydra.initialize_config_dir(f"{Path(getsourcefile(lambda: 0)).parents[0]}/configs", version_base="1.1"):
+    src = getsourcefile(lambda: 0) or __file__
+    with hydra.initialize_config_dir(f"{Path(src).parents[0]}/configs", version_base="1.1"):
         config = hydra.compose("eval_subtask_reset_config.yaml", overrides=sys.argv[1:])
     OmegaConf.resolve(config)
     

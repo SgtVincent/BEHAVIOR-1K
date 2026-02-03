@@ -157,21 +157,47 @@ def run_single_primitive(
 
     success = False
     result_type = "timeout"
+    best_state_errors: Optional[Dict[str, float]] = None
+    final_state_errors: Optional[Dict[str, float]] = None
     for step in range(max_steps):
         evaluator.obs["_meta"] = meta
         terminated, truncated = evaluator.step()
+
+        # Compute state-match errors for debugging and (optional) primitive-level success.
+        # This is stored on the evaluator by `check_primitive_success` as well, but we keep
+        # explicit tracking here so the single-primitive JSON is self-contained.
+        done, rt = evaluator.check_primitive_success(
+            primitive=primitive,
+            current_step=step + 1,
+            terminated=terminated,
+            timeout_steps=max_steps,
+        )
+
+        state_errors = getattr(evaluator, "_last_primitive_state_errors", None)
+        if isinstance(state_errors, dict):
+            final_state_errors = state_errors
+            if best_state_errors is None:
+                best_state_errors = dict(state_errors)
+            else:
+                # Keep the best (minimum) error seen so far per metric
+                for k, v in state_errors.items():
+                    try:
+                        best_state_errors[k] = float(min(best_state_errors.get(k, float("inf")), float(v)))
+                    except Exception:
+                        pass
 
         evaluator._video_primitive_progress = (step + 1) / float(max_steps)
         if evaluator.cfg.write_video:
             evaluator._write_video()
 
-        if terminated:
-            success = True
-            result_type = "success"
-            break
         if truncated:
             success = False
             result_type = "truncated"
+            break
+
+        if done:
+            success = str(rt).startswith("success")
+            result_type = str(rt)
             break
 
     result = {
@@ -184,6 +210,21 @@ def run_single_primitive(
         "result_type": str(result_type),
     }
 
+    # Add primitive-level success debugging info (if available)
+    thresholds = None
+    try:
+        thresholds = evaluator.get_primitive_success_thresholds()
+    except Exception:
+        thresholds = None
+    if thresholds is not None or best_state_errors is not None or final_state_errors is not None:
+        result["primitive_success_debug"] = {
+            "criterion": "state_match" if evaluator.cfg.get("primitive_success_use_state_match", True) else "env_terminated",
+            "thresholds": thresholds,
+            "best_state_errors": best_state_errors,
+            "final_state_errors": final_state_errors,
+            "success_reason": getattr(evaluator, "_last_primitive_success_reason", None),
+        }
+
     return result
 
 
@@ -191,8 +232,9 @@ if __name__ == "__main__":
     register_omegaconf_resolvers()
 
     # Load config
+    src = getsourcefile(lambda: 0) or __file__
     with hydra.initialize_config_dir(
-        f"{Path(getsourcefile(lambda: 0)).parents[0]}/configs",
+        f"{Path(src).parents[0]}/configs",
         version_base="1.1",
     ):
         config = hydra.compose("eval_primitive_config.yaml", overrides=sys.argv[1:])
@@ -217,7 +259,8 @@ if __name__ == "__main__":
     gm.HEADLESS = config.headless
 
     # Create output folders
-    log_root = Path(config.log_path).expanduser()
+    # `log_path` is required by config, but keep typing / runtime robust.
+    log_root = Path(str(config.log_path)).expanduser()
     metrics_path = log_root / "metrics"
     metrics_path.mkdir(parents=True, exist_ok=True)
 
@@ -278,13 +321,14 @@ if __name__ == "__main__":
 
         logger.info(f"Saved metrics to {out_path}")
         if config.write_video and video_name is not None:
-            evaluator.video_writer = None  # flush
+            evaluator.video_writer = None  # type: ignore[assignment]  # flush
             logger.info(f"Saved video to {video_name}")
 
         # Cleanup raw data handle if opened
-        if getattr(evaluator, "current_rawdata_hdf5", None) is not None:
+        raw = getattr(evaluator, "current_rawdata_hdf5", None)
+        if raw is not None:
             try:
-                evaluator.current_rawdata_hdf5.close()
+                raw.close()
             except Exception:
                 pass
             evaluator.current_rawdata_hdf5 = None

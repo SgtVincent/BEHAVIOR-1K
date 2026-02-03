@@ -63,7 +63,14 @@ class WebsocketClientPolicy:
         # First, wait for the health check to pass
         while True:
             try:
-                response = requests.get(health_url, timeout=2)
+                # Important: do NOT honor HTTP proxy env vars for localhost health checks.
+                # Some cluster environments set proxies globally, which breaks local requests
+                # and causes an infinite wait here.
+                response = requests.get(
+                    health_url,
+                    timeout=2,
+                    proxies={"http": None, "https": None},
+                )
                 if response.ok:
                     logger.info("Health check passed, attempting websocket connection...")
                     break
@@ -168,6 +175,20 @@ class WebsocketPolicyServer:
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = Packer()
 
+        # IMPORTANT:
+        # Many policies maintain rollout state (e.g., action queues / step counters).
+        # If multiple evaluators share a single websocket server, policy state must be
+        # isolated per connection, otherwise resets and rollout state will collide.
+        policy = self._policy
+        if hasattr(self._policy, "spawn_session"):
+            try:
+                policy = self._policy.spawn_session()
+            except Exception:
+                logger.warning(
+                    "Policy exposes spawn_session() but session creation failed; falling back to shared policy. "
+                    "This may break multi-client evaluation.\n" + traceback.format_exc()
+                )
+
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None
@@ -176,13 +197,13 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 result = unpackb(await websocket.recv(), strict_map_key=False)
                 if "reset" in result:
-                    self._policy.reset()
+                    policy.reset()
                     continue
 
                 obs = deepcopy(result)
 
                 infer_time = time.monotonic()
-                action = self._policy.act(obs)
+                action = policy.act(obs)
                 infer_time = time.monotonic() - infer_time
 
                 action = {

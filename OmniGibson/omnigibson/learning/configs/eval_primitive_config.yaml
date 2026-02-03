@@ -34,3 +34,22 @@ expected_skill: null
 # (demo_id encodes the instance id)
 eval_on_train_instances: true
 write_video: true
+
+# Primitive-level success criterion (task-agnostic default)
+#
+# Background:
+# - OmniGibson `terminated=True` means the FULL task is complete.
+# - For mid-trajectory primitives (e.g., "pick up from"), that makes success_rate ~0.
+#
+# This evaluator optionally defines primitive success by matching the current low-dim
+# robot state to the demo's end-frame state for this primitive.
+primitive_success_use_state_match: true
+
+# Thresholds for the state-match criterion.
+# You may need to tune these per task / primitive family.
+primitive_success_base_pos_threshold: 0.15
+primitive_success_yaw_threshold: 0.35
+primitive_success_eef_pos_threshold: 0.12
+primitive_success_gripper_qpos_threshold: 0.03
+primitive_success_std_joint_qpos_rmse_threshold: 0.25
+primitive_success_joint_qpos_rmse_threshold: 0.25

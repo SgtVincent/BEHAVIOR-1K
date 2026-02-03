@@ -14,6 +14,22 @@ reset_on_primitive_failure: true  # Reset to next primitive start if current fai
 restore_at_each_primitive_start: false  # If true, restore to each primitive start frame (debug / stricter subtask eval)
 primitive_timeout_multiplier: 2.0  # Timeout = demo_duration * multiplier
 
+# Primitive-level success criterion (task-agnostic default)
+#
+# Background:
+# - OmniGibson `terminated=True` means the FULL task is complete.
+# - For mid-trajectory primitives, we instead (optionally) treat a primitive as successful
+#   if the current low-dim robot state matches the demo's end-frame state for that primitive.
+primitive_success_use_state_match: true
+
+# Thresholds for the state-match criterion.
+primitive_success_base_pos_threshold: 0.15
+primitive_success_yaw_threshold: 0.35
+primitive_success_eef_pos_threshold: 0.12
+primitive_success_gripper_qpos_threshold: 0.03
+primitive_success_std_joint_qpos_rmse_threshold: 0.25
+primitive_success_joint_qpos_rmse_threshold: 0.25
+
 # (Optional) Primitive-eval debug guidance for hierarchical / VLM policies
 # - expected_skill: soft hint included in the VLM prompt
 expected_skill: null

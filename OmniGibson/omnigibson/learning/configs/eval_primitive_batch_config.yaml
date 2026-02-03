@@ -1,0 +1,23 @@
+# Batch primitive evaluation configuration for BEHAVIOR-1K
+# This runs multiple (demo_id, primitive_idx) trials and writes a summary.json.
+
+defaults:
+  - eval_primitive_config.yaml
+  - _self_
+
+# Which primitive(s) to evaluate.
+# Matching is done by normalizing both strings (lowercase, underscores->spaces) and substring match.
+primitive_desc: ???
+
+# Demo selection
+demo_ids: null  # Optional explicit list. If null, pick first `num_demos` demos for the task.
+num_demos: 3
+
+# For each demo, evaluate up to this many matching primitives.
+max_primitives_per_demo: 2
+
+# Batch runs usually don't need videos (set true if debugging)
+write_video: false
+
+# Primitive success criterion settings (see eval_primitive_config.yaml for docs)
+primitive_success_use_state_match: true

@@ -310,12 +310,15 @@ class Evaluator:
     def success_callback(self, success: bool) -> None:
         if success:
             self.n_success_trials += 1
-            sucess_video_name = self.cur_video_name.replace(".mp4", "_success.mp4")
-            try:
-                shutil.move(self.cur_video_name, sucess_video_name)
-            except Exception:
-                logger.warning(f"Failed to move video {self.cur_video_name} to {sucess_video_name}")
-            self.cur_video_name = sucess_video_name
+            # Only attempt to rename success videos if video recording is enabled.
+            # When write_video=False, `cur_video_name` is never created.
+            if hasattr(self, "cur_video_name"):
+                sucess_video_name = self.cur_video_name.replace(".mp4", "_success.mp4")
+                try:
+                    shutil.move(self.cur_video_name, sucess_video_name)
+                except Exception:
+                    logger.warning(f"Failed to move video {self.cur_video_name} to {sucess_video_name}")
+                self.cur_video_name = sucess_video_name
             if hasattr(self, "rollout_paths"):
                 np.savez_compressed(self.rollout_paths["state_action"], self.rollout_state_action)
                 logger.info(f"Saved rollout data to {self.rollout_paths['state_action']}")
