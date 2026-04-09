@@ -46,6 +46,7 @@ class WebsocketClientPolicy:
         self._api_key = api_key
         self._ws, self._server_metadata = None, None
         self._allow_reconnect = allow_reconnect
+        self._last_generated_subtask = None
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
@@ -102,11 +103,18 @@ class WebsocketClientPolicy:
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
+        t0 = time.perf_counter()
         data = self._packer.pack(obs)
+        pack_s = time.perf_counter() - t0
         while True:
             try:
+                t1 = time.perf_counter()
                 self._ws.send(data)
+                send_s = time.perf_counter() - t1
+
+                t2 = time.perf_counter()
                 response = self._ws.recv()
+                recv_s = time.perf_counter() - t2
                 break
             except websockets.exceptions.ConnectionClosedError:
                 if self._allow_reconnect:
@@ -117,16 +125,37 @@ class WebsocketClientPolicy:
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
+        t3 = time.perf_counter()
         action_dict = unpackb(response)
+        unpack_s = time.perf_counter() - t3
         try:
             action_np = deepcopy(action_dict["action"])
         except KeyError:
             # We try getting action one more time before raising error
             logger.warning("No action received from server, retrying one more time...")
+            t1 = time.perf_counter()
             self._ws.send(data)
+            send_s = time.perf_counter() - t1
+
+            t2 = time.perf_counter()
             response = self._ws.recv()
+            recv_s = time.perf_counter() - t2
+
+            t3 = time.perf_counter()
             action_dict = unpackb(response)
+            unpack_s = time.perf_counter() - t3
             action_np = deepcopy(action_dict["action"])
+
+        self._last_client_timing = {
+            "pack_ms": pack_s * 1000,
+            "send_ms": send_s * 1000,
+            "recv_ms": recv_s * 1000,
+            "unpack_ms": unpack_s * 1000,
+            "rtt_ms": (pack_s + send_s + recv_s + unpack_s) * 1000,
+        }
+        self._last_server_timing = deepcopy(action_dict.get("server_timing", {}))
+        if "generated_subtask" in action_dict and action_dict["generated_subtask"] is not None:
+            self._last_generated_subtask = action_dict["generated_subtask"]
         action = th.from_numpy(action_np).to(th.float32)
         return action
 
@@ -209,6 +238,9 @@ class WebsocketPolicyServer:
                 action = {
                     "action": action.cpu().numpy(),
                 }
+                generated_subtask = getattr(policy, "last_generated_subtask", None)
+                if generated_subtask is not None:
+                    action["generated_subtask"] = generated_subtask
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }

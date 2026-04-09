@@ -87,6 +87,11 @@ class Evaluator:
         self.robot = self.load_robot()
         self.metrics = self.load_metrics()
 
+        self.current_episode: int | None = None
+        self.current_instance_id: int | None = None
+        self._last_step_timing: dict[str, Any] = {}
+        self._last_generated_subtask: str | None = None
+
         self.reset()
         self.env._current_episode = 0
         self._video_writer = None
@@ -171,10 +176,40 @@ class Evaluator:
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
     def step(self) -> tuple[bool, bool, dict]:
+        t0 = time.perf_counter()
         self.robot_action = self.policy.forward(obs=self.obs)
+        policy_s = time.perf_counter() - t0
 
+        t1 = time.perf_counter()
         obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+        env_step_s = time.perf_counter() - t1
+
+        t2 = time.perf_counter()
         self.obs = self._preprocess_obs(obs)
+        preprocess_s = time.perf_counter() - t2
+
+        client_timing = {}
+        server_timing = {}
+        client = getattr(self.policy, "policy", None)
+        if client is not None:
+            client_timing = getattr(client, "_last_client_timing", {}) or {}
+            server_timing = getattr(client, "_last_server_timing", {}) or {}
+            self._last_generated_subtask = getattr(client, "_last_generated_subtask", None)
+        else:
+            self._last_generated_subtask = None
+
+        self._last_step_timing = {
+            "policy_ms": policy_s * 1000,
+            "env_step_ms": env_step_s * 1000,
+            "preprocess_ms": preprocess_s * 1000,
+            "pack_ms": client_timing.get("pack_ms"),
+            "send_ms": client_timing.get("send_ms"),
+            "recv_ms": client_timing.get("recv_ms"),
+            "unpack_ms": client_timing.get("unpack_ms"),
+            "rtt_ms": client_timing.get("rtt_ms"),
+            "server_infer_ms": server_timing.get("infer_ms"),
+            "server_prev_total_ms": server_timing.get("prev_total_ms"),
+        }
 
         if terminated or truncated:
             self.n_trials += 1
@@ -371,6 +406,35 @@ if __name__ == "__main__":
 
     gm.HEADLESS = config.headless
 
+    timing_path = Path(config.log_path).expanduser() / "timing.csv"
+    timing_path.parent.mkdir(parents=True, exist_ok=True)
+    timing_f = open(timing_path, "w", newline="")
+    timing_fields = [
+        "timestamp_s",
+        "task_name",
+        "episode",
+        "instance_id",
+        "step_idx",
+        "env_current_step",
+        "policy_ms",
+        "env_step_ms",
+        "preprocess_ms",
+        "pack_ms",
+        "send_ms",
+        "recv_ms",
+        "unpack_ms",
+        "rtt_ms",
+        "server_infer_ms",
+        "server_prev_total_ms",
+    ]
+    timing_writer = csv.DictWriter(timing_f, fieldnames=timing_fields)
+    timing_writer.writeheader()
+    subtask_predictions_f = None
+    if config.save_subtask_predictions:
+        subtask_predictions_path = Path(config.log_path).expanduser() / "subtask_predictions.jsonl"
+        subtask_predictions_path.parent.mkdir(parents=True, exist_ok=True)
+        subtask_predictions_f = open(subtask_predictions_path, "w")
+
     if config.write_video:
         video_path = Path(config.log_path).expanduser() / "videos"
         video_path.mkdir(parents=True, exist_ok=True)
@@ -437,6 +501,8 @@ if __name__ == "__main__":
                 evaluator.reset()
                 evaluator.load_task_instance(idx, test_hidden=config.test_hidden)
                 logger.info(f"Starting task instance {idx} / episode {epi} for evaluation...")
+                evaluator.current_episode = epi
+                evaluator.current_instance_id = idx
 
                 done = False
                 if config.write_video:
@@ -467,10 +533,12 @@ if __name__ == "__main__":
                 for metric in evaluator.metrics:
                     metric.start_callback(evaluator.env)
 
+                step_idx = 0
+                rolling = []
                 while not done:
-                    time_start = time.time()
+                    time_start = time.perf_counter()
                     terminated, truncated, info = evaluator.step()
-                    time_step = time.time() - time_start
+                    time_step = time.perf_counter() - time_start
 
                     if time_step > 15 * 60:
                         logger.error(f"Step timeout: {time_step} seconds, terminating evaluation")
@@ -484,6 +552,57 @@ if __name__ == "__main__":
                         evaluator._write_video()
                     if evaluator.env._current_step % 1000 == 0:
                         logger.info(f"Current step: {evaluator.env._current_step}")
+
+                    row = {
+                        "timestamp_s": time.time(),
+                        "task_name": config.task.name,
+                        "episode": evaluator.current_episode,
+                        "instance_id": evaluator.current_instance_id,
+                        "step_idx": step_idx,
+                        "env_current_step": evaluator.env._current_step,
+                    }
+                    row.update(evaluator._last_step_timing)
+                    timing_writer.writerow(row)
+                    if subtask_predictions_f is not None:
+                        subtask_predictions_f.write(
+                            json.dumps(
+                                {
+                                    "timestamp_s": row["timestamp_s"],
+                                    "task_name": row["task_name"],
+                                    "episode": row["episode"],
+                                    "instance_id": row["instance_id"],
+                                    "step_idx": row["step_idx"],
+                                    "env_current_step": row["env_current_step"],
+                                    "generated_subtask": evaluator._last_generated_subtask,
+                                }
+                            )
+                            + "\n"
+                        )
+                    step_idx += 1
+
+                    rolling.append(evaluator._last_step_timing)
+                    if len(rolling) > 20:
+                        rolling.pop(0)
+                    if step_idx % 20 == 0 and len(rolling) > 0:
+                        def _mean(key: str) -> float:
+                            vals = [r.get(key) for r in rolling if r.get(key) is not None]
+                            return float(sum(vals) / max(1, len(vals)))
+
+                        logger.info(
+                            "timing[20]: "
+                            + ", ".join(
+                                [
+                                    f"policy_ms={_mean('policy_ms'):.1f}",
+                                    f"env_step_ms={_mean('env_step_ms'):.1f}",
+                                    f"preprocess_ms={_mean('preprocess_ms'):.1f}",
+                                    f"rtt_ms={_mean('rtt_ms'):.1f}",
+                                    f"infer_ms={_mean('server_infer_ms'):.1f}",
+                                ]
+                            )
+                        )
+                        timing_f.flush()
+                        if subtask_predictions_f is not None:
+                            subtask_predictions_f.flush()
 
                     if terminated or truncated:
                         evaluator.success_callback(info["done"]["success"])
@@ -508,3 +627,4 @@ if __name__ == "__main__":
                     logger.info(f"Saved rollout video to {evaluator.rollout_paths}")
                 else:
                     logger.warning("No observations were recorded.")
+    timing_f.close()

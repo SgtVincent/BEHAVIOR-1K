@@ -221,6 +221,13 @@ def _launch_app():
     local_appdata.mkdir(parents=True, exist_ok=True)
     sys.argv.extend(["--portable-root", str(local_appdata)])
 
+    if os.getenv("OMNIGIBSON_DISABLE_DRIVER_VERSION_CHECK", "").lower() in {"1", "true", "yes"}:
+        sys.argv.append("--/rtx/verifyDriverVersion/enabled=false")
+
+    if os.getenv("OMNIGIBSON_DISABLE_EXTENSION_REGISTRY", "").lower() in {"1", "true", "yes"}:
+        sys.argv.append("--/app/extensions/registryEnabled=0")
+        sys.argv.append("--/exts/omni.kit.registry.nucleus/registries=[]")
+
     global_cache_dir = Path(gm.APPDATA_PATH) / "global" / "cache"
     global_cache_dir.mkdir(parents=True, exist_ok=True)
     sys.argv.append(f"--/app/tokens/omni_global_cache={global_cache_dir}")

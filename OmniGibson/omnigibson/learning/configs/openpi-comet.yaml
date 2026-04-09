@@ -21,6 +21,7 @@ env_wrapper:
   _target_: omnigibson.learning.wrappers.RGBWrapper
 
 save_rollout: false
+save_subtask_predictions: false
 perturb_pose: false
 perturb_pose_seed: 42
 
