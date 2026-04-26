@@ -29,6 +29,7 @@ segment_idx: ???
 # - predicate_subgoal: segment succeeds if all subgoal predicates are satisfied
 # - predicate_progress: only record progress, no binary success
 # - state_match: fallback to state-match (like eval_primitive)
+# - segment_predicates: use per-segment predicate spec built from annotation + BDDL-compatible predicates
 success_mode: predicate_subgoal
 
 # Number of top grounding candidates to output
@@ -55,3 +56,10 @@ primitive_success_eef_pos_threshold: 0.12
 primitive_success_gripper_qpos_threshold: 0.03
 primitive_success_std_joint_qpos_rmse_threshold: 0.25
 primitive_success_joint_qpos_rmse_threshold: 0.25
+
+# Per-segment predicate evaluation settings
+segment_predicate_generation: hybrid
+segment_predicate_window_mode: anytime
+segment_predicate_last_k: 20
+segment_predicate_min_consecutive: 1
+segment_predicate_dump_trace: true

@@ -47,6 +47,7 @@ from omnigibson.robots import BaseRobot
 from omnigibson.utils.asset_utils import get_task_instance_path
 from omnigibson.utils.python_utils import recursively_convert_to_torch
 import omnigibson.utils.transform_utils as T
+from PIL import Image
 import torch as th
 
 m = create_module_macros(module_path=__file__)
@@ -69,6 +70,30 @@ ROLLOUT_CAMERA_NAMES = [
 
 logger = logging.getLogger("evaluator")
 logger.setLevel(20)  # info
+
+MODEL_VIDEO_TILE_SIZE = 224
+MODEL_VIDEO_RESOLUTION = (MODEL_VIDEO_TILE_SIZE * 2, MODEL_VIDEO_TILE_SIZE * 2)
+
+
+def _resize_with_pad_np(image: np.ndarray, height: int, width: int, method=None) -> np.ndarray:
+    """Match the policy-side resize_with_pad behavior for video export."""
+    if image.shape[:2] == (height, width):
+        return image
+
+    pil_image = Image.fromarray(image)
+    if method is None:
+        method = int(getattr(getattr(Image, "Resampling", None), "BILINEAR", 2))
+    cur_width, cur_height = pil_image.size
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_image = pil_image.resize((resized_width, resized_height), resample=method)
+
+    zero_image = Image.new(resized_image.mode, (width, height), 0)
+    pad_height = max(0, int((height - resized_height) / 2))
+    pad_width = max(0, int((width - resized_width) / 2))
+    zero_image.paste(resized_image, (pad_width, pad_height))
+    return np.asarray(zero_image)
 
 
 class Evaluator:
@@ -311,20 +336,37 @@ class Evaluator:
         return obs
 
     def _write_video(self) -> None:
-        left_wrist_rgb = cv2.resize(
-            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["left_wrist"] + "::rgb"].numpy(),
-            (56, 56),
+        # Export the same per-camera spatial view the model actually consumes:
+        # resize_with_pad to 224x224, then tile into a 448x448 summary frame.
+        left_wrist_rgb = _resize_with_pad_np(
+            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["left_wrist"] + "::rgb"].numpy()[..., :3],
+            MODEL_VIDEO_TILE_SIZE,
+            MODEL_VIDEO_TILE_SIZE,
         )
-        right_wrist_rgb = cv2.resize(
-            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["right_wrist"] + "::rgb"].numpy(),
-            (56, 56),
+        right_wrist_rgb = _resize_with_pad_np(
+            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["right_wrist"] + "::rgb"].numpy()[..., :3],
+            MODEL_VIDEO_TILE_SIZE,
+            MODEL_VIDEO_TILE_SIZE,
         )
-        head_rgb = cv2.resize(
-            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["head"] + "::rgb"].numpy(),
-            (112, 112),
+        head_rgb = _resize_with_pad_np(
+            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["head"] + "::rgb"].numpy()[..., :3],
+            MODEL_VIDEO_TILE_SIZE,
+            MODEL_VIDEO_TILE_SIZE,
+        )
+        # Layout matches the default visualization: one column for wrists (stacked),
+        # one column for head. Avoid a blank subplot by padding the head view to
+        # the same height as the stacked wrists.
+        wrist_column = np.vstack([left_wrist_rgb, right_wrist_rgb])
+        pad_top = MODEL_VIDEO_TILE_SIZE // 2
+        pad_bottom = MODEL_VIDEO_TILE_SIZE - pad_top
+        head_column = np.pad(
+            head_rgb,
+            ((pad_top, pad_bottom), (0, 0), (0, 0)),
+            mode="constant",
+            constant_values=0,
         )
         write_video(
-            np.expand_dims(np.hstack([np.vstack([left_wrist_rgb, right_wrist_rgb]), head_rgb]), 0),
+            np.expand_dims(np.hstack([wrist_column, head_column]), 0),
             video_writer=self.video_writer,
             batch_size=1,
             mode="rgb",
@@ -509,7 +551,7 @@ if __name__ == "__main__":
                     evaluator.cur_video_name = f"{video_path!s}/{config.task.name}_{idx}_{epi}.mp4"
                     evaluator.video_writer = create_video_writer(
                         fpath=evaluator.cur_video_name,
-                        resolution=(112, 168),
+                        resolution=MODEL_VIDEO_RESOLUTION,
                     )
 
                 if config.save_rollout:

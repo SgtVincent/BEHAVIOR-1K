@@ -34,6 +34,7 @@ import torch as th
 import traceback
 from inspect import getsourcefile
 from omegaconf import DictConfig, OmegaConf
+from omnigibson.controllers import IsGraspingState
 from omnigibson.learning.eval import Evaluator, m
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.eval_utils import (
@@ -119,6 +120,154 @@ class SubTaskEvaluator(Evaluator):
         self._last_primitive_success_reason: Optional[str] = None
         
         logger.info("SubTaskEvaluator initialized with primitive evaluation support")
+
+    #region debug-point restore-grasp-state
+    def _debug_log_grasp_state(self, tag: str) -> None:
+        try:
+            robot: Any = self.robot
+            all_qpos = robot.get_joint_positions()
+            all_qvel = robot.get_joint_velocities()
+            for arm in getattr(robot, "arm_names", []):
+                controller = robot.controllers.get(f"gripper_{arm}", None)
+                qpos = all_qpos[robot.gripper_control_idx[arm]]
+                qvel = all_qvel[robot.gripper_control_idx[arm]]
+                logger.info(
+                    "[debug][%s] grasp_mode=%s arm=%s is_grasping=%s qpos=%s qvel=%s goal=%s control=%s",
+                    tag,
+                    getattr(robot, "grasping_mode", None),
+                    arm,
+                    str(robot.is_grasping(arm=arm)),
+                    np.asarray(qpos).tolist(),
+                    np.asarray(qvel).tolist(),
+                    getattr(controller, "_goal", None),
+                    getattr(controller, "_control", None),
+                )
+        except Exception as e:
+            logger.info("[debug][%s] failed to inspect grasp state: %s", tag, e)
+    #endregion debug-point restore-grasp-state
+
+    def _stabilize_robot_post_restore(self) -> None:
+        """
+        Stabilize the robot after rawdata restore without clearing gripper holding force.
+
+        For physical grasping, calling robot.keep_still() will zero all joint efforts, which can
+        immediately drop an object that is already being held at the restored frame. In that case,
+        only freeze the base and non-gripper joints.
+        """
+        try:
+            robot: Any = self.robot
+            grasping_mode = getattr(robot, "grasping_mode", None)
+            grasping_arms = [
+                arm for arm in getattr(robot, "arm_names", []) if robot.is_grasping(arm=arm) == IsGraspingState.TRUE
+            ]
+        except Exception:
+            grasping_mode = None
+            grasping_arms = []
+
+        if grasping_mode == "physical" and grasping_arms:
+            try:
+                robot.set_linear_velocity(th.zeros(3))
+                robot.set_angular_velocity(th.zeros(3))
+                joint_vel = robot.get_joint_velocities().clone()
+                protected_idx = set()
+                for arm in grasping_arms:
+                    protected_idx.update(robot.gripper_control_idx[arm].tolist())
+                non_gripper_idx = [i for i in range(joint_vel.shape[0]) if i not in protected_idx]
+                if len(non_gripper_idx) > 0:
+                    joint_vel[non_gripper_idx] = 0.0
+                    robot.set_joint_velocities(joint_vel, drive=False)
+                logger.info(
+                    "[debug][post_restore_stabilize] preserving physical grasp on arms=%s by skipping keep_still on gripper joints",
+                    grasping_arms,
+                )
+                return
+            except Exception as e:
+                logger.info("[debug][post_restore_stabilize] selective stabilize failed, fallback to keep_still: %s", e)
+
+        self.robot.keep_still()
+
+    def _maybe_recover_assisted_grasp_post_restore(self, tag: str) -> None:
+        robot: Any = self.robot
+        if getattr(robot, "grasping_mode", None) == "physical":
+            return
+
+        recovered = []
+        for arm in getattr(robot, "arm_names", []):
+            try:
+                if robot.is_grasping(arm=arm) != IsGraspingState.FALSE:
+                    continue
+            except Exception:
+                continue
+
+            try:
+                contact_data, _ = robot._find_gripper_contacts(arm=arm, return_contact_positions=True)
+                raycast_paths = sorted(robot._find_gripper_raycast_collisions(arm=arm))
+                if getattr(robot, "grasping_mode", None) == "assisted":
+                    ag_data = robot._calculate_in_hand_object_rigid(arm=arm, restore_fallback=True)
+                else:
+                    ag_data = robot._calculate_in_hand_object(arm=arm)
+                contact_paths = sorted({prim_path for prim_path, _ in contact_data})
+                logger.info(
+                    "[debug][%s] assisted probe arm=%s contact_paths=%s raycast_paths=%s rigid_candidate=%s",
+                    tag,
+                    arm,
+                    contact_paths,
+                    raycast_paths,
+                    None if ag_data is None else getattr(ag_data[1], "prim_path", None),
+                )
+            except Exception as e:
+                logger.info("[debug][%s] assisted regrasp probe failed for arm=%s: %s", tag, arm, e)
+                continue
+
+            if ag_data is None and getattr(robot, "grasping_mode", None) == "assisted":
+                try:
+                    qpos = robot.get_joint_positions()[robot.gripper_control_idx[arm]]
+                    gripper_closed = bool(float(th.min(qpos).item()) < 0.04)
+                except Exception:
+                    gripper_closed = False
+
+                if gripper_closed and len(raycast_paths) == 1:
+                    candidate_path = raycast_paths[0]
+                    obj = robot.scene.object_registry("prim_path", "/".join(candidate_path.split("/")[:-1]))
+                    if obj is not None:
+                        link_name = candidate_path.split("/")[-1]
+                        link = obj.links.get(link_name, None)
+                        if link is not None:
+                            ag_data = (obj, link)
+                            logger.info(
+                                "[debug][%s] restore-only raycast fallback arm=%s candidate=%s qpos=%s",
+                                tag,
+                                arm,
+                                candidate_path,
+                                np.asarray(qpos).tolist(),
+                            )
+
+            if ag_data is None:
+                continue
+
+            try:
+                contact_pos = None
+                obj, link = ag_data
+                target_prim_path = link.prim_path
+                target_points = [point for prim_path, point in contact_data if prim_path == target_prim_path]
+                if len(target_points) > 0:
+                    stacked = th.stack(target_points)
+                    contact_pos = stacked.mean(dim=0)
+                else:
+                    contact_pos = link.get_position_orientation()[0]
+                    logger.info(
+                        "[debug][%s] assisted regrasp using fallback contact_pos=link_center for arm=%s link=%s",
+                        tag,
+                        arm,
+                        target_prim_path,
+                    )
+                robot._establish_grasp(arm=arm, ag_data=ag_data, contact_pos=contact_pos)
+                recovered.append(arm)
+            except Exception as e:
+                logger.info("[debug][%s] assisted regrasp establish failed for arm=%s: %s", tag, arm, e)
+
+        if recovered:
+            logger.info("[debug][%s] recovered assisted grasp on arms=%s", tag, recovered)
 
     def _get_cfg_float(self, key: str, default: float) -> float:
         val = self.cfg.get(key, default)
@@ -358,18 +507,24 @@ class SubTaskEvaluator(Evaluator):
             state_data = th.tensor(state[frame_idx, :int(state_size[frame_idx])])
             logger.info(f"Restoring FULL world state from rawdata frame {frame_idx} (serialized)")
             og.sim.load_state(state_data, serialized=True)
+            self._debug_log_grasp_state(f"rawdata_restore_frame_{frame_idx}_after_load_state")
+            self._maybe_recover_assisted_grasp_post_restore(f"rawdata_restore_frame_{frame_idx}_after_load_state")
             
             # Step physics to stabilize
             for _ in range(5):
                 og.sim.step_physics()
                 try:
-                    self.robot.keep_still()
+                    self._stabilize_robot_post_restore()
                 except Exception:
                     pass
+            self._maybe_recover_assisted_grasp_post_restore(f"rawdata_restore_frame_{frame_idx}_after_keep_still")
+            self._debug_log_grasp_state(f"rawdata_restore_frame_{frame_idx}_after_keep_still")
 
             # Render to refresh sensors / video
             for _ in range(2):
                 og.sim.render()
+            self._maybe_recover_assisted_grasp_post_restore(f"rawdata_restore_frame_{frame_idx}_after_render")
+            self._debug_log_grasp_state(f"rawdata_restore_frame_{frame_idx}_after_render")
                 
             logger.info(f"Restored full simulation state from frame {frame_idx}")
             return True

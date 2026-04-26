@@ -55,6 +55,12 @@ from omnigibson.learning.utils.predicate_utils import (
     format_head_predicate,
     get_subgoal_predicates,
 )
+from omnigibson.learning.utils.segment_predicate_eval import (
+    build_auto_mined_predicates,
+    build_template_predicates,
+    eval_segment_predicates,
+    predicate_window_satisfied,
+)
 from omnigibson.macros import gm
 
 
@@ -73,6 +79,23 @@ def _get_instance_id_from_demo_id(demo_id: str) -> int:
     return int(demo_id) // 10 % 1000
 
 
+def _flatten_numeric(x: Any) -> List[int]:
+    out: List[int] = []
+    if isinstance(x, (list, tuple)):
+        for y in x:
+            out.extend(_flatten_numeric(y))
+    elif isinstance(x, (int, float)):
+        out.append(int(x))
+    return out
+
+
+def _normalize_frame_duration(raw: Any) -> Tuple[int, int]:
+    vals = _flatten_numeric(raw)
+    if len(vals) < 2:
+        raise ValueError(f"Invalid frame_duration: {raw}")
+    return int(vals[0]), int(vals[-1])
+
+
 def load_segment_annotations(
     evaluator: SubTaskEvaluator,
     demo_id: str,
@@ -89,7 +112,13 @@ def load_segment_annotations(
     if not segments:
         logger.warning(f"Empty {key}")
         return None
-    segments = sorted(segments, key=lambda x: x["frame_duration"][0])
+    normalized_segments = []
+    for seg in segments:
+        seg_copy = dict(seg)
+        start_frame, end_frame = _normalize_frame_duration(seg_copy.get("frame_duration"))
+        seg_copy["frame_duration"] = [start_frame, end_frame]
+        normalized_segments.append(seg_copy)
+    segments = sorted(normalized_segments, key=lambda x: x["frame_duration"][0])
     return {"segments": segments, "annotations": annotations}
 
 
@@ -201,6 +230,217 @@ def run_single_segment(
     if ground_options is None or len(ground_options) == 0:
         return {"error": "no_ground_goal_state_options"}
 
+    if success_mode == "segment_predicates":
+        evaluator.current_demo_id = demo_id
+        evaluator.current_rawdata_hdf5 = evaluator.load_rawdata_hdf5(demo_id)
+        if evaluator.current_rawdata_hdf5 is None:
+            evaluator.current_primitive_state_cache = evaluator.load_primitive_state_cache(demo_id)
+
+        restored_start, method_start, _ = restore_and_eval_predicates(evaluator, start_frame)
+        restored_end, method_end, _ = restore_and_eval_predicates(evaluator, end_frame)
+        if not restored_start or not restored_end:
+            return {
+                "demo_id": demo_id,
+                "segment_level": segment_level,
+                "segment_idx": segment_idx,
+                "segment_desc": segment_desc,
+                "frame_duration": [int(start_frame), int(end_frame)],
+                "restore": {
+                    "start": {"restored": restored_start, "method": method_start},
+                    "end": {"restored": restored_end, "method": method_end},
+                },
+                "success_mode": str(success_mode),
+                "success": False,
+                "result_type": "restore_failed",
+            }
+
+        template_specs, metric_debug = build_template_predicates(segment_level, segment, evaluator.env)
+        restored_start_for_compare, _, _ = restore_and_eval_predicates(evaluator, start_frame)
+        if not restored_start_for_compare:
+            return {
+                "demo_id": demo_id,
+                "segment_level": segment_level,
+                "segment_idx": segment_idx,
+                "segment_desc": segment_desc,
+                "frame_duration": [int(start_frame), int(end_frame)],
+                "restore": {
+                    "start": {"restored": False, "method": method_start},
+                    "end": {"restored": True, "method": method_end},
+                },
+                "success_mode": str(success_mode),
+                "success": False,
+                "result_type": "restore_failed",
+            }
+        start_truth_map, start_trace = eval_segment_predicates(evaluator.env, template_specs)
+        restored_end, method_end, _ = restore_and_eval_predicates(evaluator, end_frame)
+        end_truth_map, end_trace = eval_segment_predicates(evaluator.env, template_specs)
+        auto_specs = build_auto_mined_predicates(
+            segment_level,
+            segment,
+            evaluator.env,
+            start_truth=start_truth_map,
+            end_truth=end_truth_map,
+        )
+        predicate_specs = template_specs if template_specs else auto_specs
+        if template_specs and auto_specs:
+            existing = {(p.metric_type, p.name, tuple(p.args), p.desired) for p in template_specs}
+            predicate_specs = list(template_specs) + [
+                p for p in auto_specs if (p.metric_type, p.name, tuple(p.args), p.desired) not in existing
+            ]
+
+        if len(predicate_specs) == 0:
+            return {
+                "demo_id": demo_id,
+                "segment_level": segment_level,
+                "segment_idx": segment_idx,
+                "segment_desc": segment_desc,
+                "frame_duration": [int(start_frame), int(end_frame)],
+                "restore": {
+                    "start": {"restored": True, "method": method_start},
+                    "end": {"restored": True, "method": method_end},
+                },
+                "success_mode": str(success_mode),
+                "effective_success_mode": "segment_predicates",
+                "success": False,
+                "result_type": "no_predicates_generated",
+            }
+
+        # Segment rollout must start from the segment start frame, not the end frame used for target metric capture.
+        restored_rollout_start, _, _ = restore_and_eval_predicates(evaluator, start_frame)
+        if not restored_rollout_start:
+            return {
+                "demo_id": demo_id,
+                "segment_level": segment_level,
+                "segment_idx": segment_idx,
+                "segment_desc": segment_desc,
+                "frame_duration": [int(start_frame), int(end_frame)],
+                "restore": {
+                    "start": {"restored": False, "method": method_start},
+                    "end": {"restored": True, "method": method_end},
+                },
+                "success_mode": str(success_mode),
+                "effective_success_mode": "segment_predicates",
+                "success": False,
+                "result_type": "restore_failed_before_rollout",
+            }
+
+        result = {
+            "demo_id": demo_id,
+            "segment_level": segment_level,
+            "segment_idx": segment_idx,
+            "segment_desc": segment_desc,
+            "frame_duration": [int(start_frame), int(end_frame)],
+            "restore": {
+                "start": {"restored": True, "method": method_start},
+                "end": {"restored": True, "method": method_end},
+            },
+            "success_mode": str(success_mode),
+            "effective_success_mode": "segment_predicates",
+            "predicate_spec": [
+                {
+                    "metric_type": p.metric_type,
+                    "name": p.name,
+                    "args": p.args,
+                    "desired": p.desired,
+                    "source": p.source,
+                    "params": p.params,
+                }
+                for p in predicate_specs
+            ],
+            "predicate_debug": {
+                **metric_debug,
+                "template_trace_start": start_trace,
+                "template_trace_end": end_trace,
+            },
+        }
+
+        if dry_run:
+            result["success"] = None
+            result["result_type"] = "dry_run"
+            return result
+
+        evaluator.policy.reset()
+        evaluator.obs = evaluator._preprocess_obs(evaluator._get_obs_for_policy())
+
+        meta = {
+            f"{segment_level}_idx": int(segment_idx),
+            f"{segment_level}_desc": segment_desc,
+        }
+        max_steps = max(
+            int(segment_max_steps)
+            if segment_max_steps is not None
+            else int((end_frame - start_frame) * evaluator.primitive_timeout_multiplier),
+            1,
+        )
+        trace_history: List[List[Dict[str, Any]]] = []
+        success = False
+        result_type = "timeout"
+
+        window_mode = str(evaluator.cfg.get("segment_predicate_window_mode", "anytime"))
+        last_k = int(evaluator.cfg.get("segment_predicate_last_k", 20))
+        min_consecutive = int(evaluator.cfg.get("segment_predicate_min_consecutive", 1))
+        combine_mode = str(metric_debug.get("combine_mode", "all_of"))
+        start_all_satisfied = (
+            any(item.get("satisfied", False) for item in start_trace)
+            if combine_mode == "any_of"
+            else all(item.get("satisfied", False) for item in start_trace)
+        ) if len(start_trace) > 0 else False
+        require_unsatisfied_at_start = bool(metric_debug.get("require_unsatisfied_at_start", True))
+        activation_armed = not (require_unsatisfied_at_start and start_all_satisfied)
+        result["predicate_debug"]["start_all_satisfied"] = start_all_satisfied
+        result["predicate_debug"]["require_unsatisfied_at_start"] = require_unsatisfied_at_start
+
+        for step in range(max_steps):
+            evaluator.obs["_meta"] = meta
+            terminated, truncated = evaluator.step()
+            _, step_trace = eval_segment_predicates(evaluator.env, predicate_specs)
+            trace_history.append(step_trace)
+            if not activation_armed:
+                step_satisfied_now = (
+                    any(item.get("satisfied", False) for item in step_trace)
+                    if combine_mode == "any_of"
+                    else all(item.get("satisfied", False) for item in step_trace)
+                ) if len(step_trace) > 0 else False
+                if not step_satisfied_now:
+                    activation_armed = True
+
+            evaluator._video_primitive_progress = (step + 1) / float(max_steps)
+            if evaluator.cfg.write_video:
+                evaluator._write_video()
+
+            if activation_armed and predicate_window_satisfied(
+                trace_history,
+                mode=window_mode,
+                last_k=last_k,
+                min_consecutive=min_consecutive,
+                combine_mode=combine_mode,
+            ):
+                success = True
+                result_type = "predicate_satisfied"
+                break
+
+            if truncated:
+                success = False
+                result_type = "truncated"
+                break
+
+            if terminated:
+                success = True
+                result_type = "env_terminated"
+                break
+
+        result["rollout"] = {
+            "max_steps": max_steps,
+            "final_step": step + 1 if "step" in dir() else max_steps,
+            "predicate_window_mode": window_mode,
+            "combine_mode": combine_mode,
+        }
+        if bool(evaluator.cfg.get("segment_predicate_dump_trace", True)):
+            result["predicate_trace"] = trace_history
+        result["success"] = success
+        result["result_type"] = result_type
+        return result
+
     restored_start, method_start, s_start = restore_and_eval_predicates(evaluator, start_frame)
     logger.info(f"Restore at start frame {start_frame}: restored={restored_start}, method={method_start}")
 
@@ -255,6 +495,7 @@ def run_single_segment(
             "start": {"restored": True, "method": method_start},
             "end": {"restored": True, "method": method_end},
         },
+        "success_mode": str(success_mode),
         "grounding": {
             "chosen_option_idx": subgoal_info["chosen_option_idx"],
             "topk_candidates": subgoal_info["topk_candidates"],
@@ -271,6 +512,23 @@ def run_single_segment(
             "delta": q_score_end - q_score_start,
         },
     }
+
+    # If this segment does not induce any task-level predicate delta (common for intermediate skills like "pick up from"),
+    # then predicate_subgoal can never terminate successfully. Fall back to state_match in that case.
+    requested_success_mode = str(success_mode)
+    effective_success_mode = requested_success_mode
+    fallback_reason = None
+    if requested_success_mode == "predicate_subgoal" and len(subgoal_info["subgoal_indices"]) == 0:
+        effective_success_mode = "state_match"
+        fallback_reason = "empty_subgoal_fallback_to_state_match"
+        logger.warning(
+            "Empty subgoal_indices for %s=%s (%s). Falling back from predicate_subgoal -> state_match",
+            segment_level,
+            segment_idx,
+            segment_desc,
+        )
+    result["effective_success_mode"] = effective_success_mode
+    result["success_fallback_reason"] = fallback_reason
 
     if dry_run:
         result["result_type"] = "dry_run"
@@ -291,9 +549,10 @@ def run_single_segment(
 
     if segment_max_steps is None:
         segment_max_steps = int((end_frame - start_frame) * evaluator.primitive_timeout_multiplier)
-    max_steps = max(segment_max_steps, 100)
+    max_steps = max(int(segment_max_steps), 1)
 
-    evaluator._video_n_primitives = len(evaluator.load_demo_annotations(demo_id).get(f"{segment_level}_annotation", []))
+    demo_annotations = evaluator.load_demo_annotations(demo_id) or {}
+    evaluator._video_n_primitives = len(demo_annotations.get(f"{segment_level}_annotation", []))
     evaluator._video_primitive_idx = segment_idx + 1
     evaluator._video_primitive_desc = segment_desc
     evaluator._video_primitive_progress = 0.0
@@ -331,7 +590,7 @@ def run_single_segment(
             result_type = "env_terminated"
             break
 
-        if success_mode == "predicate_subgoal" and subgoal_indices and current_truth is not None:
+        if effective_success_mode == "predicate_subgoal" and subgoal_indices and current_truth is not None:
             all_satisfied = all(current_truth[i] for i in subgoal_indices)
             if all_satisfied:
                 success = True
@@ -348,7 +607,7 @@ def run_single_segment(
         "final_progress": current_progress if 'current_progress' in dir() else 0.0,
     }
 
-    if success_mode == "state_match":
+    if effective_success_mode == "state_match":
         done, rt = evaluator.check_primitive_success(
             primitive=segment,
             current_step=step + 1 if 'step' in dir() else max_steps,
