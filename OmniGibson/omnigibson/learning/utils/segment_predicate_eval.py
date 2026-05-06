@@ -135,66 +135,85 @@ def _object_from_name(env, name: Optional[str]):
     return None
 
 
-def _og_eval_predicate(env, name: str, args: Sequence[str]) -> bool:
+def _og_eval_predicate_detailed(env, name: str, args: Sequence[str]) -> Tuple[bool, Dict[str, Any]]:
+    diagnostics: Dict[str, Any] = {
+        "predicate_name": name,
+        "predicate_args": list(args),
+    }
     # Evaluate a compact predicate subset directly on OmniGibson runtime state.
     if name == "grasped":
         obj_name = args[1]
         obj = _object_from_name(env, obj_name)
         if obj is None:
-            return False
+            diagnostics["missing_object"] = obj_name
+            return False, diagnostics
         robot = env.robots[0]
-        return any(robot.is_grasping(arm=arm, candidate_obj=obj) for arm in robot.arm_names)
+        arm_states = {
+            arm: bool(robot.is_grasping(arm=arm, candidate_obj=obj))
+            for arm in robot.arm_names
+        }
+        diagnostics["arm_grasp_states"] = arm_states
+        return any(arm_states.values()), diagnostics
     if name == "ontop":
         obj = _object_from_name(env, args[0])
         other = _object_from_name(env, args[1])
         if obj is None or other is None:
-            return False
-        return bool(obj.states[OnTop].get_value(other))
+            diagnostics["missing_object"] = args[0] if obj is None else args[1]
+            return False, diagnostics
+        return bool(obj.states[OnTop].get_value(other)), diagnostics
     if name == "inside":
         obj = _object_from_name(env, args[0])
         other = _object_from_name(env, args[1])
         if obj is None or other is None:
-            return False
-        return bool(obj.states[Inside].get_value(other))
+            diagnostics["missing_object"] = args[0] if obj is None else args[1]
+            return False, diagnostics
+        return bool(obj.states[Inside].get_value(other)), diagnostics
     if name == "touching":
         obj = _object_from_name(env, args[0])
         other = _object_from_name(env, args[1])
         if obj is None or other is None:
-            return False
-        return bool(obj.states[Touching].get_value(other))
+            diagnostics["missing_object"] = args[0] if obj is None else args[1]
+            return False, diagnostics
+        return bool(obj.states[Touching].get_value(other)), diagnostics
     if name == "nextto":
         obj = _object_from_name(env, args[0])
         other = _object_from_name(env, args[1])
         if obj is None or other is None:
-            return False
-        return bool(obj.states[NextTo].get_value(other))
+            diagnostics["missing_object"] = args[0] if obj is None else args[1]
+            return False, diagnostics
+        return bool(obj.states[NextTo].get_value(other)), diagnostics
     if name == "attached":
         obj = _object_from_name(env, args[0])
         other = _object_from_name(env, args[1])
         if obj is None or other is None:
-            return False
-        return bool(obj.states[AttachedTo].get_value(other))
+            diagnostics["missing_object"] = args[0] if obj is None else args[1]
+            return False, diagnostics
+        return bool(obj.states[AttachedTo].get_value(other)), diagnostics
     if name == "under":
         obj = _object_from_name(env, args[0])
         other = _object_from_name(env, args[1])
         if obj is None or other is None:
-            return False
-        return bool(obj.states[Under].get_value(other))
+            diagnostics["missing_object"] = args[0] if obj is None else args[1]
+            return False, diagnostics
+        return bool(obj.states[Under].get_value(other)), diagnostics
     if name == "open":
         obj = _object_from_name(env, args[0])
         if obj is None:
-            return False
-        return bool(obj.states[Open].get_value())
+            diagnostics["missing_object"] = args[0]
+            return False, diagnostics
+        return bool(obj.states[Open].get_value()), diagnostics
     if name == "toggled_on":
         obj = _object_from_name(env, args[0])
         if obj is None:
-            return False
-        return bool(obj.states[ToggledOn].get_value())
+            diagnostics["missing_object"] = args[0]
+            return False, diagnostics
+        return bool(obj.states[ToggledOn].get_value()), diagnostics
     if name == "on_fire":
         obj = _object_from_name(env, args[0])
         if obj is None:
-            return False
-        return bool(obj.states[OnFire].get_value())
+            diagnostics["missing_object"] = args[0]
+            return False, diagnostics
+        return bool(obj.states[OnFire].get_value()), diagnostics
     raise NotImplementedError(f"Unsupported predicate for segment_predicates: {name}")
 
 
@@ -413,19 +432,28 @@ def build_auto_mined_predicates(
     return mined
 
 
-def _eval_geometry_metric(env, spec: SegmentPredicate) -> bool:
+def _eval_geometry_metric_detailed(env, spec: SegmentPredicate) -> Tuple[bool, Dict[str, Any]]:
+    diagnostics: Dict[str, Any] = {
+        "metric_name": spec.name,
+        "metric_type": spec.metric_type,
+        "metric_args": list(spec.args),
+    }
     if spec.metric_type == "base_to_object":
         target = _object_from_name(env, spec.args[0])
         if target is None:
-            return False
+            diagnostics["missing_object"] = spec.args[0]
+            return False, diagnostics
         robot_pos, _ = env.robots[0].get_position_orientation()
         target_pos, _ = target.get_position_orientation()
         dist = float(np.linalg.norm(np.asarray(robot_pos[:2]) - np.asarray(target_pos[:2])))
-        return dist <= float(spec.params["threshold"])
+        threshold = float(spec.params["threshold"])
+        diagnostics.update({"distance_xy": dist, "threshold": threshold, "target_name": spec.args[0]})
+        return dist <= threshold, diagnostics
     if spec.metric_type == "face_object":
         target = _object_from_name(env, spec.args[0])
         if target is None:
-            return False
+            diagnostics["missing_object"] = spec.args[0]
+            return False, diagnostics
         robot_pos, robot_quat = env.robots[0].get_position_orientation()
         q = np.asarray(robot_quat, dtype=float)
         x, y, z, w = q
@@ -434,24 +462,41 @@ def _eval_geometry_metric(env, spec: SegmentPredicate) -> bool:
         vec = np.asarray(target_pos[:2]) - np.asarray(robot_pos[:2])
         target_yaw = float(np.arctan2(vec[1], vec[0]))
         err = abs(np.arctan2(np.sin(robot_yaw - target_yaw), np.cos(robot_yaw - target_yaw)))
-        return err <= float(spec.params["threshold"])
+        threshold = float(spec.params["threshold"])
+        diagnostics.update({"yaw_error": err, "threshold": threshold, "target_name": spec.args[0]})
+        return err <= threshold, diagnostics
     if spec.metric_type == "object_pose_match":
         obj = _object_from_name(env, spec.args[0])
         if obj is None:
-            return False
+            diagnostics["missing_object"] = spec.args[0]
+            return False, diagnostics
         pos, _ = obj.get_position_orientation()
         tgt = np.asarray(spec.params["position"], dtype=float)
         pos = np.asarray(pos, dtype=float)
         xy_err = float(np.linalg.norm(pos[:2] - tgt[:2]))
         z_err = abs(float(pos[2] - tgt[2]))
-        return xy_err <= float(spec.params.get("xy_threshold", 0.2)) and z_err <= float(spec.params.get("z_threshold", 0.2))
+        xy_threshold = float(spec.params.get("xy_threshold", 0.2))
+        z_threshold = float(spec.params.get("z_threshold", 0.2))
+        diagnostics.update(
+            {
+                "xy_error": xy_err,
+                "z_error": z_err,
+                "xy_threshold": xy_threshold,
+                "z_threshold": z_threshold,
+                "target_name": spec.args[0],
+            }
+        )
+        return xy_err <= xy_threshold and z_err <= z_threshold, diagnostics
     if spec.metric_type == "object_orientation_match":
         obj = _object_from_name(env, spec.args[0])
         if obj is None:
-            return False
+            diagnostics["missing_object"] = spec.args[0]
+            return False, diagnostics
         _, quat = obj.get_position_orientation()
         err = _quat_angle_diff(quat, spec.params["quat"])
-        return err <= float(spec.params.get("angle_threshold", 0.55))
+        threshold = float(spec.params.get("angle_threshold", 0.55))
+        diagnostics.update({"angle_error": err, "angle_threshold": threshold, "target_name": spec.args[0]})
+        return err <= threshold, diagnostics
     raise NotImplementedError(f"Unknown geometry metric: {spec.metric_type}")
 
 
@@ -466,10 +511,12 @@ def eval_segment_predicates(
     for spec in predicate_specs:
         try:
             if spec.metric_type == "predicate":
-                value = bool(_og_eval_predicate(env, spec.name, spec.args))
+                value, diagnostics = _og_eval_predicate_detailed(env, spec.name, spec.args)
+                value = bool(value)
                 key = f"{spec.name}({','.join(spec.args)})"
             else:
-                value = bool(_eval_geometry_metric(env, spec))
+                value, diagnostics = _eval_geometry_metric_detailed(env, spec)
+                value = bool(value)
                 key = f"{spec.metric_type}({','.join(spec.args)})"
             truth[key] = value
             trace.append(
@@ -481,6 +528,7 @@ def eval_segment_predicates(
                     "satisfied": value == bool(spec.desired),
                     "source": spec.source,
                     "params": spec.params,
+                    "diagnostics": diagnostics,
                 }
             )
         except Exception as e:

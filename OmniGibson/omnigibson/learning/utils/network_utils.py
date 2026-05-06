@@ -47,6 +47,7 @@ class WebsocketClientPolicy:
         self._ws, self._server_metadata = None, None
         self._allow_reconnect = allow_reconnect
         self._last_generated_subtask = None
+        self._last_server_fresh_action = False
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
@@ -154,6 +155,7 @@ class WebsocketClientPolicy:
             "rtt_ms": (pack_s + send_s + recv_s + unpack_s) * 1000,
         }
         self._last_server_timing = deepcopy(action_dict.get("server_timing", {}))
+        self._last_server_fresh_action = bool(action_dict.get("fresh_action_plan", False))
         if "generated_subtask" in action_dict and action_dict["generated_subtask"] is not None:
             self._last_generated_subtask = action_dict["generated_subtask"]
         action = th.from_numpy(action_np).to(th.float32)
@@ -241,6 +243,7 @@ class WebsocketPolicyServer:
                 generated_subtask = getattr(policy, "last_generated_subtask", None)
                 if generated_subtask is not None:
                     action["generated_subtask"] = generated_subtask
+                action["fresh_action_plan"] = bool(getattr(policy, "last_policy_inferred", False))
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }

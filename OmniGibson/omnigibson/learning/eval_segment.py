@@ -39,11 +39,14 @@ from inspect import getsourcefile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import hydra
+import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from omnigibson.learning.eval_subtask_reset import SubTaskEvaluator, get_demo_ids_for_task
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
+from omnigibson.learning.utils.eval_utils import ROBOT_CAMERA_NAMES
 from omnigibson.learning.utils.obs_utils import create_video_writer
 from omnigibson.learning.utils.predicate_utils import (
     eval_ground_option,
@@ -94,6 +97,132 @@ def _normalize_frame_duration(raw: Any) -> Tuple[int, int]:
     if len(vals) < 2:
         raise ValueError(f"Invalid frame_duration: {raw}")
     return int(vals[0]), int(vals[-1])
+
+
+def _to_numpy_image(x: Any) -> Optional[np.ndarray]:
+    if x is None:
+        return None
+    if hasattr(x, "detach"):
+        x = x.detach()
+    if hasattr(x, "cpu"):
+        x = x.cpu()
+    if hasattr(x, "numpy"):
+        x = x.numpy()
+    arr = np.asarray(x)
+    if arr.ndim < 3:
+        return None
+    arr = arr[..., :3]
+    if np.issubdtype(arr.dtype, np.floating):
+        scale = 255.0 if float(arr.max(initial=0.0)) <= 1.5 else 1.0
+        arr = np.clip(arr * scale, 0.0, 255.0).astype(np.uint8)
+    elif arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+def _find_obs_key(obs: Dict[str, Any], key: str) -> Optional[str]:
+    if key in obs:
+        return key
+    suffix = f"{key.split('::')[0]}::rgb"
+    for candidate in obs:
+        if candidate.endswith(suffix):
+            return candidate
+    return None
+
+
+def _build_review_composite(obs: Dict[str, Any]) -> Optional[np.ndarray]:
+    """Build a single RGB image for quick visual review.
+
+    Primary path: R1Pro (left/right wrist + head) composite.
+    Fallback path: find any available `rgb` observations and build a stable 448x672 montage.
+    """
+
+    def _collect_rgb_candidates() -> List[Tuple[str, np.ndarray]]:
+        candidates: List[Tuple[str, np.ndarray]] = []
+
+        def visit(prefix: str, value: Any, depth: int) -> None:
+            if depth <= 0:
+                return
+            # Recurse common containers
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    visit(f"{prefix}/{k}" if prefix else str(k), v, depth - 1)
+                return
+            if isinstance(value, (list, tuple)):
+                for i, v in enumerate(value):
+                    visit(f"{prefix}[{i}]", v, depth - 1)
+                return
+
+            path_l = prefix.lower()
+            hinted = any(tok in path_l for tok in ("rgb", "image", "camera"))
+            img = _to_numpy_image(value)
+            if img is None:
+                return
+            h, w = int(img.shape[0]), int(img.shape[1])
+            if h < 32 or w < 32:
+                return
+            if hinted or img.shape[-1] == 3:
+                candidates.append((prefix, img))
+
+        visit("", obs, depth=5)
+        # Prefer larger images first (often the head / main camera)
+        candidates.sort(key=lambda item: int(item[1].shape[0]) * int(item[1].shape[1]), reverse=True)
+        return candidates
+
+    # 1) Preferred R1Pro montage if keys exist.
+    left_key = _find_obs_key(obs, ROBOT_CAMERA_NAMES["R1Pro"]["left_wrist"] + "::rgb")
+    right_key = _find_obs_key(obs, ROBOT_CAMERA_NAMES["R1Pro"]["right_wrist"] + "::rgb")
+    head_key = _find_obs_key(obs, ROBOT_CAMERA_NAMES["R1Pro"]["head"] + "::rgb")
+    if left_key is not None and right_key is not None and head_key is not None:
+        left = _to_numpy_image(obs.get(left_key))
+        right = _to_numpy_image(obs.get(right_key))
+        head = _to_numpy_image(obs.get(head_key))
+        if left is not None and right is not None and head is not None:
+            left = cv2.resize(left, (224, 224))
+            right = cv2.resize(right, (224, 224))
+            head = cv2.resize(head, (448, 448))
+            return np.hstack([np.vstack([left, right]), head]).copy()
+
+    # 2) Fallback: any rgb keys.
+    candidates = _collect_rgb_candidates()
+    if not candidates:
+        return None
+
+    main = cv2.resize(candidates[0][1], (448, 448))
+    if len(candidates) >= 2:
+        left_top = cv2.resize(candidates[1][1], (224, 224))
+    else:
+        left_top = cv2.resize(candidates[0][1], (224, 224))
+    if len(candidates) >= 3:
+        left_bottom = cv2.resize(candidates[2][1], (224, 224))
+    else:
+        left_bottom = left_top
+
+    return np.hstack([np.vstack([left_top, left_bottom]), main]).copy()
+
+
+def _capture_review_frame(evaluator: SubTaskEvaluator, out_path: Optional[Path]) -> Optional[str]:
+    if out_path is None:
+        return None
+    try:
+        obs = evaluator._get_obs_for_policy()
+        composite = _build_review_composite(obs)
+        if composite is None:
+            all_keys = [str(k) for k in obs.keys()]
+            rgb_keys = [k for k in all_keys if "rgb" in k.lower()]
+            logger.warning(
+                "Failed to build review composite for %s (found %d rgb-like keys). Keys (first 30): %s",
+                str(out_path),
+                len(rgb_keys),
+                all_keys[:30],
+            )
+            return None
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if cv2.imwrite(str(out_path), cv2.cvtColor(composite, cv2.COLOR_RGB2BGR)):
+            return str(out_path)
+    except Exception as exc:
+        logger.warning(f"Failed to capture review frame {out_path}: {exc}")
+    return None
 
 
 def load_segment_annotations(
@@ -202,6 +331,7 @@ def run_single_segment(
     success_mode: str = "predicate_subgoal",
     dry_run: bool = False,
     segment_max_steps: Optional[int] = None,
+    review_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     segment, annotations = get_segment(evaluator, demo_id, segment_level, segment_idx)
     if segment is None:
@@ -231,13 +361,28 @@ def run_single_segment(
         return {"error": "no_ground_goal_state_options"}
 
     if success_mode == "segment_predicates":
+        review_artifacts = {
+            "start_restore_rgb": None,
+            "end_restore_rgb": None,
+            "final_rollout_rgb": None,
+        }
         evaluator.current_demo_id = demo_id
         evaluator.current_rawdata_hdf5 = evaluator.load_rawdata_hdf5(demo_id)
         if evaluator.current_rawdata_hdf5 is None:
             evaluator.current_primitive_state_cache = evaluator.load_primitive_state_cache(demo_id)
 
         restored_start, method_start, _ = restore_and_eval_predicates(evaluator, start_frame)
+        if restored_start:
+            review_artifacts["start_restore_rgb"] = _capture_review_frame(
+                evaluator,
+                review_dir / "start_restore.png" if review_dir is not None else None,
+            )
         restored_end, method_end, _ = restore_and_eval_predicates(evaluator, end_frame)
+        if restored_end:
+            review_artifacts["end_restore_rgb"] = _capture_review_frame(
+                evaluator,
+                review_dir / "end_restore.png" if review_dir is not None else None,
+            )
         if not restored_start or not restored_end:
             return {
                 "demo_id": demo_id,
@@ -252,6 +397,7 @@ def run_single_segment(
                 "success_mode": str(success_mode),
                 "success": False,
                 "result_type": "restore_failed",
+                "review_artifacts": review_artifacts,
             }
 
         template_specs, metric_debug = build_template_predicates(segment_level, segment, evaluator.env)
@@ -270,6 +416,7 @@ def run_single_segment(
                 "success_mode": str(success_mode),
                 "success": False,
                 "result_type": "restore_failed",
+                "review_artifacts": review_artifacts,
             }
         start_truth_map, start_trace = eval_segment_predicates(evaluator.env, template_specs)
         restored_end, method_end, _ = restore_and_eval_predicates(evaluator, end_frame)
@@ -303,6 +450,7 @@ def run_single_segment(
                 "effective_success_mode": "segment_predicates",
                 "success": False,
                 "result_type": "no_predicates_generated",
+                "review_artifacts": review_artifacts,
             }
 
         # Segment rollout must start from the segment start frame, not the end frame used for target metric capture.
@@ -322,6 +470,7 @@ def run_single_segment(
                 "effective_success_mode": "segment_predicates",
                 "success": False,
                 "result_type": "restore_failed_before_rollout",
+                "review_artifacts": review_artifacts,
             }
 
         result = {
@@ -352,6 +501,7 @@ def run_single_segment(
                 "template_trace_start": start_trace,
                 "template_trace_end": end_trace,
             },
+            "review_artifacts": review_artifacts,
         }
 
         if dry_run:
@@ -425,7 +575,9 @@ def run_single_segment(
                 break
 
             if terminated:
-                success = True
+                # Env termination does NOT necessarily imply this segment's predicates were satisfied.
+                # The predicate_window_satisfied() check above is the only success condition.
+                success = False
                 result_type = "env_terminated"
                 break
 
@@ -435,6 +587,10 @@ def run_single_segment(
             "predicate_window_mode": window_mode,
             "combine_mode": combine_mode,
         }
+        result["review_artifacts"]["final_rollout_rgb"] = _capture_review_frame(
+            evaluator,
+            review_dir / "final_rollout.png" if review_dir is not None else None,
+        )
         if bool(evaluator.cfg.get("segment_predicate_dump_trace", True)):
             result["predicate_trace"] = trace_history
         result["success"] = success
@@ -661,6 +817,8 @@ if __name__ == "__main__":
     if config.write_video:
         video_dir = log_root / "videos"
         video_dir.mkdir(parents=True, exist_ok=True)
+    review_dir = log_root / "review"
+    review_dir.mkdir(parents=True, exist_ok=True)
 
     demo_data_path = config.get("demo_data_path", None)
     if demo_data_path is None:
@@ -706,6 +864,7 @@ if __name__ == "__main__":
             success_mode=success_mode,
             dry_run=dry_run,
             segment_max_steps=segment_max_steps,
+            review_dir=review_dir,
         )
 
         result["task_name"] = config.task.name

@@ -11,8 +11,13 @@ headless: true  # whether to run in headless mode (no GUI)
 eval_on_train_instances: false  # whether to eval on training instances
 eval_instance_ids: null  # specific list of instance ids to eval on, if null test on all instances
 write_video: true # whether we record videos during rollout
-partial_scene_load: false  # whether to only load task-relevant rooms for a specific task
+partial_scene_load: true  # default to the C2 optimization: only load task-relevant rooms for a specific task
 max_steps: null  # max steps per rollout episode, setting to null will use the default value (2 x average human demo completion steps)
+max_steps_human_multiplier: 2.0  # used only when max_steps is null
+render_viewer_camera: true  # whether to create / render the extra viewer camera
+gui_viewport_only: false  # whether to hide non-viewport UI windows
+viewer_width: 1280  # viewer width for the extra viewer camera
+viewer_height: 720  # viewer height for the extra viewer camera
 log_path: ???
 test_hidden: false  # [Internal use only] whether to eval on hidden test instances
 
@@ -24,6 +29,10 @@ save_rollout: false
 save_subtask_predictions: false
 perturb_pose: false
 perturb_pose_seed: 42
+video_on_replan_only: false  # if true, only save frames when the server produced a fresh action plan
+stuck_motion_window: 0  # if >0, enable conservative low-motion early-stop over this many env steps
+stuck_min_steps: 0
+stuck_motion_threshold: 0.0
 
 # parallel evaluator
 use_parallel_evaluator: false

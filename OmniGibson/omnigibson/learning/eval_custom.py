@@ -1,3 +1,4 @@
+from collections import deque
 import csv
 from inspect import getsourcefile
 import json
@@ -116,6 +117,12 @@ class Evaluator:
         self.current_instance_id: int | None = None
         self._last_step_timing: dict[str, Any] = {}
         self._last_generated_subtask: str | None = None
+        self._last_server_fresh_action = False
+        self._stuck_motion_window = max(int(getattr(self.cfg, "stuck_motion_window", 0) or 0), 0)
+        self._stuck_min_steps = max(int(getattr(self.cfg, "stuck_min_steps", 0) or 0), 0)
+        self._stuck_motion_threshold = float(getattr(self.cfg, "stuck_motion_threshold", 0.0) or 0.0)
+        self._recent_motion = deque(maxlen=self._stuck_motion_window) if self._stuck_motion_window > 0 else deque()
+        self._last_motion_pose: dict[str, th.Tensor] | None = None
 
         self.reset()
         self.env._current_episode = 0
@@ -172,10 +179,16 @@ class Evaluator:
         if self.cfg.robot.controllers is not None:
             cfg["robots"][0]["controller_config"].update(self.cfg.robot.controllers)
         if self.cfg.max_steps is None:
+            max_steps_multiplier = float(getattr(self.cfg, "max_steps_human_multiplier", 2.0))
+            if max_steps_multiplier <= 0:
+                raise ValueError(f"max_steps_human_multiplier must be positive, got {max_steps_multiplier}")
+            resolved_max_steps = int(self.human_stats["length"] * max_steps_multiplier)
             logger.info(
-                f"Setting timeout to be 2x the average length of human demos: {int(self.human_stats['length'] * 2)}"
+                "Setting timeout to be %.2fx the average length of human demos: %d",
+                max_steps_multiplier,
+                resolved_max_steps,
             )
-            cfg["task"]["termination_config"]["max_steps"] = int(self.human_stats["length"] * 2)
+            cfg["task"]["termination_config"]["max_steps"] = resolved_max_steps
         else:
             logger.info(f"Setting timeout to be {self.cfg.max_steps} steps through config.")
             cfg["task"]["termination_config"]["max_steps"] = self.cfg.max_steps
@@ -220,8 +233,10 @@ class Evaluator:
             client_timing = getattr(client, "_last_client_timing", {}) or {}
             server_timing = getattr(client, "_last_server_timing", {}) or {}
             self._last_generated_subtask = getattr(client, "_last_generated_subtask", None)
+            self._last_server_fresh_action = bool(getattr(client, "_last_server_fresh_action", False))
         else:
             self._last_generated_subtask = None
+            self._last_server_fresh_action = False
 
         self._last_step_timing = {
             "policy_ms": policy_s * 1000,
@@ -234,13 +249,23 @@ class Evaluator:
             "rtt_ms": client_timing.get("rtt_ms"),
             "server_infer_ms": server_timing.get("infer_ms"),
             "server_prev_total_ms": server_timing.get("prev_total_ms"),
+            "fresh_action_plan": self._last_server_fresh_action,
         }
-
-        if terminated or truncated:
-            self.n_trials += 1
 
         for metric in self.metrics:
             metric.step_callback(self.env)
+        self._record_motion_step()
+
+        if self._should_truncate_for_stuck():
+            truncated = True
+            info = dict(info)
+            done_info = dict(info.get("done", {}))
+            done_info["success"] = False
+            done_info["stuck_motion"] = True
+            info["done"] = done_info
+
+        if terminated or truncated:
+            self.n_trials += 1
         return terminated, truncated, info
 
     @property
@@ -318,6 +343,7 @@ class Evaluator:
 
         self.env.scene.update_initial_file()
         self.env.scene.reset()
+        self._reset_stuck_monitor()
 
     def _preprocess_obs(self, obs: dict) -> dict:
         obs = flatten_obs_dict(obs)
@@ -334,6 +360,56 @@ class Evaluator:
         obs["robot_r1::cam_rel_poses"] = th.cat(cam_rel_poses, axis=-1)
         obs["task_id"] = th.tensor([TASK_NAMES_TO_INDICES[self.cfg.task.name]], dtype=th.int64)
         return obs
+
+    def _get_motion_pose(self) -> dict[str, th.Tensor]:
+        return {
+            "base": self.robot.get_position_orientation()[0].clone(),
+            **{arm: self.robot.get_eef_position(arm).clone() for arm in self.robot.arm_names},
+        }
+
+    def _reset_stuck_monitor(self) -> None:
+        self._recent_motion.clear()
+        self._last_motion_pose = self._get_motion_pose()
+
+    def _record_motion_step(self) -> None:
+        if self._stuck_motion_window <= 0:
+            return
+        current_pose = self._get_motion_pose()
+        if self._last_motion_pose is None:
+            self._last_motion_pose = current_pose
+            return
+        total_motion = th.linalg.norm(current_pose["base"] - self._last_motion_pose["base"]).item()
+        for arm in self.robot.arm_names:
+            total_motion += th.linalg.norm(current_pose[arm] - self._last_motion_pose[arm]).item()
+        self._recent_motion.append(total_motion)
+        self._last_motion_pose = current_pose
+
+    def _should_truncate_for_stuck(self) -> bool:
+        if self._stuck_motion_window <= 0 or self._stuck_motion_threshold <= 0:
+            return False
+        if self.env._current_step < self._stuck_min_steps:
+            return False
+        if len(self._recent_motion) < self._stuck_motion_window:
+            return False
+        total_motion = float(sum(self._recent_motion))
+        if total_motion <= self._stuck_motion_threshold:
+            logger.warning(
+                "Early-stop rollout at step %s due to low motion over last %s steps: total_motion=%.4f <= %.4f",
+                self.env._current_step,
+                self._stuck_motion_window,
+                total_motion,
+                self._stuck_motion_threshold,
+            )
+            return True
+        return False
+
+    def should_write_video_frame(self) -> bool:
+        if not getattr(self.cfg, "video_on_replan_only", False):
+            return self.env._current_step % 20 == 0
+        client = getattr(self.policy, "policy", None)
+        if client is None:
+            return self.env._current_step % 20 == 0
+        return self._last_server_fresh_action
 
     def _write_video(self) -> None:
         # Export the same per-camera spatial view the model actually consumes:
@@ -412,6 +488,8 @@ class Evaluator:
             metric.start_callback(self.env)
         self.policy.reset()
         self.n_success_trials, self.n_trials = 0, 0
+        self._last_server_fresh_action = False
+        self._reset_stuck_monitor()
 
     def __enter__(self):
         signal(SIGINT, self._sigint_handler)
@@ -446,7 +524,12 @@ if __name__ == "__main__":
         config = hydra.compose("openpi-comet.yaml", overrides=sys.argv[1:])
     OmegaConf.resolve(config)
 
-    gm.HEADLESS = config.headless
+    with gm.unlocked():
+        gm.HEADLESS = config.headless
+        gm.RENDER_VIEWER_CAMERA = bool(getattr(config, "render_viewer_camera", True))
+        gm.GUI_VIEWPORT_ONLY = bool(getattr(config, "gui_viewport_only", False))
+        gm.DEFAULT_VIEWER_WIDTH = int(getattr(config, "viewer_width", gm.DEFAULT_VIEWER_WIDTH))
+        gm.DEFAULT_VIEWER_HEIGHT = int(getattr(config, "viewer_height", gm.DEFAULT_VIEWER_HEIGHT))
 
     timing_path = Path(config.log_path).expanduser() / "timing.csv"
     timing_path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,6 +551,7 @@ if __name__ == "__main__":
         "rtt_ms",
         "server_infer_ms",
         "server_prev_total_ms",
+        "fresh_action_plan",
     ]
     timing_writer = csv.DictWriter(timing_f, fieldnames=timing_fields)
     timing_writer.writeheader()
@@ -590,7 +674,7 @@ if __name__ == "__main__":
                         done = True
                     if config.save_rollout:
                         evaluator._write_rollout()
-                    if config.write_video and evaluator.env._current_step % 20 == 0:
+                    if config.write_video and evaluator.should_write_video_frame():
                         evaluator._write_video()
                     if evaluator.env._current_step % 1000 == 0:
                         logger.info(f"Current step: {evaluator.env._current_step}")

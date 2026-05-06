@@ -23,13 +23,26 @@ class RGBWrapper(EnvironmentWrapper):
         # Update robot sensors:
         for camera_id, camera_name in ROBOT_CAMERA_NAMES["R1Pro"].items():
             sensor_name = camera_name.split("::")[1]
-            if camera_id == "head":
-                robot.sensors[sensor_name].horizontal_aperture = 40.0
-                robot.sensors[sensor_name].image_height = HEAD_RESOLUTION[0]
-                robot.sensors[sensor_name].image_width = HEAD_RESOLUTION[1]
-            else:
-                robot.sensors[sensor_name].image_height = WRIST_RESOLUTION[0]
-                robot.sensors[sensor_name].image_width = WRIST_RESOLUTION[1]
+            sensor = robot.sensors.get(sensor_name)
+            if sensor is None:
+                logger.warning(f"Sensor '{sensor_name}' not found on robot; skip sensor reconfiguration")
+                continue
+            try:
+                if camera_id == "head":
+                    sensor.horizontal_aperture = 40.0
+                    sensor.image_height = HEAD_RESOLUTION[0]
+                    sensor.image_width = HEAD_RESOLUTION[1]
+                else:
+                    sensor.image_height = WRIST_RESOLUTION[0]
+                    sensor.image_width = WRIST_RESOLUTION[1]
+            except Exception as e:  # noqa: BLE001
+                # Some Isaac/Replicator versions can crash (or segfault later) when mutating
+                # render product settings in certain headless / no-viewer configurations.
+                # Best-effort: keep default sensor settings rather than failing evaluation.
+                logger.warning(
+                    f"Failed to reconfigure sensor '{sensor_name}' (camera_id='{camera_id}'): "
+                    f"{type(e).__name__}: {e}. Keep defaults.")
+                continue
             # # add depth and segmentation
             # robot.sensors[sensor_name].add_modality("depth_linear")
             # robot.sensors[sensor_name].add_modality("seg_semantic")
