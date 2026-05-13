@@ -61,6 +61,16 @@ python OmniGibson/omnigibson/learning/eval_segment.py \
 3. 如遇 GPU 问题，设置 `export OMNIGIBSON_GPU_ID=<可用GPU编号>`
 4. 首次运行 `import omnigibson` 可能需要数分钟初始化
 
+## 安全启动建议
+
+1. 做正式对比实验时，优先使用 `openpi-comet/scripts/run_skill_metric_multinode_sweep.py` 启动，而不是手工分别起 `serve_b1k.py` 与 `eval_segment.py`
+2. 如必须手工启动 websocket eval，务必保证 **一条 task 一个 server**，不要让多个不同 `task.name` 共享同一个 policy server
+3. 正式运行时建议显式校验以下字段：`model.expected_task_name`、`model.expected_task_prompt_sha256`、`model.expected_server_run_id`、`model.expected_server_token`
+4. 如果只看到 `healthz` 成功，不代表连对了 server；必须结合 metadata 做身份校验，否则旧 run 残留进程可能污染结果
+5. 若同一条样例结果前后“抖动”，优先排查：旧 server 未退出、端口复用、`--resume` 复用了脏输出目录、JAX/Torch backend 与 server 不匹配、代理变量干扰 localhost websocket
+6. 对比实验时固定 job 清单、`segment_max_steps` / `max_dynamic_steps_cap`、checkpoint 路径、`policy_backend`，不要一边重跑一边改配置
+7. 若是查看单条 segment 失败原因，可直接读 `segment_eval.log`、`metrics/*.json` 和 `review/*.png`；若要下正式结论，必须看整次 run 的 `multinode_skill_summary.json`
+
 ## 相关文件
 
 - 脚本：`OmniGibson/omnigibson/learning/eval_segment.py`
