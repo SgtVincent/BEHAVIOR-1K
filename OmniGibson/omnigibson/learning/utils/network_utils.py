@@ -5,6 +5,7 @@ Adapted from https://github.com/Physical-Intelligence/openpi
 import asyncio
 import functools
 import http
+import json
 import logging
 import msgpack
 import numpy as np
@@ -38,6 +39,10 @@ class WebsocketClientPolicy:
         port: Optional[int] = None,
         api_key: Optional[str] = None,
         allow_reconnect: bool = False,
+        expected_task_name: Optional[str] = None,
+        expected_task_prompt_sha256: Optional[str] = None,
+        expected_server_run_id: Optional[str] = None,
+        expected_server_token: Optional[str] = None,
     ) -> None:
         self._uri = f"wss://{host}" if int(port) == 443 else f"ws://{host}"
         if port is not None:
@@ -48,9 +53,30 @@ class WebsocketClientPolicy:
         self._allow_reconnect = allow_reconnect
         self._last_generated_subtask = None
         self._last_server_fresh_action = False
+        self._last_prompt_debug = None
+        self._expected_server_identity = {
+            "task_name": expected_task_name,
+            "task_prompt_sha256": expected_task_prompt_sha256,
+            "server_run_id": expected_server_run_id,
+            "server_token": expected_server_token,
+        }
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
+
+    def _validate_server_identity(self, metadata: Dict, *, source: str) -> None:
+        mismatches = []
+        for key, expected in self._expected_server_identity.items():
+            if expected is None:
+                continue
+            actual = metadata.get(key)
+            if actual != expected:
+                mismatches.append(f"{key}: expected={expected!r}, actual={actual!r}")
+        if mismatches:
+            raise RuntimeError(
+                f"Connected to unexpected policy server via {source}. "
+                + "; ".join(mismatches)
+            )
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         # TODO [Wensi]: use URL parser instead of this
@@ -74,8 +100,15 @@ class WebsocketClientPolicy:
                     proxies={"http": None, "https": None},
                 )
                 if response.ok:
+                    if any(value is not None for value in self._expected_server_identity.values()):
+                        try:
+                            self._validate_server_identity(response.json(), source=f"healthz:{health_url}")
+                        except ValueError:
+                            raise RuntimeError(f"Health check response from {health_url} is not valid JSON")
                     logger.info("Health check passed, attempting websocket connection...")
                     break
+            except RuntimeError:
+                raise
             except Exception:
                 pass
             logger.info(f"Health check failed, waiting for server at {health_url}...")
@@ -90,10 +123,12 @@ class WebsocketClientPolicy:
                     compression=None,
                     max_size=None,
                     additional_headers=headers,
+                    proxy=None,
                     ping_interval=60,
                     ping_timeout=300,
                 )
                 metadata = unpackb(conn.recv())
+                self._validate_server_identity(metadata, source=f"websocket:{self._uri}")
                 logger.info("Connected to server!")
                 return conn, metadata
             except (ConnectionRefusedError, websockets.exceptions.InvalidMessage, EOFError) as e:
@@ -158,6 +193,7 @@ class WebsocketClientPolicy:
         self._last_server_fresh_action = bool(action_dict.get("fresh_action_plan", False))
         if "generated_subtask" in action_dict and action_dict["generated_subtask"] is not None:
             self._last_generated_subtask = action_dict["generated_subtask"]
+        self._last_prompt_debug = deepcopy(action_dict.get("prompt_debug"))
         action = th.from_numpy(action_np).to(th.float32)
         return action
 
@@ -187,6 +223,18 @@ class WebsocketPolicyServer:
         self._port = port
         self._metadata = metadata or {}
 
+    def _health_payload(self) -> dict:
+        return {"ok": True, **self._metadata}
+
+    def _process_request(self, connection, request) -> Optional[Any]:
+        if hasattr(request, "path") and request.path == "/healthz":
+            body = json.dumps(self._health_payload(), sort_keys=True).encode("utf-8") + b"\n"
+            headers = {"Content-Type": "application/json"}
+            if hasattr(connection, "respond"):
+                return connection.respond(http.HTTPStatus.OK, body.decode("utf-8"))
+            return http.HTTPStatus.OK, headers, body
+        return None
+
     def serve_forever(self) -> None:
         asyncio.run(self.run())
 
@@ -198,7 +246,7 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
-            process_request=_health_check,
+            process_request=self._process_request,
         ) as server:
             await server.serve_forever()
 
@@ -243,6 +291,9 @@ class WebsocketPolicyServer:
                 generated_subtask = getattr(policy, "last_generated_subtask", None)
                 if generated_subtask is not None:
                     action["generated_subtask"] = generated_subtask
+                prompt_debug = getattr(policy, "last_prompt_debug", None)
+                if prompt_debug is not None:
+                    action["prompt_debug"] = deepcopy(prompt_debug)
                 action["fresh_action_plan"] = bool(getattr(policy, "last_policy_inferred", False))
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
@@ -271,19 +322,6 @@ class WebsocketPolicyServer:
                     # Fallback for older websockets versions
                     await websocket.close(code=1011, reason="Internal server error")
                 raise
-
-
-def _health_check(connection, request) -> Optional[Any]:
-    if hasattr(request, "path") and request.path == "/healthz":
-        if hasattr(connection, "respond"):
-            return connection.respond(http.HTTPStatus.OK, "OK\n")
-        else:
-            # For older websockets versions, return a simple response
-            return http.HTTPStatus.OK, {"Content-Type": "text/plain"}, b"OK\n"
-    # Continue with the normal request handling.
-    return None
-
-
 """
 Adds NumPy array support to msgpack.
 

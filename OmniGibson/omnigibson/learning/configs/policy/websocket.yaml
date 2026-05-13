@@ -6,3 +6,7 @@ model:
   _target_: omnigibson.learning.policies.WebsocketPolicy
   host: localhost
   port: 8000
+  expected_task_name: null
+  expected_task_prompt_sha256: null
+  expected_server_run_id: null
+  expected_server_token: null

@@ -207,6 +207,11 @@ class Evaluator:
         self.robot_action = self.policy.forward(obs=self.obs)
 
         obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+        self._last_step_info = info
+        self._last_done_info = dict((info or {}).get("done", {}) or {})
+        self._last_env_done_success = self._last_done_info.get("success")
+        self._last_terminated = bool(terminated)
+        self._last_truncated = bool(truncated)
 
         # process obs
         self.obs = self._preprocess_obs(obs)

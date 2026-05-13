@@ -37,6 +37,7 @@ from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES
 from omnigibson.learning.utils.eval_utils import WRIST_RESOLUTION
 from omnigibson.learning.utils.eval_utils import flatten_obs_dict
 from omnigibson.learning.utils.eval_utils import generate_basic_environment_config
+from omnigibson.learning.utils.eval_diagnostics import build_termination_summary
 from omnigibson.learning.utils.obs_utils import create_video_writer
 from omnigibson.learning.utils.obs_utils import write_video
 from omnigibson.macros import create_module_macros
@@ -117,6 +118,7 @@ class Evaluator:
         self.current_instance_id: int | None = None
         self._last_step_timing: dict[str, Any] = {}
         self._last_generated_subtask: str | None = None
+        self._last_prompt_debug: dict[str, Any] | None = None
         self._last_server_fresh_action = False
         self._stuck_motion_window = max(int(getattr(self.cfg, "stuck_motion_window", 0) or 0), 0)
         self._stuck_min_steps = max(int(getattr(self.cfg, "stuck_min_steps", 0) or 0), 0)
@@ -233,9 +235,11 @@ class Evaluator:
             client_timing = getattr(client, "_last_client_timing", {}) or {}
             server_timing = getattr(client, "_last_server_timing", {}) or {}
             self._last_generated_subtask = getattr(client, "_last_generated_subtask", None)
+            self._last_prompt_debug = getattr(client, "_last_prompt_debug", None)
             self._last_server_fresh_action = bool(getattr(client, "_last_server_fresh_action", False))
         else:
             self._last_generated_subtask = None
+            self._last_prompt_debug = None
             self._last_server_fresh_action = False
 
         self._last_step_timing = {
@@ -690,6 +694,14 @@ if __name__ == "__main__":
                     row.update(evaluator._last_step_timing)
                     timing_writer.writerow(row)
                     if subtask_predictions_f is not None:
+                        termination_summary = build_termination_summary(
+                            terminated=terminated,
+                            truncated=truncated,
+                            env_current_step=evaluator.env._current_step,
+                            done_info=info.get("done", {}),
+                            prompt_debug=evaluator._last_prompt_debug,
+                            generated_subtask=evaluator._last_generated_subtask,
+                        )
                         subtask_predictions_f.write(
                             json.dumps(
                                 {
@@ -700,6 +712,8 @@ if __name__ == "__main__":
                                     "step_idx": row["step_idx"],
                                     "env_current_step": row["env_current_step"],
                                     "generated_subtask": evaluator._last_generated_subtask,
+                                    "prompt_debug": evaluator._last_prompt_debug,
+                                    "termination_summary": termination_summary,
                                 }
                             )
                             + "\n"
@@ -741,6 +755,14 @@ if __name__ == "__main__":
                 logger.info(f"Total success trials: {evaluator.n_success_trials}")
                 for metric in evaluator.metrics:
                     metrics.update(metric.gather_results())
+                metrics["termination_summary"] = build_termination_summary(
+                    terminated=terminated,
+                    truncated=truncated,
+                    env_current_step=evaluator.env._current_step,
+                    done_info=info.get("done", {}),
+                    prompt_debug=evaluator._last_prompt_debug,
+                    generated_subtask=evaluator._last_generated_subtask,
+                )
                 with open(metrics_path / f"{config.task.name}_{idx}_{epi}.json", "w") as f:
                     json.dump(metrics, f)
                 if config.write_video:
