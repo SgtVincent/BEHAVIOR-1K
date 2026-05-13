@@ -62,4 +62,14 @@ segment_predicate_generation: hybrid
 segment_predicate_window_mode: anytime
 segment_predicate_last_k: 20
 segment_predicate_min_consecutive: 1
+# Generic early-stop safeguard. A predicate hit before this many rollout steps is
+# treated as a transient / non-reviewable success candidate and rollout continues.
+segment_predicate_min_success_steps: 150
 segment_predicate_dump_trace: true
+# In segment-predicate mode, whole-task env success is telemetry, not the segment success condition.
+# Keep false so a task-level success (e.g. attached relation) does not cut off a still-unsatisfied final skill
+# predicate such as release / not-grasped.
+segment_predicate_env_termination_is_terminal: false
+
+# Review-video safeguard: pad very short clips with duplicate final-state frames up to this estimate.
+review_video_min_meaningful_frames: 30

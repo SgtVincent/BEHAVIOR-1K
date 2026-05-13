@@ -22,6 +22,8 @@ from omnigibson.learning.utils.segment_skill_metric_registry import get_skill_me
 logger = logging.getLogger("segment_predicate_eval")
 logger.setLevel(logging.INFO)
 
+MISSING_OBJECT_RESULT_TYPE = "metric_invalid_missing_object"
+
 _NON_OBJECT_ROLE_TOKENS = {"robot", "right", "left", "face", "low_level", ""}
 
 
@@ -128,11 +130,55 @@ def _object_from_name(env, name: Optional[str]):
     inst_to_name = env.scene.get_task_metadata("inst_to_name")
     if isinstance(inst_to_name, dict):
         for inst, obj_name in inst_to_name.items():
+            if inst == name:
+                maybe = env.scene.object_registry("name", obj_name)
+                if maybe is not None:
+                    return maybe
             if obj_name == name:
                 maybe = env.scene.object_registry("name", obj_name)
                 if maybe is not None:
                     return maybe
     return None
+
+
+def _task_activity_name(env) -> str:
+    return str(getattr(getattr(env, "task", None), "activity_name", "") or "")
+
+
+def _goal_body_arg_to_name(arg: Any) -> Optional[str]:
+    return _safe_name(str(arg).lstrip("?"))
+
+
+def _task_goal_predicates(env, predicate_names: Sequence[str]) -> List[SegmentPredicate]:
+    allowed = set(predicate_names)
+    specs: List[SegmentPredicate] = []
+    seen = set()
+    for option in getattr(getattr(env, "task", None), "ground_goal_state_options", []) or []:
+        for head in option or []:
+            body = getattr(head, "body", None)
+            if not body or len(body) < 2 or str(body[0]) not in allowed:
+                continue
+            args = [_goal_body_arg_to_name(arg) for arg in body[1:]]
+            if any(arg is None for arg in args):
+                continue
+            key = (str(body[0]), tuple(args))
+            if key in seen:
+                continue
+            seen.add(key)
+            specs.append(
+                SegmentPredicate(
+                    metric_type="predicate",
+                    name=str(body[0]),
+                    args=[str(arg) for arg in args],
+                    desired=True,
+                    source="task_goal_final_relation",
+                    params={
+                        "metric_family": "task_aware_release_relation",
+                        "success_rule": "task final relation remains satisfied during release",
+                    },
+                )
+            )
+    return specs
 
 
 def _og_eval_predicate_detailed(env, name: str, args: Sequence[str]) -> Tuple[bool, Dict[str, Any]]:
@@ -361,12 +407,37 @@ def build_template_predicates(
                 )
             )
 
+    task_prefixes = entry.get("task_aware_final_relation_task_prefixes") or []
+    relation_predicate_names = entry.get("task_aware_final_relation_predicates") or []
+    if relation_predicate_names and any(_task_activity_name(env).startswith(str(prefix)) for prefix in task_prefixes):
+        existing = {(spec.name, tuple(spec.args), spec.desired) for spec in specs if spec.metric_type == "predicate"}
+        for spec in _task_goal_predicates(env, relation_predicate_names):
+            key = (spec.name, tuple(spec.args), spec.desired)
+            if key not in existing:
+                specs.append(spec)
+                existing.add(key)
+
     debug = {
         "metric_family": entry["metric_family"],
         "success_rule": entry["success_rule"],
         "combine_mode": entry.get("combine_mode", "all_of"),
         "require_unsatisfied_at_start": bool(entry.get("require_unsatisfied_at_start", True)),
     }
+    debug.update(
+        {
+            key: value
+            for key, value in entry.items()
+            if key
+            not in {
+                "metric_family",
+                "success_rule",
+                "combine_mode",
+                "require_unsatisfied_at_start",
+                "metrics",
+                "object_roles",
+            }
+        }
+    )
     return specs, debug
 
 
@@ -538,21 +609,51 @@ def eval_segment_predicates(
     return truth, trace
 
 
+def trace_missing_objects(trace: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    missing_objects: List[Dict[str, Any]] = []
+    for item in trace or []:
+        diagnostics = item.get("diagnostics") or {}
+        missing_object = diagnostics.get("missing_object")
+        if missing_object is None:
+            continue
+        missing_objects.append(
+            {
+                "predicate": item.get("predicate"),
+                "metric_type": item.get("metric_type"),
+                "desired": item.get("desired"),
+                "value": item.get("value"),
+                "satisfied": item.get("satisfied"),
+                "missing_object": missing_object,
+            }
+        )
+    return missing_objects
+
+
+def trace_has_missing_object(trace: Sequence[Dict[str, Any]]) -> bool:
+    return bool(trace_missing_objects(trace))
+
+
 def predicate_window_satisfied(history: Sequence[List[Dict[str, Any]]], mode: str = "anytime", last_k: int = 20, min_consecutive: int = 1, combine_mode: str = "all_of") -> bool:
     if not history:
         return False
-    if combine_mode == "any_of":
-        sat_flags = [any(item.get("satisfied", False) for item in step_trace) and len(step_trace) > 0 for step_trace in history]
-    else:
-        sat_flags = [all(item.get("satisfied", False) for item in step_trace) and len(step_trace) > 0 for step_trace in history]
+    def step_trace_satisfied(step_trace: List[Dict[str, Any]]) -> bool:
+        if not step_trace or trace_has_missing_object(step_trace):
+            return False
+        if combine_mode == "any_of":
+            return any(item.get("satisfied", False) for item in step_trace)
+        return all(item.get("satisfied", False) for item in step_trace)
+
+    sat_flags = [step_trace_satisfied(step_trace) for step_trace in history]
     if mode == "last_k":
         window = sat_flags[-max(last_k, 1):]
         return any(window)
     if mode == "consecutive":
         run = 0
-        for flag in sat_flags:
+        for flag in reversed(sat_flags):
             run = run + 1 if flag else 0
+            if not flag:
+                break
             if run >= max(min_consecutive, 1):
                 return True
-        return False
+        return run >= max(min_consecutive, 1)
     return any(sat_flags)

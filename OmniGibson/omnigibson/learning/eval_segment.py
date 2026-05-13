@@ -46,6 +46,15 @@ from omegaconf import DictConfig, OmegaConf
 
 from omnigibson.learning.eval_subtask_reset import SubTaskEvaluator, get_demo_ids_for_task
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
+from omnigibson.learning.utils.eval_diagnostics import (
+    ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS,
+    build_pre_satisfied_start_result,
+    build_termination_summary,
+    classify_short_proxy_success,
+    classify_short_video_success,
+    finalize_segment_predicate_result_type,
+    update_segment_env_termination_telemetry,
+)
 from omnigibson.learning.utils.eval_utils import ROBOT_CAMERA_NAMES
 from omnigibson.learning.utils.obs_utils import create_video_writer
 from omnigibson.learning.utils.predicate_utils import (
@@ -59,10 +68,12 @@ from omnigibson.learning.utils.predicate_utils import (
     get_subgoal_predicates,
 )
 from omnigibson.learning.utils.segment_predicate_eval import (
+    MISSING_OBJECT_RESULT_TYPE,
     build_auto_mined_predicates,
     build_template_predicates,
     eval_segment_predicates,
     predicate_window_satisfied,
+    trace_missing_objects,
 )
 from omnigibson.macros import gm
 
@@ -80,6 +91,43 @@ def _as_demo_id(x: Any) -> str:
 
 def _get_instance_id_from_demo_id(demo_id: str) -> int:
     return int(demo_id) // 10 % 1000
+
+
+def _video_rgb_obs_ready(evaluator: SubTaskEvaluator) -> bool:
+    obs = getattr(evaluator, "obs", None) or {}
+    return all(
+        ROBOT_CAMERA_NAMES["R1Pro"][camera_name] + "::rgb" in obs
+        for camera_name in ("head", "left_wrist", "right_wrist")
+    )
+
+
+def _pad_review_video_tail(
+    evaluator: SubTaskEvaluator,
+    *,
+    current_frames: int,
+    min_frames: int,
+) -> int:
+    """Append duplicate final-state frames so very short review videos are inspectable.
+
+    This does not step the simulator or affect rollout metrics; it only writes extra copies of
+    the current observation to the active video writer.
+    """
+    missing_frames = max(int(min_frames) - max(int(current_frames), 0), 0)
+    if missing_frames <= 0 or getattr(evaluator, "video_writer", None) is None:
+        return 0
+    if not _video_rgb_obs_ready(evaluator):
+        try:
+            evaluator.obs = evaluator._preprocess_obs(evaluator._get_obs_for_policy())
+        except Exception as exc:
+            logger.warning("Unable to refresh observation for review-video tail padding: %s", exc)
+            return 0
+    if not _video_rgb_obs_ready(evaluator):
+        return 0
+
+    evaluator._video_primitive_progress = 1.0
+    for _ in range(missing_frames):
+        evaluator._write_video()
+    return missing_frames
 
 
 def _flatten_numeric(x: Any) -> List[int]:
@@ -523,48 +571,170 @@ def run_single_segment(
             1,
         )
         trace_history: List[List[Dict[str, Any]]] = []
+        activation_trace_history: List[List[Dict[str, Any]]] = []
         success = False
         result_type = "timeout"
 
         window_mode = str(evaluator.cfg.get("segment_predicate_window_mode", "anytime"))
         last_k = int(evaluator.cfg.get("segment_predicate_last_k", 20))
         min_consecutive = int(evaluator.cfg.get("segment_predicate_min_consecutive", 1))
+        min_success_steps_cfg = int(evaluator.cfg.get("segment_predicate_min_success_steps", 150))
+        env_termination_is_terminal = bool(evaluator.cfg.get("segment_predicate_env_termination_is_terminal", False))
         combine_mode = str(metric_debug.get("combine_mode", "all_of"))
+        min_success_steps = max(min_success_steps_cfg, 0)
+        first_predicate_satisfied_step: Optional[int] = None
+        early_predicate_satisfied_steps = 0
+        missing_object_traces: List[Dict[str, Any]] = []
+        for trace_stage, trace in (("template_start", start_trace), ("template_end", end_trace)):
+            for item in trace_missing_objects(trace):
+                item["trace_stage"] = trace_stage
+                missing_object_traces.append(item)
+        result["predicate_debug"]["missing_object_traces"] = missing_object_traces
+        if missing_object_traces:
+            env_terminal_debug = build_termination_summary(
+                terminated=False,
+                truncated=False,
+                env_current_step=int(getattr(evaluator.env, "_current_step", 0)),
+                done_info=None,
+                prompt_debug=getattr(evaluator, "_last_prompt_debug", None),
+                generated_subtask=getattr(evaluator, "_last_generated_subtask", None),
+            )
+            result["rollout"] = {
+                "max_steps": max_steps,
+                "final_step": 0,
+                "predicate_window_mode": window_mode,
+                "combine_mode": combine_mode,
+                "rollout_attempted": False,
+                "termination_reason": MISSING_OBJECT_RESULT_TYPE,
+                "terminated": False,
+                "truncated": False,
+                "env_done_success": None,
+                "env_terminal_debug": env_terminal_debug,
+            }
+            result["review_artifacts"]["final_rollout_rgb"] = _capture_review_frame(
+                evaluator,
+                review_dir / "final_rollout.png" if review_dir is not None else None,
+            )
+            if bool(evaluator.cfg.get("segment_predicate_dump_trace", True)):
+                result["predicate_trace"] = trace_history
+            result["success"] = False
+            result["result_type"] = MISSING_OBJECT_RESULT_TYPE
+            return result
         start_all_satisfied = (
             any(item.get("satisfied", False) for item in start_trace)
             if combine_mode == "any_of"
             else all(item.get("satisfied", False) for item in start_trace)
         ) if len(start_trace) > 0 else False
         require_unsatisfied_at_start = bool(metric_debug.get("require_unsatisfied_at_start", True))
-        activation_armed = not (require_unsatisfied_at_start and start_all_satisfied)
+        invalid_start_state = require_unsatisfied_at_start and start_all_satisfied
         result["predicate_debug"]["start_all_satisfied"] = start_all_satisfied
         result["predicate_debug"]["require_unsatisfied_at_start"] = require_unsatisfied_at_start
 
+        if invalid_start_state:
+            result["rollout"], result_type = build_pre_satisfied_start_result(
+                max_steps=max_steps,
+                window_mode=window_mode,
+                combine_mode=combine_mode,
+                start_all_satisfied=start_all_satisfied,
+                require_unsatisfied_at_start=require_unsatisfied_at_start,
+            )
+            result["review_artifacts"]["final_rollout_rgb"] = _capture_review_frame(
+                evaluator,
+                review_dir / "final_rollout.png" if review_dir is not None else None,
+            )
+            if bool(evaluator.cfg.get("segment_predicate_dump_trace", True)):
+                result["predicate_trace"] = trace_history
+            result["success"] = False
+            result["result_type"] = result_type
+            return result
+
+        min_yaw_error_improvement = metric_debug.get("min_yaw_error_improvement")
+        start_yaw_errors = {
+            item.get("predicate"): float(item.get("diagnostics", {}).get("yaw_error"))
+            for item in start_trace
+            if item.get("metric_type") == "face_object"
+            and item.get("diagnostics", {}).get("yaw_error") is not None
+        }
+
+        def _yaw_improvement_satisfied(step_trace: List[Dict[str, Any]]) -> bool:
+            if min_yaw_error_improvement is None or not start_yaw_errors:
+                return True
+            try:
+                min_improvement = float(min_yaw_error_improvement)
+            except (TypeError, ValueError):
+                return True
+            if min_improvement <= 0:
+                return True
+            for item in step_trace:
+                if item.get("metric_type") != "face_object":
+                    continue
+                predicate_name = item.get("predicate")
+                if predicate_name not in start_yaw_errors:
+                    continue
+                current_yaw_error = item.get("diagnostics", {}).get("yaw_error")
+                if current_yaw_error is None:
+                    return False
+                if start_yaw_errors[predicate_name] - float(current_yaw_error) < min_improvement:
+                    return False
+            return True
+
+        final_step = 0
+        last_terminated = False
+        last_truncated = False
+        last_done_info: Dict[str, Any] = {}
+        last_env_done_success = None
+        env_termination_telemetry: Dict[str, Any] = {
+            "env_termination_is_terminal": env_termination_is_terminal,
+            "env_terminated_seen": False,
+            "env_done_success_seen": False,
+            "first_env_terminated_step": None,
+            "first_env_done_success_step": None,
+            "env_termination_count": 0,
+        }
         for step in range(max_steps):
             evaluator.obs["_meta"] = meta
             terminated, truncated = evaluator.step()
+            final_step = step + 1
+            last_terminated = bool(terminated)
+            last_truncated = bool(truncated)
+            last_done_info = dict(getattr(evaluator, "_last_done_info", {}) or {})
+            last_env_done_success = getattr(evaluator, "_last_env_done_success", None)
+            update_segment_env_termination_telemetry(
+                env_termination_telemetry,
+                step=step + 1,
+                terminated=last_terminated,
+                env_done_success=last_env_done_success,
+            )
             _, step_trace = eval_segment_predicates(evaluator.env, predicate_specs)
             trace_history.append(step_trace)
-            if not activation_armed:
-                step_satisfied_now = (
-                    any(item.get("satisfied", False) for item in step_trace)
-                    if combine_mode == "any_of"
-                    else all(item.get("satisfied", False) for item in step_trace)
-                ) if len(step_trace) > 0 else False
-                if not step_satisfied_now:
-                    activation_armed = True
+            activation_trace_history.append(step_trace)
 
             evaluator._video_primitive_progress = (step + 1) / float(max_steps)
             if evaluator.cfg.write_video:
                 evaluator._write_video()
 
-            if activation_armed and predicate_window_satisfied(
-                trace_history,
+            step_missing_objects = trace_missing_objects(step_trace)
+            if step_missing_objects:
+                for item in step_missing_objects:
+                    item["trace_stage"] = "rollout"
+                    item["rollout_step"] = step
+                result["predicate_debug"].setdefault("missing_object_traces", []).extend(step_missing_objects)
+                success = False
+                result_type = MISSING_OBJECT_RESULT_TYPE
+                break
+
+            if predicate_window_satisfied(
+                activation_trace_history,
                 mode=window_mode,
                 last_k=last_k,
                 min_consecutive=min_consecutive,
                 combine_mode=combine_mode,
-            ):
+            ) and _yaw_improvement_satisfied(step_trace):
+                if first_predicate_satisfied_step is None:
+                    first_predicate_satisfied_step = final_step
+                if final_step < min_success_steps:
+                    early_predicate_satisfied_steps += 1
+                    continue
                 success = True
                 result_type = "predicate_satisfied"
                 break
@@ -574,18 +744,72 @@ def run_single_segment(
                 result_type = "truncated"
                 break
 
-            if terminated:
+            if terminated and env_termination_is_terminal:
                 # Env termination does NOT necessarily imply this segment's predicates were satisfied.
                 # The predicate_window_satisfied() check above is the only success condition.
                 success = False
                 result_type = "env_terminated"
                 break
 
+        result_type = finalize_segment_predicate_result_type(
+            success=success,
+            result_type=result_type,
+            env_done_success_seen=bool(env_termination_telemetry["env_done_success_seen"]),
+        )
+        success, result_type, short_proxy_diagnostics = classify_short_proxy_success(
+            success=success,
+            result_type=result_type,
+            final_step=final_step or max_steps,
+            max_steps=max_steps,
+            metric_debug=metric_debug,
+        )
+        result["predicate_debug"].update(short_proxy_diagnostics)
+        success, result_type, short_video_diagnostics = classify_short_video_success(
+            success=success,
+            result_type=result_type,
+            final_step=final_step or max_steps,
+            max_steps=max_steps,
+            min_rollout_steps_for_success=min_success_steps,
+        )
+        result["predicate_debug"].update(short_video_diagnostics)
+        result["predicate_debug"].update(
+            {
+                "min_success_steps": min_success_steps,
+                "first_predicate_satisfied_step": first_predicate_satisfied_step,
+                "early_predicate_satisfied_steps": early_predicate_satisfied_steps,
+            }
+        )
+        env_terminal_debug = build_termination_summary(
+            terminated=last_terminated,
+            truncated=last_truncated,
+            env_current_step=int(getattr(evaluator.env, "_current_step", 0)),
+            done_info=last_done_info,
+            prompt_debug=getattr(evaluator, "_last_prompt_debug", None),
+            generated_subtask=getattr(evaluator, "_last_generated_subtask", None),
+        )
         result["rollout"] = {
             "max_steps": max_steps,
-            "final_step": step + 1 if "step" in dir() else max_steps,
+            "final_step": final_step or max_steps,
             "predicate_window_mode": window_mode,
+            "predicate_min_success_steps": min_success_steps,
             "combine_mode": combine_mode,
+            "rollout_attempted": True,
+            "termination_reason": result_type,
+            "env_termination_reason": env_terminal_debug.get("termination_reason"),
+            "terminated": bool(env_termination_telemetry["env_terminated_seen"]),
+            "last_terminated": last_terminated,
+            "truncated": last_truncated,
+            "env_done_success": bool(env_termination_telemetry["env_done_success_seen"])
+            if env_termination_telemetry["env_done_success_seen"] or last_env_done_success is not None
+            else None,
+            "last_env_done_success": None if last_env_done_success is None else bool(last_env_done_success),
+            "env_terminated_seen": bool(env_termination_telemetry["env_terminated_seen"]),
+            "env_done_success_seen": bool(env_termination_telemetry["env_done_success_seen"]),
+            "first_env_terminated_step": env_termination_telemetry["first_env_terminated_step"],
+            "first_env_done_success_step": env_termination_telemetry["first_env_done_success_step"],
+            "env_termination_count": int(env_termination_telemetry["env_termination_count"]),
+            "env_task_success_before_segment_success": result_type == ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS,
+            "env_terminal_debug": env_terminal_debug,
         }
         result["review_artifacts"]["final_rollout_rgb"] = _capture_review_frame(
             evaluator,
@@ -869,6 +1093,30 @@ if __name__ == "__main__":
 
         result["task_name"] = config.task.name
         result["instance_id"] = instance_id
+        if config.write_video and video_name is not None:
+            review_artifacts = result.setdefault("review_artifacts", {})
+            rollout = result.get("rollout") or {}
+            rollout_frame_count_estimate = int(rollout.get("final_step") or 0)
+            video_rate = 30
+            min_meaningful_frames = int(config.get("review_video_min_meaningful_frames", 30))
+            tail_frames_appended = _pad_review_video_tail(
+                evaluator,
+                current_frames=rollout_frame_count_estimate,
+                min_frames=min_meaningful_frames,
+            )
+            estimated_frames = rollout_frame_count_estimate + tail_frames_appended
+            review_artifacts.update(
+                {
+                    "video_path": video_name,
+                    "video_rollout_frame_count_estimate": rollout_frame_count_estimate,
+                    "video_tail_frames_appended": tail_frames_appended,
+                    "video_frame_count_estimate": estimated_frames,
+                    "video_duration_s_estimate": estimated_frames / float(video_rate) if estimated_frames else 0.0,
+                    "video_min_meaningful_frames": min_meaningful_frames,
+                    "video_too_short_for_review": estimated_frames < min_meaningful_frames,
+                    "video_early_stop_reason": result.get("result_type") if rollout_frame_count_estimate < min_meaningful_frames else None,
+                }
+            )
 
         out_path = metrics_path / f"segment_eval_{config.task.name}_{demo_id}_{segment_level}{segment_idx:03d}.json"
         with open(out_path, "w") as f:

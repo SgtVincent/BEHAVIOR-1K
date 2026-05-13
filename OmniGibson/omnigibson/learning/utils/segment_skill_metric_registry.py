@@ -19,7 +19,7 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
         "object_roles": ["target_or_obj"],
         "success_rule": "robot base stays within a target-relative proximity threshold captured from demo end state",
         "metrics": [_geom("base_to_object", "target_or_obj", margin=0.10, min_threshold=0.30)],
-        "require_unsatisfied_at_start": False,
+        "require_unsatisfied_at_start": True,
     },
     "pick up from": {
         "metric_family": "grasp_relation",
@@ -30,6 +30,7 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
             _pred("ontop", ["obj", "src_or_target"], False),
             _pred("inside", ["obj", "src_or_target"], False),
         ],
+        "require_unsatisfied_at_start": True,
     },
     "place in": {
         "metric_family": "relation_place_inside",
@@ -55,9 +56,10 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
         "success_rule": "object reaches demo-end target pose or becomes nextto target",
         "metrics": [
             _pred("nextto", ["obj", "target_or_dst"], True),
-            _geom("object_pose_match", "obj", xy_threshold=0.25, z_threshold=0.20),
+            _geom("object_pose_match", "obj", xy_threshold=0.12, z_threshold=0.10),
         ],
         "combine_mode": "any_of",
+        "require_unsatisfied_at_start": True,
     },
     "chop": {
         "metric_family": "contact_effect_proxy",
@@ -91,23 +93,19 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
         "metric_family": "contact_effect_proxy",
         "object_roles": ["obj", "target_obj_or_surface"],
         "success_rule": "tool maintains contact with target surface during sweep",
-        "metrics": [
-            _pred("touching", ["obj", "target_obj_or_surface"], True),
-            _geom("object_pose_match", "obj", xy_threshold=0.35, z_threshold=0.25),
-        ],
-        "combine_mode": "any_of",
+        "metrics": [_pred("touching", ["obj", "target_obj_or_surface"], True)],
+        "require_unsatisfied_at_start": True,
     },
     "pour": {
         "metric_family": "relation_transfer_proxy",
         "object_roles": ["payload_or_obj", "dst_or_target", "obj"],
-        "success_rule": "payload reaches target/support or manipulated container reaches end pose proxy",
+        "success_rule": "payload reaches target/support; container end-pose proxy alone is not sufficient",
         "metrics": [
             _pred("ontop", ["payload_or_obj", "dst_or_target"], True),
             _pred("inside", ["payload_or_obj", "dst_or_target"], True),
-            _geom("object_pose_match", "obj", xy_threshold=0.40, z_threshold=0.30),
         ],
         "combine_mode": "any_of",
-        "require_unsatisfied_at_start": False,
+        "require_unsatisfied_at_start": True,
     },
     "turn on switch": {
         "metric_family": "toggle_on",
@@ -125,8 +123,11 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
         "metric_family": "geometry_base_facing",
         "object_roles": ["face_target"],
         "success_rule": "robot base yaw faces target object within threshold from demo end state",
-        "metrics": [_geom("face_object", "face_target", yaw_margin=0.20, min_threshold=0.40)],
-        "require_unsatisfied_at_start": False,
+        "metrics": [_geom("face_object", "face_target", yaw_margin=0.12, min_threshold=0.25)],
+        "min_yaw_error_improvement": 0.02,
+        "short_success_caution_steps": 30,
+        "short_success_caution_step_fraction": 0.10,
+        "require_unsatisfied_at_start": True,
     },
     "turn off switch": {
         "metric_family": "toggle_off",
@@ -139,19 +140,19 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
         "object_roles": ["obj"],
         "success_rule": "object reaches demo-end handover pose while remaining grasped",
         "metrics": [
-            _geom("object_pose_match", "obj", xy_threshold=0.18, z_threshold=0.18),
+            _geom("object_pose_match", "obj", xy_threshold=0.10, z_threshold=0.10),
             _pred("grasped", ["agent", "obj"], True),
         ],
+        "min_rollout_steps_for_success": 30,
+        "min_success_step_fraction": 0.10,
+        "likely_false_positive_on_short_success": True,
     },
     "spray": {
         "metric_family": "contact_effect_proxy",
         "object_roles": ["obj", "target_obj"],
-        "success_rule": "sprayer reaches/contacts the target object during the segment",
-        "metrics": [
-            _pred("touching", ["obj", "target_obj"], True),
-            _geom("object_pose_match", "obj", xy_threshold=0.25, z_threshold=0.20),
-        ],
-        "combine_mode": "any_of",
+        "success_rule": "sprayer must make contact with the target object during the segment",
+        "metrics": [_pred("touching", ["obj", "target_obj"], True)],
+        "require_unsatisfied_at_start": True,
     },
     "open lid": {
         "metric_family": "articulation_open",
@@ -170,12 +171,14 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
         "object_roles": ["obj"],
         "success_rule": "object is no longer grasped",
         "metrics": [_pred("grasped", ["agent", "obj"], False)],
+        "task_aware_final_relation_predicates": ["attached"],
+        "task_aware_final_relation_task_prefixes": ["attach_"],
     },
     "tip over": {
         "metric_family": "orientation_proxy",
         "object_roles": ["obj"],
         "success_rule": "object orientation matches tipped end-state proxy",
-        "metrics": [_geom("object_orientation_match", "obj", angle_threshold=0.55)],
+        "metrics": [_geom("object_orientation_match", "obj", angle_threshold=0.35)],
     },
     "insert": {
         "metric_family": "relation_place_inside",
