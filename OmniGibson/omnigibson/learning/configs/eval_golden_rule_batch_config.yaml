@@ -1,0 +1,13 @@
+# Batch golden-rule evaluation configuration for BEHAVIOR-1K
+# Runs full-episode golden-rule evaluation across multiple demos.
+
+defaults:
+  - eval_golden_rule_config.yaml
+  - _self_
+
+# Demo selection
+demo_ids: null  # Optional explicit list. If null, pick first `num_demos` demos for the task.
+num_demos: 3
+
+# Batch runs usually don't need videos (set true if debugging)
+write_video: false
