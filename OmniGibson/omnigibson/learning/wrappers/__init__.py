@@ -4,4 +4,10 @@ from .rgb_low_res_wrapper import RGBLowResWrapper
 from .rgb_wrapper import RGBWrapper
 from .rich_obs_wrapper import RichObservationWrapper
 
-__all__ = ["DefaultWrapper", "HeavyRobotWrapper", "RGBLowResWrapper", "RGBWrapper", "RichObservationWrapper"]
+__all__ = [
+    "DefaultWrapper",
+    "HeavyRobotWrapper",
+    "RGBLowResWrapper",
+    "RGBWrapper",
+    "RichObservationWrapper",
+]

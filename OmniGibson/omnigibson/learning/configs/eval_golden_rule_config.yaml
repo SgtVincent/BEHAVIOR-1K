@@ -1,0 +1,38 @@
+# Golden Rule Evaluator Configuration for BEHAVIOR-1K
+# Evaluates a policy that follows a ground-truth skill plan (golden rule).
+
+defaults:
+  - base_config
+  - _self_
+
+# Golden rule specific settings
+use_gt_plan: true
+demo_data_path: /mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos
+demo_id: "00000010"
+skill_timeout_steps: 300
+skill_max_steps_multiplier: 2.0
+control_mode: receeding_horizon
+max_len: 32
+fine_grained_level: 2
+
+# Subtask evaluation settings (inherited from eval_subtask_reset_config)
+use_primitive_eval: true
+rawdata_path: null
+primitive_state_cache_dir: null
+num_demos: null
+reset_on_primitive_failure: true
+restore_at_each_primitive_start: false
+primitive_timeout_multiplier: 2.0
+
+# Primitive-level success criterion
+primitive_success_use_state_match: true
+primitive_success_base_pos_threshold: 0.15
+primitive_success_yaw_threshold: 0.35
+primitive_success_eef_pos_threshold: 0.12
+primitive_success_gripper_qpos_threshold: 0.03
+primitive_success_std_joint_qpos_rmse_threshold: 0.25
+primitive_success_joint_qpos_rmse_threshold: 0.25
+
+# Override default settings for golden rule eval
+eval_on_train_instances: true
+write_video: true

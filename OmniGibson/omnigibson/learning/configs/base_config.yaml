@@ -4,8 +4,8 @@ defaults:
   - task: behavior
   - policy: ???
 
-env_wrapper: 
-  _target_: omnigibson.learning.wrappers.RGBLowResWrapper
+# env_wrapper: 
+#   _target_: omnigibson.learning.wrappers.RGBLowResWrapper
 policy_name: ???  # filled by policy
 headless: true  # whether to run in headless mode (no GUI)
 eval_on_train_instances: false  # whether to eval on training instances
@@ -15,3 +15,16 @@ partial_scene_load: false  # whether to only load task-relevant rooms for a spec
 max_steps: null  # max steps per rollout episode, setting to null will use the default value (2 x average human demo completion steps)
 log_path: ???
 test_hidden: false  # [Internal use only] whether to eval on hidden test instances
+
+# + additional config
+env_wrapper: 
+  _target_: behavior.learning.wrappers.RGBWrapper
+
+save_rollout: false
+perturb_pose: false
+perturb_pose_seed: 42
+
+# parallel evaluator
+use_parallel_evaluator: false
+parallel_evaluator_start_idx: 0
+parallel_evaluator_end_idx: 10

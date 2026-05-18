@@ -66,14 +66,14 @@ with gm.unlocked():
     gm.USE_GPU_DYNAMICS = False
     gm.ENABLE_TRANSITION_RULES = True
 
-
+# rollout video
 ROLLOUT_CAMERA_NAMES = [
     "head",
     "left_wrist",
     "right_wrist",
 ]
 
-
+# create module logger
 logger = logging.getLogger("evaluator")
 logger.setLevel(20)  # info
 
@@ -103,11 +103,18 @@ def _resize_with_pad_np(image: np.ndarray, height: int, width: int, method=None)
 
 
 class Evaluator:
-    """Evaluator class for running and evaluating policies for behavior task."""
+    """
+    Evaluator class for running and evaluating policies for behavior task.
+    This class manages the setup, execution, and evaluation of policy rollouts in OmniGibson environment,
+    tracking metrics such as the number of trials, successes, and total time. It supports loading environments,
+    robots, policies, and metrics, and provides methods for stepping through the environment, resetting state,
+    and handling video outputs and loggings.
+    """
 
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
 
+        # record total number and success number of trials and trial time
         self.n_trials = 0
         self.n_success_trials = 0
         self.total_time = 0
@@ -131,6 +138,7 @@ class Evaluator:
         self._last_motion_pose: dict[str, th.Tensor] | None = None
 
         self.reset()
+        # manually reset environment episode number
         self.env._current_episode = 0
         self._video_writer = None
         self._rollout_video_writers = None
@@ -142,13 +150,18 @@ class Evaluator:
         logger.info(f"{self.cfg=}")
 
     def load_env(self, env_wrapper: DictConfig) -> EnvironmentWrapper:
+        """
+        Read the environment config file and create the environment.
+        The config file is located in the configs/envs directory.
+        """
+        # Disable a subset of transition rules for data collection
         for rule in DISABLED_TRANSITION_RULES:
             rule.ENABLED = False
-
+        # Load config file
         available_tasks = load_available_tasks()
         task_name = self.cfg.task.name
         assert task_name in available_tasks, f"Got invalid task name: {task_name}"
-
+        # Now, get human stats of the task
         task_idx = TASK_NAMES_TO_INDICES[task_name]
         self.human_stats = {
             "length": [],
@@ -162,9 +175,11 @@ class Evaluator:
             if episode["episode_index"] // 1e4 == task_idx:
                 for k in self.human_stats.keys():
                     self.human_stats[k].append(episode[k])
+        # take a mean
         for k in self.human_stats.keys():
             self.human_stats[k] = sum(self.human_stats[k]) / len(self.human_stats[k])
 
+        # Load the seed instance by default
         task_cfg = available_tasks[task_name][0]
         robot_type = self.cfg.robot.type
         assert robot_type == "R1Pro", f"Got invalid robot type: {robot_type}, only R1Pro is supported."
@@ -200,6 +215,7 @@ class Evaluator:
                 task_cfg=task_cfg,
             )
         ]
+        # Update observation modalities
         cfg["robots"][0]["obs_modalities"] = ["proprio", "rgb"]
         cfg["robots"][0]["proprio_obs"] = list(PROPRIOCEPTION_INDICES["R1Pro"].keys())
         if self.cfg.robot.controllers is not None:
@@ -230,10 +246,18 @@ class Evaluator:
         return env
 
     def load_robot(self) -> BaseRobot:
+        """
+        Loads and returns the robot instance from the environment.
+        Returns:
+            BaseRobot: The robot instance loaded from the environment.
+        """
         robot = self.env.scene.object_registry("name", "robot_r1")
         return robot
 
     def load_policy(self) -> Any:
+        """
+        Loads and returns the policy instance.
+        """
         policy = instantiate(self.cfg.model)
         logger.info("")
         logger.info("=" * 50)
@@ -243,9 +267,31 @@ class Evaluator:
         return policy
 
     def load_metrics(self) -> list[MetricBase]:
+        """
+        Load agent and task metrics.
+        """
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
     def step(self) -> tuple[bool, bool, dict]:
+        """
+        Performs a single step of the task by executing the policy, interacting with the environment,
+        processing observations, updating metrics, and tracking trial success.
+
+        Returns:
+            Tuple[bool, bool]:
+                - terminated (bool): Whether the episode has terminated (i.e., reached a terminal state).
+                - truncated (bool): Whether the episode was truncated (i.e., stopped due to a time limit or other constraint).
+
+        Workflow:
+            1. Computes the next action using the policy based on the current observation.
+            2. Steps the environment with the computed action and retrieves the next observation,
+               termination and truncation flags, and additional info.
+            3. If the episode has ended (terminated or truncated), increments the trial counter and
+               updates the count of successful trials if the task was completed successfully.
+            4. Preprocesses the new observation.
+            5. Invokes step callbacks for all registered metrics to update their state.
+            6. Returns the termination and truncation status.
+        """
         t0 = time.perf_counter()
         self.robot_action = self.policy.forward(obs=self.obs)
         policy_s = time.perf_counter() - t0
@@ -304,19 +350,27 @@ class Evaluator:
 
     @property
     def video_writer(self) -> tuple[Container, Stream]:
+        """
+        Returns the video writer for the current evaluation step.
+        """
         return self._video_writer
 
     @video_writer.setter
     def video_writer(self, video_writer: tuple[Container, Stream]) -> None:
         if self._video_writer is not None:
             (container, stream) = self._video_writer
+            # Flush any remaining packets
             for packet in stream.encode():
                 container.mux(packet)
+            # Close the container
             container.close()
         self._video_writer = video_writer
 
     @property
     def rollout_video_writers(self) -> dict[str, tuple[Container, Stream]]:
+        """
+        Returns the video writer for the current rollout.
+        """
         return self._rollout_video_writers
 
     @rollout_video_writers.setter
@@ -324,12 +378,21 @@ class Evaluator:
         if self._rollout_video_writers is not None:
             for camera_name in ROLLOUT_CAMERA_NAMES:
                 (container, stream) = self._rollout_video_writers[camera_name]
+                # Flush any remaining packets
                 for packet in stream.encode():
                     container.mux(packet)
+                # Close the container
                 container.close()
         self._rollout_video_writers = rollout_video_writers
 
     def load_task_instance(self, instance_id: int, test_hidden: bool = False) -> None:
+        """
+        Loads the configuration for a specific task instance.
+
+        Args:
+            instance_id (int): The ID of the task instance to load.
+            test_hidden (bool): [Interal use only] Whether to load the hidden test instance.
+        """
         scene_model = self.env.task.scene_name
         tro_filename = self.env.task.get_cached_activity_scene_filename(
             scene_model=scene_model,
@@ -365,10 +428,14 @@ class Evaluator:
                     presampled_robot_poses[self.robot.model_name][0]["position"] = perturbed_pos
                     presampled_robot_poses[self.robot.model_name][0]["orientation"] = perturbed_quat
 
+                # Write robot poses to scene metadata
                 self.env.scene.write_task_metadata(key=tro_key, data=tro_state)
             else:
                 self.env.task.object_scope[tro_key].load_state(tro_state, serialized=False)
 
+        # Try to ensure that all task-relevant objects are stable
+        # They should already be stable from the sampled instance, but there is some issue where loading the state
+        # causes some jitter (maybe for small mass / thin objects?)
         for _ in range(25):
             og.sim.step_physics()
             for entity in self.env.task.object_scope.values():
@@ -380,18 +447,35 @@ class Evaluator:
         self._reset_stuck_monitor()
 
     def _preprocess_obs(self, obs: dict) -> dict:
+        """
+        Preprocess the observation dictionary before passing it to the policy.
+        Args:
+            obs (dict): The observation dictionary to preprocess.
+
+        Returns:
+            dict: The preprocessed observation dictionary.
+        """
         obs = flatten_obs_dict(obs)
         base_pose = self.robot.get_position_orientation()
         cam_rel_poses = []
+        # The first time we query for camera parameters, it will return all zeros
+        # For this case, we use camera.get_position_orientation() instead.
+        # The reason we are not using camera.get_position_orientation() by defualt is because it will always return the most recent camera poses
+        # However, since og render is somewhat "async", it takes >= 3 render calls per step to actually get the up-to-date camera renderings
+        # Since we are using n_render_iterations=1 for speed concern, we need the correct corresponding camera poses instead of the most update-to-date one.
+        # Thus, we use camera parameters which are guaranteed to be in sync with the visual observations.
         for camera_name in ROBOT_CAMERA_NAMES["R1Pro"].values():
             camera = self.robot.sensors[camera_name.split("::")[1]]
             direct_cam_pose = camera.camera_parameters["cameraViewTransform"]
             if np.allclose(direct_cam_pose, np.zeros(16)):
-                cam_rel_poses.append(th.cat(T.relative_pose_transform(*(camera.get_position_orientation()), *base_pose)))
+                cam_rel_poses.append(
+                    th.cat(T.relative_pose_transform(*(camera.get_position_orientation()), *base_pose))
+                )
             else:
                 cam_pose = T.mat2pose(th.tensor(np.linalg.inv(np.reshape(direct_cam_pose, [4, 4]).T), dtype=th.float32))
                 cam_rel_poses.append(th.cat(T.relative_pose_transform(*cam_pose, *base_pose)))
         obs["robot_r1::cam_rel_poses"] = th.cat(cam_rel_poses, axis=-1)
+        # append task id to obs
         obs["task_id"] = th.tensor([TASK_NAMES_TO_INDICES[self.cfg.task.name]], dtype=th.int64)
         return obs
 
@@ -446,6 +530,7 @@ class Evaluator:
         return self._last_server_fresh_action
 
     def _write_video(self) -> None:
+        """Write the current robot observations to video."""
         # Export the same per-camera spatial view the model actually consumes:
         # resize_with_pad to 224x224, then tile into a 448x448 summary frame.
         left_wrist_rgb = _resize_with_pad_np(
@@ -483,6 +568,12 @@ class Evaluator:
         )
 
     def _write_rollout(self) -> None:
+        """
+        Write the current robot observations to rollout video.
+        """
+        # logger.info(f"{self.obs['robot_r1::proprio'].shape=}, dtype={self.obs['robot_r1::proprio'].dtype}")
+        # logger.info(f"{self.robot_action.shape=}, dtype={self.robot_action.dtype}")
+
         self.rollout_state_action["state"].append(self.obs["robot_r1::proprio"].cpu().numpy())
         self.rollout_state_action["action"].append(self.robot_action.cpu().numpy())
 
@@ -495,17 +586,20 @@ class Evaluator:
             )
 
     def success_callback(self, success: bool) -> None:
+        """
+        Callback function to be called when the task is completed successfully.
+        """
+        # self.video_writer = None
+        # self.rollout_video_writers = None
+
         if success:
             self.n_success_trials += 1
-            # Only attempt to rename success videos if video recording is enabled.
-            # When write_video=False, `cur_video_name` is never created.
-            if hasattr(self, "cur_video_name"):
-                sucess_video_name = self.cur_video_name.replace(".mp4", "_success.mp4")
-                try:
-                    shutil.move(self.cur_video_name, sucess_video_name)
-                except Exception:
-                    logger.warning(f"Failed to move video {self.cur_video_name} to {sucess_video_name}")
-                self.cur_video_name = sucess_video_name
+            sucess_video_name = self.cur_video_name.replace(".mp4", "_success.mp4")
+            try:
+                shutil.move(self.cur_video_name, sucess_video_name)
+            except:
+                logger.warning(f"Failed to move video {self.cur_video_name} to {sucess_video_name}")
+            self.cur_video_name = sucess_video_name
             if hasattr(self, "rollout_paths"):
                 np.savez_compressed(self.rollout_paths["state_action"], self.rollout_state_action)
                 logger.info(f"Saved rollout data to {self.rollout_paths['state_action']}")
@@ -513,11 +607,15 @@ class Evaluator:
             for camera_name in ROLLOUT_CAMERA_NAMES:
                 try:
                     os.remove(self.rollout_paths[camera_name])
-                except Exception:
+                except:
                     logger.warning(f"Failed to remove rollout video {self.rollout_paths.get(camera_name)}")
 
     def reset(self) -> None:
+        """
+        Reset the environment, policy, and compute metrics.
+        """
         self.obs = self._preprocess_obs(self.env.reset()[0])
+        # run metric start callbacks
         for metric in self.metrics:
             metric.start_callback(self.env)
         self.policy.reset()
@@ -530,6 +628,7 @@ class Evaluator:
         return self
 
     def __exit__(self, exc_type, exc_value, exc_tb):
+        # print stats
         logger.info("")
         logger.info("=" * 50)
         logger.info(f"Total success trials: {self.n_success_trials}")
@@ -553,9 +652,9 @@ class Evaluator:
 
 if __name__ == "__main__":
     register_omegaconf_resolvers()
-
+    # open yaml from task path
     with hydra.initialize_config_dir(f"{Path(getsourcefile(lambda: 0)).parents[0]}/configs", version_base="1.1"):
-        config = hydra.compose("openpi-comet.yaml", overrides=sys.argv[1:])
+        config = hydra.compose("base_config.yaml", overrides=sys.argv[1:])
     OmegaConf.resolve(config)
 
     with gm.unlocked():
@@ -601,15 +700,17 @@ if __name__ == "__main__":
     if config.save_rollout:
         rollout_path = Path(config.log_path).expanduser() / "rollouts"
         rollout_path.mkdir(parents=True, exist_ok=True)
-
     assert not (
         config.eval_on_train_instances and config.test_hidden
     ), "Cannot eval on train instances and test hidden instances simultaneously."
     if config.test_hidden:
         logger.info("You are evaluating on hidden test instances! This is for internal use only.")
 
+    # get run instances
     if config.eval_on_train_instances:
-        logger.info("You are evaluating on training instances, set eval_on_train_instances to False for test instances.")
+        logger.info(
+            "You are evaluating on training instances, set eval_on_train_instances to False for test instances."
+        )
         task_idx = TASK_NAMES_TO_INDICES[config.task.name]
         with open(os.path.join(gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "episodes.jsonl")) as f:
             episodes = [json.loads(line) for line in f]
@@ -618,36 +719,47 @@ if __name__ == "__main__":
             if episode["episode_index"] // 1e4 == task_idx:
                 instances_to_run.append(str(int((episode["episode_index"] // 10) % 1e3)))
         if config.eval_instance_ids:
-            assert set(config.eval_instance_ids).issubset(set(range(m.NUM_TRAIN_INSTANCES))), (
-                f"eval instance ids must be in range({m.NUM_TRAIN_INSTANCES})"
-            )
+            assert set(config.eval_instance_ids).issubset(
+                set(range(m.NUM_TRAIN_INSTANCES))
+            ), f"eval instance ids must be in range({m.NUM_TRAIN_INSTANCES})"
             instances_to_run = [instances_to_run[i] for i in config.eval_instance_ids]
+
     elif config.test_hidden:
-        instances_to_run = config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
-        assert set(instances_to_run).issubset(set(range(m.NUM_EVAL_INSTANCES))), (
-            f"eval instance ids must be in range({m.NUM_EVAL_INSTANCES})"
+        instances_to_run = (
+            config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
         )
+        assert set(instances_to_run).issubset(
+            set(range(m.NUM_EVAL_INSTANCES))
+        ), f"eval instance ids must be in range({m.NUM_EVAL_INSTANCES})"
+
     else:
+        # parallel evaluator
         if config.use_parallel_evaluator:
             instances_to_run = set(range(config.parallel_evaluator_start_idx, config.parallel_evaluator_end_idx))
             logger.info(
                 f"Using parallel evaluator with start index {config.parallel_evaluator_start_idx} and end index {config.parallel_evaluator_end_idx}"
             )
         else:
-            instances_to_run = config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
+            instances_to_run = (
+                config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
+            )
 
-        assert set(instances_to_run).issubset(set(range(m.NUM_EVAL_INSTANCES))), (
-            f"eval instance ids must be in range({m.NUM_EVAL_INSTANCES})"
+        assert set(instances_to_run).issubset(
+            set(range(m.NUM_EVAL_INSTANCES))
+        ), f"eval instance ids must be in range({m.NUM_EVAL_INSTANCES})"
+        # load csv file
+        task_instance_csv_path = os.path.join(
+            gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "test_instances.csv"
         )
-        task_instance_csv_path = os.path.join(gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "test_instances.csv")
         with open(task_instance_csv_path) as f:
             lines = list(csv.reader(f))[1:]
-        assert lines[TASK_NAMES_TO_INDICES[config.task.name]][1] == config.task.name, (
-            f"Task name from config {config.task.name} does not match task name from csv {lines[TASK_NAMES_TO_INDICES[config.task.name]][1]}"
-        )
+        assert (
+            lines[TASK_NAMES_TO_INDICES[config.task.name]][1] == config.task.name
+        ), f"Task name from config {config.task.name} does not match task name from csv {lines[TASK_NAMES_TO_INDICES[config.task.name]][1]}"
         test_instances = lines[TASK_NAMES_TO_INDICES[config.task.name]][2].strip().split(",")
         instances_to_run = [int(test_instances[i]) for i in instances_to_run]
 
+    # establish metrics
     metrics = {}
     metrics_path = Path(config.log_path).expanduser() / "metrics"
     metrics_path.mkdir(parents=True, exist_ok=True)
@@ -655,14 +767,13 @@ if __name__ == "__main__":
     with Evaluator(config) as evaluator:
         logger.info("Starting evaluation...")
 
+        # NOTE: we change the order of the loops to make diversity
         for epi in range(m.NUM_EVAL_EPISODES):
             evaluator.reset()
             for idx in instances_to_run:
                 evaluator.reset()
                 evaluator.load_task_instance(idx, test_hidden=config.test_hidden)
                 logger.info(f"Starting task instance {idx} / episode {epi} for evaluation...")
-                evaluator.current_episode = epi
-                evaluator.current_instance_id = idx
 
                 done = False
                 if config.write_video:
@@ -690,15 +801,16 @@ if __name__ == "__main__":
                     evaluator.rollout_state_action = {"state": [], "action": []}
                     logger.info(f"created rollout video writers and saved rollout video to {rollout_id_path}")
 
+                # run metric start callbacks
                 for metric in evaluator.metrics:
                     metric.start_callback(evaluator.env)
 
                 step_idx = 0
                 rolling = []
                 while not done:
-                    time_start = time.perf_counter()
+                    time_start = time.time()
                     terminated, truncated, info = evaluator.step()
-                    time_step = time.perf_counter() - time_start
+                    time_step = time.time() - time_start
 
                     if time_step > 15 * 60:
                         logger.error(f"Step timeout: {time_step} seconds, terminating evaluation")
@@ -777,12 +889,14 @@ if __name__ == "__main__":
                     if terminated or truncated:
                         evaluator.success_callback(info["done"]["success"])
 
+                # run metric end callbacks
                 for metric in evaluator.metrics:
                     metric.end_callback(evaluator.env)
                 logger.info(f"Evaluation finished at step {evaluator.env._current_step}.")
                 logger.info(f"Evaluation exit state: {terminated}, {truncated}")
                 logger.info(f"Total trials: {evaluator.n_trials}")
                 logger.info(f"Total success trials: {evaluator.n_success_trials}")
+                # gather metric results and write to file
                 for metric in evaluator.metrics:
                     metrics.update(metric.gather_results())
                 metrics["termination_summary"] = build_termination_summary(
@@ -795,9 +909,11 @@ if __name__ == "__main__":
                 )
                 with open(metrics_path / f"{config.task.name}_{idx}_{epi}.json", "w") as f:
                     json.dump(metrics, f)
+                # reset video writer
                 if config.write_video:
                     evaluator.video_writer = None
                     logger.info(f"Saved video to {evaluator.cur_video_name}")
+                # reset rollout video writers
                 if config.save_rollout:
                     evaluator.rollout_video_writers = None
                     evaluator.rollout_paths = None

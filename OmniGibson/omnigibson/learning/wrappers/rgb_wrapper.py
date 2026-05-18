@@ -7,7 +7,7 @@ from omnigibson.learning.utils.eval_utils import ROBOT_CAMERA_NAMES
 from omnigibson.learning.utils.eval_utils import WRIST_RESOLUTION
 from omnigibson.utils.ui_utils import create_module_logger
 
-
+# Create module logger
 logger = create_module_logger("RGBWrapper")
 
 

@@ -16,13 +16,7 @@ def create_pose_matrix(pos, ori):
 class PosePerturbator:
     """ """
 
-    def __init__(
-        self,
-        logger,
-        x_range=(-0.15, +0.15),
-        y_range=(-0.15, +0.15),
-        theta_range=(-np.pi / 12, +np.pi / 12),
-    ):
+    def __init__(self, logger, x_range=(-0.15, +0.15), y_range=(-0.15, +0.15), theta_range=(-np.pi / 12, +np.pi / 12)):
         """ """
         self._logger = logger
         self._x_range = x_range
