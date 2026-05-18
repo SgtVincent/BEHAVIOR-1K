@@ -15,6 +15,13 @@ control_mode: receeding_horizon
 max_len: 32
 fine_grained_level: 2
 
+# When true, the evaluator will try to import GoldenRulePolicyWrapper from
+# openpi-comet and wrap the policy locally.  This requires both repos to be
+# importable from the same Python environment.  The default (false) is suitable
+# for distributed evaluation where the policy server runs in the openpi-comet
+# environment and the evaluator runs in the behavior environment.
+wrap_policy_locally: false
+
 # Subtask evaluation settings (inherited from eval_subtask_reset_config)
 use_primitive_eval: true
 rawdata_path: null

@@ -38,6 +38,7 @@ from inspect import getsourcefile
 from omegaconf import DictConfig, OmegaConf
 from omnigibson.controllers import IsGraspingState
 from omnigibson.learning.eval_subtask_reset import SubTaskEvaluator
+from omnigibson.learning.gt_plan_loader import GTPlanLoader
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.eval_utils import (
     ROBOT_CAMERA_NAMES,
@@ -59,93 +60,6 @@ logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
-# Mock / fallback policy wrapper (used when openpi-comet is not available)
-# ---------------------------------------------------------------------------
-
-class _MockGoldenRulePolicyWrapper:
-    """Minimal mock of GoldenRulePolicyWrapper for framework integration."""
-
-    def __init__(self, base_policy: Any, gt_plan_loader: Any, cfg: DictConfig) -> None:
-        self.base_policy = base_policy
-        self.gt_plan_loader = gt_plan_loader
-        self.cfg = cfg
-        self.current_skill_idx = 0
-        self.skills: List[Dict[str, Any]] = []
-
-    def set_plan(self, skills: List[Dict[str, Any]]) -> None:
-        self.skills = skills
-        self.current_skill_idx = 0
-        logger.info(f"MockGoldenRulePolicyWrapper: loaded plan with {len(skills)} skills")
-
-    def advance_skill(self) -> None:
-        self.current_skill_idx += 1
-        logger.info(f"MockGoldenRulePolicyWrapper: advanced to skill {self.current_skill_idx}/{len(self.skills)}")
-
-    def current_skill(self) -> Optional[Dict[str, Any]]:
-        if 0 <= self.current_skill_idx < len(self.skills):
-            return self.skills[self.current_skill_idx]
-        return None
-
-    def forward(self, obs: dict, *args, **kwargs) -> th.Tensor:
-        # Delegate to base policy; in the real wrapper this would inject skill context.
-        if hasattr(self.base_policy, "forward"):
-            return self.base_policy.forward(obs, *args, **kwargs)
-        if hasattr(self.base_policy, "act"):
-            return self.base_policy.act(obs)
-        raise RuntimeError("Base policy has no forward/act method")
-
-    def reset(self) -> None:
-        self.current_skill_idx = 0
-        if hasattr(self.base_policy, "reset"):
-            self.base_policy.reset()
-
-
-# ---------------------------------------------------------------------------
-# GTPlanLoader (local implementation until Worker A lands the real one)
-# ---------------------------------------------------------------------------
-
-class GTPlanLoader:
-    """Load a ground-truth skill plan from demo annotations."""
-
-    def __init__(self, demo_data_path: str) -> None:
-        self.demo_data_path = os.path.expanduser(demo_data_path)
-
-    def load_plan(self, task_name: str, demo_id: str) -> List[Dict[str, Any]]:
-        task_idx = TASK_NAMES_TO_INDICES[task_name]
-        task_name_fmt = f"task-{task_idx:04d}"
-        episode_name = f"episode_{demo_id}"
-        annotation_path = os.path.join(
-            self.demo_data_path, "annotations", task_name_fmt, f"{episode_name}.json"
-        )
-        if not os.path.exists(annotation_path):
-            logger.warning(f"Annotation file not found: {annotation_path}")
-            return []
-
-        with open(annotation_path, "r", encoding="utf-8") as f:
-            annotations = json.load(f)
-
-        skills = annotations.get("skill_annotation", []) or []
-        plan = []
-        for i, skill in enumerate(skills):
-            if not isinstance(skill, dict):
-                continue
-            desc = skill.get("skill_description", ["unknown"])
-            if isinstance(desc, list):
-                desc = desc[0] if desc else "unknown"
-            plan.append(
-                {
-                    "index": i,
-                    "description": str(desc),
-                    "frame_duration": skill.get("frame_duration"),
-                    "object_id": skill.get("object_id"),
-                    "manipulating_object_id": skill.get("manipulating_object_id"),
-                }
-            )
-        logger.info(f"GTPlanLoader: loaded {len(plan)} skills from {annotation_path}")
-        return plan
-
-
-# ---------------------------------------------------------------------------
 # GoldenRuleEvaluator
 # ---------------------------------------------------------------------------
 
@@ -155,11 +69,17 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
 
     Key behaviours:
     1. Loads a GT skill plan for the target demo.
-    2. Wraps the base policy with ``GoldenRulePolicyWrapper`` (or a mock when
-       openpi-comet is unavailable) so that the policy is driven by the plan.
+    2. Optionally wraps the base policy with ``GoldenRulePolicyWrapper`` when
+       openpi-comet is available in the same Python environment.
     3. Steps the environment, checks skill-level completion, and advances the
        plan when a skill is done.
     4. Collects per-skill and end-to-end metrics.
+
+    .. note::
+       When the policy is a websocket client (remote server), the golden-rule
+       prompt injection should happen on the server side (e.g. via
+       ``serve_golden_rule.py``).  This evaluator still loads the GT plan and
+       tracks skill-level success for reporting.
     """
 
     def __init__(self, cfg: DictConfig) -> None:
@@ -172,6 +92,7 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
         self.control_mode: str = str(cfg.get("control_mode", "receeding_horizon"))
         self.max_len: int = int(cfg.get("max_len", 32))
         self.fine_grained_level: int = int(cfg.get("fine_grained_level", 2))
+        self._wrap_policy_locally: bool = cfg.get("wrap_policy_locally", False)
 
         # Skill-level tracking
         self.n_skill_trials = 0
@@ -193,6 +114,7 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
         logger.info(f"  use_gt_plan={self.use_gt_plan}")
         logger.info(f"  skill_timeout_steps={self.skill_timeout_steps}")
         logger.info(f"  skill_max_steps_multiplier={self.skill_max_steps_multiplier}")
+        logger.info(f"  wrap_policy_locally={self._wrap_policy_locally}")
 
     # ------------------------------------------------------------------
     # Policy loading
@@ -200,40 +122,50 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
 
     def load_policy(self) -> Any:
         """
-        Load the underlying policy and wrap it with ``GoldenRulePolicyWrapper``.
+        Load the underlying policy.
 
-        The wrapper is instantiated from openpi-comet when available; otherwise a
-        local mock is used so that the integration framework can still be exercised.
+        When ``wrap_policy_locally=true`` (and openpi-comet is importable) the
+        policy is wrapped with ``GoldenRulePolicyWrapper``.  This is useful for
+        local integration tests where both repos live in the same Python
+        environment.
+
+        In the default remote mode the base policy (typically a websocket
+        client) is returned unchanged; the server is expected to handle golden
+        rule prompt injection.
         """
         # Load base policy exactly as the parent Evaluator does
         base_policy = super().load_policy()
 
-        # Attempt to import the real wrapper from openpi-comet
-        GoldenRulePolicyWrapper = None  # type: ignore
+        if not self._wrap_policy_locally:
+            logger.info("Running in remote mode; policy returned unchanged")
+            return base_policy
+
+        # Attempt to import and wrap with GoldenRulePolicyWrapper
         try:
-            from openpi_comet.policy.golden_rule_wrapper import GoldenRulePolicyWrapper  # type: ignore
+            from openpi.shared.golden_rule_policy import GoldenRulePolicyWrapper  # type: ignore[import-untyped]
             logger.info("Imported GoldenRulePolicyWrapper from openpi-comet")
         except Exception as exc:
             logger.warning(
-                f"Could not import GoldenRulePolicyWrapper from openpi-comet ({exc}); "
-                "falling back to mock wrapper."
+                "Could not import GoldenRulePolicyWrapper from openpi-comet (%s). "
+                "Falling back to unwrapped policy. For server-side golden rule, "
+                "use serve_golden_rule.py in the openpi-comet environment.",
+                exc,
             )
-            GoldenRulePolicyWrapper = _MockGoldenRulePolicyWrapper  # type: ignore
+            return base_policy
 
-        # Create GTPlanLoader (local implementation until Worker A lands the real one)
-        demo_data_path = self.cfg.get("demo_data_path", None)
-        if demo_data_path is not None:
-            self._gt_plan_loader = GTPlanLoader(demo_data_path)
-        else:
-            logger.warning("demo_data_path not set; GTPlanLoader will be unavailable")
-
-        # Wrap the base policy
+        # Wrap the base policy.  plan_loader is injected later per-episode.
         self._golden_rule_policy = GoldenRulePolicyWrapper(
-            base_policy=base_policy,
-            gt_plan_loader=self._gt_plan_loader,
-            cfg=self.cfg,
+            policy=base_policy,
+            task_name=self.cfg.task.name,
+            plan_loader=None,
+            control_mode=self.control_mode,
+            max_len=self.max_len,
+            action_horizon=getattr(self.cfg, "action_horizon", 5),
+            skill_timeout_steps=self.skill_timeout_steps,
+            fine_grained_level=self.fine_grained_level,
+            temporal_ensemble_max=getattr(self.cfg, "temporal_ensemble_max", 3),
         )
-        logger.info("Policy wrapped with GoldenRulePolicyWrapper")
+        logger.info("Policy wrapped with GoldenRulePolicyWrapper (local mode)")
         return self._golden_rule_policy
 
     # ------------------------------------------------------------------
@@ -251,24 +183,29 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
         self.current_skill_idx = 0
         self.current_skill_step = 0
 
-        # Load skill plan
-        if self.use_gt_plan and self._gt_plan_loader is not None:
-            self.current_skill_plan = self._gt_plan_loader.load_plan(
+        # Load skill plan into a fresh GTPlanLoader
+        demo_data_path = self.cfg.get("demo_data_path", None)
+        if self.use_gt_plan and demo_data_path is not None:
+            self._gt_plan_loader = GTPlanLoader(
+                demo_data_path=demo_data_path,
                 task_name=self.cfg.task.name,
                 demo_id=demo_id,
             )
+            self.current_skill_plan = self._gt_plan_loader.load_plan()
         else:
+            self._gt_plan_loader = None
             self.current_skill_plan = []
 
         if not self.current_skill_plan:
             logger.error(f"No skill plan available for demo {demo_id}")
             return False
 
-        # Push the plan into the policy wrapper
-        if hasattr(self.policy, "set_plan"):
-            self.policy.set_plan(self.current_skill_plan)
-        else:
-            logger.warning("Policy wrapper does not expose set_plan(); skipping plan injection")
+        # Inject the plan loader into the policy wrapper so that it can
+        # resolve per-skill prompts and detect skill completion.
+        if self._golden_rule_policy is not None:
+            self._golden_rule_policy.plan_loader = self._gt_plan_loader
+            # Reset the wrapper so it starts from the first skill.
+            self._golden_rule_policy.reset()
 
         # Load demo low-dim data for state-match checks
         self.current_demo_data = self.load_demo_lowdim_data(demo_id)
@@ -385,7 +322,11 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
             - "skill_result" : result string (see check_skill_success)
             - "skill_idx"    : index of the skill that was active
         """
-        # Delegate to parent step (policy forward + env step)
+        # Delegate to parent step (policy forward + env step).
+        # NOTE: The policy wrapper's ``act()`` is called inside ``super().step()``.
+        # If the wrapper detects skill completion internally it will advance the
+        # plan and clear its action queue.  We perform our own state-match-based
+        # check here as the authoritative success criterion.
         terminated, truncated = super().step()
         self.current_skill_step += 1
 
@@ -424,9 +365,13 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
                     )
                 self.n_skill_trials += 1
 
-                # Advance plan in the policy wrapper
-                if hasattr(self.policy, "advance_skill"):
-                    self.policy.advance_skill()
+                # Advance the policy wrapper's plan loader so that the next
+                # call to ``act()`` uses the next skill's prompt.
+                if (
+                    self._golden_rule_policy is not None
+                    and self._golden_rule_policy.plan_loader is not None
+                ):
+                    self._golden_rule_policy._advance_plan()
 
                 self.current_skill_idx += 1
                 self.current_skill_step = 0
