@@ -84,17 +84,47 @@ class GTPlanLoader:
     # ------------------------------------------------------------------
 
     def _annotation_path(self) -> str:
-        """Return the expected annotation JSON path."""
-        # The annotations are stored under:
-        #   {demo_data_path}/annotations/{task_name}/{demo_id}.json
-        # Note: eval_subtask_reset.py uses task-{idx:04d} internally, but the
-        # caller already provides the resolved task_name directory name.
-        return os.path.join(
-            self.demo_data_path,
-            "annotations",
-            self.task_name,
-            f"{self.demo_id}.json",
+        """Return the expected annotation JSON path.
+
+        Supports both naming conventions:
+        - {demo_data_path}/annotations/{task_name}/{demo_id}.json
+        - {demo_data_path}/annotations/task-{idx:04d}/{demo_id}.json
+        """
+        candidates = []
+
+        # Candidate 1: task_name as-is (e.g. "turning_on_radio")
+        candidates.append(
+            os.path.join(self.demo_data_path, "annotations", self.task_name, f"{self.demo_id}.json")
         )
+
+        # Candidate 2: task-{idx:04d} format (e.g. "task-0000")
+        try:
+            from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES
+            task_idx = TASK_NAMES_TO_INDICES.get(self.task_name)
+            if task_idx is not None:
+                candidates.append(
+                    os.path.join(
+                        self.demo_data_path,
+                        "annotations",
+                        f"task-{int(task_idx):04d}",
+                        f"{self.demo_id}.json",
+                    )
+                )
+        except Exception:
+            pass
+
+        # Candidate 3: episode_{demo_id}.json filename variant
+        for base in list(candidates):
+            dir_name = os.path.dirname(base)
+            fname = os.path.basename(base)
+            if not fname.startswith("episode_"):
+                candidates.append(os.path.join(dir_name, f"episode_{fname}"))
+
+        # Return the first existing path, or the first candidate if none exist
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return candidates[0] if candidates else ""
 
     def _load_task_mapping(self) -> Optional[Dict[str, Any]]:
         """Load the optional task_mapping.json if it exists."""
