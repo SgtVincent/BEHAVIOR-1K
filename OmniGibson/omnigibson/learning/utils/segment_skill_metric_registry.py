@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
-def _pred(name: str, args: List[str], desired: bool) -> Dict[str, Any]:
-    return {"type": "predicate", "name": name, "args": args, "desired": desired}
+def _pred(name: str, args: List[str], desired: bool, **kwargs: Any) -> Dict[str, Any]:
+    spec = {"type": "predicate", "name": name, "args": args, "desired": desired}
+    spec.update(kwargs)
+    return spec
 
 
 def _geom(metric_type: str, role: str, **kwargs: Any) -> Dict[str, Any]:
@@ -86,8 +88,9 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "close door": {
         "metric_family": "articulation_close",
         "object_roles": ["unary_target"],
-        "success_rule": "target articulated object is closed",
+        "success_rule": "target articulated object is closed and remains closed for a short trailing window",
         "metrics": [_pred("open", ["unary_target"], False)],
+        "success_min_consecutive": 3,
     },
     "sweep surface": {
         "metric_family": "contact_effect_proxy",
@@ -116,8 +119,9 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "close lid": {
         "metric_family": "articulation_close",
         "object_roles": ["unary_target"],
-        "success_rule": "lid/container is closed",
+        "success_rule": "lid/container is closed and remains closed for a short trailing window",
         "metrics": [_pred("open", ["unary_target"], False)],
+        "success_min_consecutive": 5,
     },
     "turn to": {
         "metric_family": "geometry_base_facing",
@@ -137,11 +141,15 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "hand over": {
         "metric_family": "transfer_pose_proxy",
-        "object_roles": ["obj"],
-        "success_rule": "object reaches demo-end handover pose while remaining grasped",
+        "object_roles": ["obj", "dst_or_target"],
+        "success_rule": (
+            "object reaches demo-end handover pose while remaining grasped and, when a handover target "
+            "is available, is next to that target"
+        ),
         "metrics": [
             _geom("object_pose_match", "obj", xy_threshold=0.10, z_threshold=0.10),
             _pred("grasped", ["agent", "obj"], True),
+            _pred("nextto", ["obj", "dst_or_target"], True, optional=True),
         ],
         "min_rollout_steps_for_success": 30,
         "min_success_step_fraction": 0.10,
@@ -157,8 +165,9 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "open lid": {
         "metric_family": "articulation_open",
         "object_roles": ["unary_target"],
-        "success_rule": "lid/container is open",
+        "success_rule": "lid/container is open and remains open for a short trailing window",
         "metrics": [_pred("open", ["unary_target"], True)],
+        "success_min_consecutive": 5,
     },
     "hold": {
         "metric_family": "grasp_hold",
@@ -204,8 +213,9 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "close drawer": {
         "metric_family": "articulation_close",
         "object_roles": ["unary_target"],
-        "success_rule": "drawer/openable target is closed",
+        "success_rule": "drawer/openable target is closed and remains closed for a short trailing window",
         "metrics": [_pred("open", ["unary_target"], False)],
+        "success_min_consecutive": 3,
     },
     "place in next to": {
         "metric_family": "relation_place_inside_nextto",
@@ -229,8 +239,9 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "pull tray": {
         "metric_family": "articulation_open_proxy",
         "object_roles": ["unary_target"],
-        "success_rule": "tray-bearing object is open (pulled out)",
+        "success_rule": "tray-bearing object is open (pulled out) and remains open for a short trailing window",
         "metrics": [_pred("open", ["unary_target"], True)],
+        "success_min_consecutive": 5,
     },
     "press": {
         "metric_family": "toggle_on",

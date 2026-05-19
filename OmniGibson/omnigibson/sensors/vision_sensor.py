@@ -306,8 +306,30 @@ class VisionSensor(BaseSensor):
         else:
             reordered_modalities = self._modalities
 
+        graph_repaired = False
         for modality in reordered_modalities:
-            raw_obs = self._annotators[modality].get_data(device=og.sim.device)
+            try:
+                raw_obs = self._annotators[modality].get_data(device=og.sim.device)
+            except KeyError as exc:
+                # In headless persistent eval, Replicator can occasionally drop
+                # graph nodes while a render product / annotator is being
+                # reconfigured during env construction. Rebuild all active
+                # annotator attachments once and retry instead of failing the
+                # whole task load.
+                if graph_repaired:
+                    raise
+                log.warning(
+                    "Replicator annotator graph node missing for modality %s on sensor %s: %s. "
+                    "Rebuilding render product and retrying once.",
+                    modality,
+                    self.name,
+                    exc,
+                )
+                self._rebuild_render_product(self._viewport.viewport_api.get_texture_resolution())
+                for _ in range(3):
+                    render()
+                graph_repaired = True
+                raw_obs = self._annotators[modality].get_data(device=og.sim.device)
 
             if modality == "pointcloud":
                 # Pointcloud is a special case where we need to concatenate the point xyz coordinates with the rgb values
@@ -693,6 +715,71 @@ class VisionSensor(BaseSensor):
         # Requires 1 render update to propagate changes
         render()
 
+    def _rebuild_render_product(self, resolution):
+        """Recreate the render product and re-attach active annotators.
+
+        Reusing existing annotator objects across a render-product destroy / recreate
+        cycle can leave Replicator graph nodes stale in some Isaac Sim builds.
+        Rebuild the backend attachments from modality names instead so subsequent
+        ``get_data()`` calls resolve the new render product's graph nodes.
+        """
+        active_modalities = [
+            modality for modality, annotator in self._annotators.items() if annotator is not None
+        ]
+
+        for modality in active_modalities:
+            try:
+                self._remove_modality_from_backend(modality=modality)
+            except Exception as exc:  # noqa: BLE001
+                # Stale Replicator annotator objects can raise while detaching
+                # after their graph node has already disappeared. Drop the old
+                # handle and recreate a fresh annotator below.
+                log.warning(
+                    "Failed to detach modality %s from stale render product for sensor %s: %s. "
+                    "Recreating annotator.",
+                    modality,
+                    self.name,
+                    exc,
+                )
+                self._annotators[modality] = None
+
+        try:
+            self._render_product.destroy()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to destroy stale render product for sensor %s: %s", self.name, exc)
+        self._render_product = lazy.omni.replicator.core.create.render_product(
+            self.prim_path, resolution, force_new=True
+        )
+
+        for modality in active_modalities:
+            self._add_modality_to_backend(modality=modality)
+
+    def set_image_resolution(self, width, height):
+        """Atomically update image resolution for this sensor.
+
+        Updating height and width via two independent property setters can force two
+        consecutive render-product rebuilds, leaving Replicator in an inconsistent
+        intermediate state on some Isaac Sim builds. Use a single batched update so
+        active annotators are detached and reattached exactly once.
+
+        Args:
+            width (int): Image width in pixels.
+            height (int): Image height in pixels.
+        """
+        resolution = (width, height)
+        if self._viewport.viewport_api.get_texture_resolution() == resolution:
+            return
+
+        # Rebuild annotator attachments against a fresh render product before
+        # flipping the viewport texture resolution, to avoid invalidating the
+        # old graph nodes mid-detach.
+        self._rebuild_render_product(resolution)
+        self._viewport.viewport_api.set_texture_resolution(resolution)
+
+        # Requires 3 updates to propagate changes
+        for _ in range(3):
+            render()
+
     @property
     def image_height(self):
         """
@@ -710,23 +797,7 @@ class VisionSensor(BaseSensor):
             height (int): Image height of this sensor, in pixels
         """
         width, _ = self._viewport.viewport_api.get_texture_resolution()
-        self._viewport.viewport_api.set_texture_resolution((width, height))
-
-        # Also update render product and update all annotators
-        for annotator in self._annotators.values():
-            annotator.detach([self._render_product.path])
-
-        self._render_product.destroy()
-        self._render_product = lazy.omni.replicator.core.create.render_product(
-            self.prim_path, (width, height), force_new=True
-        )
-
-        for annotator in self._annotators.values():
-            annotator.attach([self._render_product])
-
-        # Requires 3 updates to propagate changes
-        for i in range(3):
-            render()
+        self.set_image_resolution(width=width, height=height)
 
     @property
     def image_width(self):
@@ -745,23 +816,7 @@ class VisionSensor(BaseSensor):
             width (int): Image width of this sensor, in pixels
         """
         _, height = self._viewport.viewport_api.get_texture_resolution()
-        self._viewport.viewport_api.set_texture_resolution((width, height))
-
-        # Also update render product and update all annotators
-        for annotator in self._annotators.values():
-            annotator.detach([self._render_product.path])
-
-        self._render_product.destroy()
-        self._render_product = lazy.omni.replicator.core.create.render_product(
-            self.prim_path, (width, height), force_new=True
-        )
-
-        for annotator in self._annotators.values():
-            annotator.attach([self._render_product])
-
-        # Requires 3 updates to propagate changes
-        for i in range(3):
-            render()
+        self.set_image_resolution(width=width, height=height)
 
     @property
     def clipping_range(self):

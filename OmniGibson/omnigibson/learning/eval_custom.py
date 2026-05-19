@@ -58,9 +58,10 @@ m.NUM_EVAL_INSTANCES = 10
 m.NUM_TRAIN_INSTANCES = 200
 
 
-gm.ENABLE_FLATCACHE = True
-gm.USE_GPU_DYNAMICS = False
-gm.ENABLE_TRANSITION_RULES = True
+with gm.unlocked():
+    gm.ENABLE_FLATCACHE = True
+    gm.USE_GPU_DYNAMICS = False
+    gm.ENABLE_TRANSITION_RULES = True
 
 
 ROLLOUT_CAMERA_NAMES = [
@@ -196,7 +197,13 @@ class Evaluator:
             cfg["task"]["termination_config"]["max_steps"] = self.cfg.max_steps
         cfg["task"]["include_obs"] = False
         env = og.Environment(configs=cfg)
-        env = instantiate(env_wrapper, env=env)
+        # Instantiate env wrapper when configured. Persistent eval may set
+        # env_wrapper=None to avoid Isaac Replicator render-product
+        # reconfiguration across soft restarts; in that mode, use the raw
+        # environment directly instead of hydra.instantiate(None), which
+        # returns None and breaks downstream self.env access.
+        if env_wrapper is not None:
+            env = instantiate(env_wrapper, env=env)
         return env
 
     def load_robot(self) -> BaseRobot:

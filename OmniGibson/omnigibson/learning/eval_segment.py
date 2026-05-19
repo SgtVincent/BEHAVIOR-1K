@@ -476,6 +476,49 @@ def run_single_segment(
             start_truth=start_truth_map,
             end_truth=end_truth_map,
         )
+        missing_template_roles = metric_debug.get("missing_template_roles") or []
+        if missing_template_roles:
+            return {
+                "demo_id": demo_id,
+                "segment_level": segment_level,
+                "segment_idx": segment_idx,
+                "segment_desc": segment_desc,
+                "frame_duration": [int(start_frame), int(end_frame)],
+                "restore": {
+                    "start": {"restored": True, "method": method_start},
+                    "end": {"restored": True, "method": method_end},
+                },
+                "success_mode": str(success_mode),
+                "effective_success_mode": "segment_predicates",
+                "success": False,
+                "result_type": MISSING_OBJECT_RESULT_TYPE,
+                "predicate_debug": {
+                    **metric_debug,
+                    "template_trace_start": start_trace,
+                    "template_trace_end": end_trace,
+                    "missing_object_traces": [
+                        {
+                            "predicate": None,
+                            "metric_type": item.get("metric_type"),
+                            "desired": None,
+                            "value": None,
+                            "satisfied": False,
+                            "missing_object": item.get("role"),
+                            "missing_role": item.get("role"),
+                            "metric_name": item.get("metric_name"),
+                            "trace_stage": "template_resolution",
+                        }
+                        for item in missing_template_roles
+                    ],
+                },
+                "rollout": {
+                    "max_steps": 0,
+                    "final_step": 0,
+                    "rollout_attempted": False,
+                    "termination_reason": MISSING_OBJECT_RESULT_TYPE,
+                },
+                "review_artifacts": review_artifacts,
+            }
         predicate_specs = template_specs if template_specs else auto_specs
         if template_specs and auto_specs:
             existing = {(p.metric_type, p.name, tuple(p.args), p.desired) for p in template_specs}
@@ -577,7 +620,11 @@ def run_single_segment(
 
         window_mode = str(evaluator.cfg.get("segment_predicate_window_mode", "anytime"))
         last_k = int(evaluator.cfg.get("segment_predicate_last_k", 20))
-        min_consecutive = int(evaluator.cfg.get("segment_predicate_min_consecutive", 1))
+        min_consecutive = max(
+            int(evaluator.cfg.get("segment_predicate_min_consecutive", 1)),
+            int(metric_debug.get("success_min_consecutive", 1)),
+        )
+        effective_window_mode = "consecutive" if min_consecutive > 1 else window_mode
         min_success_steps_cfg = int(evaluator.cfg.get("segment_predicate_min_success_steps", 150))
         env_termination_is_terminal = bool(evaluator.cfg.get("segment_predicate_env_termination_is_terminal", False))
         combine_mode = str(metric_debug.get("combine_mode", "all_of"))
@@ -723,18 +770,28 @@ def run_single_segment(
                 result_type = MISSING_OBJECT_RESULT_TYPE
                 break
 
-            if predicate_window_satisfied(
+            raw_window_satisfied = predicate_window_satisfied(
                 activation_trace_history,
-                mode=window_mode,
+                mode=effective_window_mode,
                 last_k=last_k,
                 min_consecutive=min_consecutive,
                 combine_mode=combine_mode,
-            ) and _yaw_improvement_satisfied(step_trace):
+            )
+            eligible_window_satisfied = predicate_window_satisfied(
+                activation_trace_history,
+                mode=effective_window_mode,
+                last_k=last_k,
+                min_consecutive=min_consecutive,
+                combine_mode=combine_mode,
+                min_history_index=max(min_success_steps - 1, 0),
+            )
+            if raw_window_satisfied:
                 if first_predicate_satisfied_step is None:
                     first_predicate_satisfied_step = final_step
                 if final_step < min_success_steps:
                     early_predicate_satisfied_steps += 1
                     continue
+            if eligible_window_satisfied and _yaw_improvement_satisfied(step_trace):
                 success = True
                 result_type = "predicate_satisfied"
                 break
@@ -775,6 +832,8 @@ def run_single_segment(
         result["predicate_debug"].update(
             {
                 "min_success_steps": min_success_steps,
+                "min_consecutive": min_consecutive,
+                "effective_predicate_window_mode": effective_window_mode,
                 "first_predicate_satisfied_step": first_predicate_satisfied_step,
                 "early_predicate_satisfied_steps": early_predicate_satisfied_steps,
             }
@@ -792,6 +851,7 @@ def run_single_segment(
             "final_step": final_step or max_steps,
             "predicate_window_mode": window_mode,
             "predicate_min_success_steps": min_success_steps,
+            "predicate_min_consecutive": min_consecutive,
             "combine_mode": combine_mode,
             "rollout_attempted": True,
             "termination_reason": result_type,
@@ -1003,102 +1063,158 @@ def run_single_segment(
     return result
 
 
-if __name__ == "__main__":
-    register_omegaconf_resolvers()
+def _reconfigure_for_segment(
+    evaluator: SubTaskEvaluator,
+    sample: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Mutate ``evaluator.cfg`` and per-segment caches for the given sample.
 
-    src = getsourcefile(lambda: 0) or __file__
-    with hydra.initialize_config_dir(
-        f"{Path(src).parents[0]}/configs",
-        version_base="1.1",
-    ):
-        config = hydra.compose("eval_segment_config.yaml", overrides=sys.argv[1:])
+    The evaluator is task-bound at construction time, so this helper refuses to
+    switch tasks. It updates per-segment cfg fields, releases stale rawdata
+    caches, ensures output directories exist, reloads the task instance, and
+    (re)opens the video writer if requested. Returns a context dict with the
+    resolved per-segment paths used by :func:`run_segment_on_env`.
+    """
+    cfg = evaluator.cfg
+    task_name = str(sample["task_name"])
+    if task_name != str(cfg.task.name):
+        raise RuntimeError(
+            f"_reconfigure_for_segment cannot switch tasks "
+            f"({cfg.task.name} -> {task_name}); rebuild the evaluator for a different task."
+        )
 
-    OmegaConf.resolve(config)
-    OmegaConf.set_struct(config, False)
-
-    segment_level = config.get("segment_level", "primitive")
-    segment_idx = config.get("segment_idx", None)
-    if segment_idx is None:
-        logger.error("Missing required config: segment_idx")
-        sys.exit(1)
-    segment_idx = int(segment_idx)
-
-    demo_id_cfg = config.get("demo_id", None)
-    segment_max_steps = config.get("segment_max_steps", None)
+    demo_id = _as_demo_id(sample["demo_id"])
+    segment_level = str(sample.get("segment_level", cfg.get("segment_level", "skill")))
+    if "segment_idx" in sample:
+        segment_idx = int(sample["segment_idx"])
+    elif "skill_idx" in sample:
+        segment_idx = int(sample["skill_idx"])
+    else:
+        raise KeyError("sample must contain segment_idx or skill_idx")
+    segment_max_steps = sample.get("segment_max_steps")
+    if segment_max_steps is None:
+        segment_max_steps = sample.get("dynamic_max_steps")
     if segment_max_steps is not None:
         segment_max_steps = int(segment_max_steps)
+    success_mode = str(sample.get("success_mode", cfg.get("success_mode", "segment_predicates")))
+    dry_run = bool(sample.get("dry_run", cfg.get("dry_run", False)))
+    write_video = bool(sample.get("write_video", cfg.get("write_video", False)))
+    test_hidden = bool(sample.get("test_hidden", cfg.get("test_hidden", False)))
+    expected_skill = sample.get("expected_skill", sample.get("skill"))
+    log_path = Path(str(sample["log_path"])).expanduser()
 
-    success_mode = config.get("success_mode", "predicate_subgoal")
-    dry_run = config.get("dry_run", False)
+    # Mutate cfg in place so existing helpers (e.g. run_single_segment) see the new values.
+    cfg.demo_id = demo_id
+    cfg.segment_level = segment_level
+    cfg.segment_idx = segment_idx
+    if segment_max_steps is not None:
+        cfg.segment_max_steps = segment_max_steps
+    cfg.success_mode = success_mode
+    cfg.dry_run = dry_run
+    cfg.write_video = write_video
+    cfg.test_hidden = test_hidden
+    cfg.log_path = str(log_path)
+    if expected_skill is not None:
+        cfg.expected_skill = str(expected_skill)
 
-    gm.HEADLESS = config.headless
+    # Release any rawdata caches lingering from a previous segment to avoid
+    # reusing a stale HDF5 handle for a different demo_id.
+    raw = getattr(evaluator, "current_rawdata_hdf5", None)
+    if raw is not None:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        evaluator.current_rawdata_hdf5 = None
+    evaluator.current_primitive_state_cache = None
+    evaluator.current_demo_id = None
+    evaluator.current_demo_data = None
 
-    log_root = Path(str(config.log_path)).expanduser()
-    metrics_path = log_root / "metrics"
+    # Ensure per-segment output directories exist.
+    metrics_path = log_path / "metrics"
     metrics_path.mkdir(parents=True, exist_ok=True)
-
-    video_dir = None
-    if config.write_video:
-        video_dir = log_root / "videos"
-        video_dir.mkdir(parents=True, exist_ok=True)
-    review_dir = log_root / "review"
+    review_dir = log_path / "review"
     review_dir.mkdir(parents=True, exist_ok=True)
-
-    demo_data_path = config.get("demo_data_path", None)
-    if demo_data_path is None:
-        logger.error("demo_data_path must be specified (points to 2025-challenge-demos)")
-        sys.exit(1)
-
-    if demo_id_cfg is not None:
-        demo_id = _as_demo_id(demo_id_cfg)
-    else:
-        demo_ids = get_demo_ids_for_task(
-            demo_data_path=str(demo_data_path),
-            task_name=config.task.name,
-            limit=1,
-        )
-        if not demo_ids:
-            logger.error(f"No demos found for task {config.task.name}")
-            sys.exit(1)
-        demo_id = demo_ids[0]
+    video_dir: Optional[Path] = None
+    if write_video:
+        video_dir = log_path / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
 
     instance_id = _get_instance_id_from_demo_id(demo_id)
 
-    with SubTaskEvaluator(config) as evaluator:
-        evaluator.reset()
-        evaluator.load_task_instance(instance_id, test_hidden=config.test_hidden)
+    # Mirror the original main() flow: reset → load_task_instance → reset.
+    evaluator.reset()
+    evaluator.load_task_instance(instance_id, test_hidden=test_hidden)
 
-        video_name = None
-        if config.write_video and video_dir is not None:
-            video_name = str(
-                video_dir / f"{config.task.name}_demo{demo_id}_{segment_level}{segment_idx:03d}.mp4"
-            )
-            evaluator.video_writer = create_video_writer(
-                fpath=video_name,
-                resolution=(448, 672),
-            )
+    video_name: Optional[str] = None
+    if write_video and video_dir is not None:
+        video_name = str(
+            video_dir / f"{task_name}_demo{demo_id}_{segment_level}{segment_idx:03d}.mp4"
+        )
+        evaluator.video_writer = create_video_writer(
+            fpath=video_name,
+            resolution=(448, 672),
+        )
+    else:
+        # Drop any leftover writer from a previous segment.
+        evaluator.video_writer = None
 
-        evaluator.reset()
+    evaluator.reset()
 
+    return {
+        "task_name": task_name,
+        "demo_id": demo_id,
+        "instance_id": instance_id,
+        "segment_level": segment_level,
+        "segment_idx": segment_idx,
+        "segment_max_steps": segment_max_steps,
+        "success_mode": success_mode,
+        "dry_run": dry_run,
+        "write_video": write_video,
+        "log_path": log_path,
+        "metrics_path": metrics_path,
+        "review_dir": review_dir,
+        "video_name": video_name,
+    }
+
+
+def run_segment_on_env(
+    evaluator: SubTaskEvaluator,
+    sample: Dict[str, Any],
+    *,
+    write_metrics: bool = True,
+) -> Dict[str, Any]:
+    """Run one segment on a long-lived evaluator and return the metrics dict.
+
+    Mirrors the per-segment block of :func:`__main__`: reconfigure the
+    evaluator, run the rollout, pad the review-video tail, optionally write
+    the metrics JSON, flush the video writer, and release rawdata caches.
+    Always cleans up cached HDF5 handles, even if the rollout raised.
+    """
+    ctx = _reconfigure_for_segment(evaluator, sample)
+    cfg = evaluator.cfg
+    try:
         result = run_single_segment(
             evaluator=evaluator,
-            demo_id=demo_id,
-            segment_level=segment_level,
-            segment_idx=segment_idx,
-            success_mode=success_mode,
-            dry_run=dry_run,
-            segment_max_steps=segment_max_steps,
-            review_dir=review_dir,
+            demo_id=ctx["demo_id"],
+            segment_level=ctx["segment_level"],
+            segment_idx=ctx["segment_idx"],
+            success_mode=ctx["success_mode"],
+            dry_run=ctx["dry_run"],
+            segment_max_steps=ctx["segment_max_steps"],
+            review_dir=ctx["review_dir"],
         )
 
-        result["task_name"] = config.task.name
-        result["instance_id"] = instance_id
-        if config.write_video and video_name is not None:
+        result["task_name"] = ctx["task_name"]
+        result["instance_id"] = ctx["instance_id"]
+
+        video_name = ctx["video_name"]
+        if ctx["write_video"] and video_name is not None:
             review_artifacts = result.setdefault("review_artifacts", {})
             rollout = result.get("rollout") or {}
             rollout_frame_count_estimate = int(rollout.get("final_step") or 0)
             video_rate = 30
-            min_meaningful_frames = int(config.get("review_video_min_meaningful_frames", 30))
+            min_meaningful_frames = int(cfg.get("review_video_min_meaningful_frames", 30))
             tail_frames_appended = _pad_review_video_tail(
                 evaluator,
                 current_frames=rollout_frame_count_estimate,
@@ -1118,15 +1234,23 @@ if __name__ == "__main__":
                 }
             )
 
-        out_path = metrics_path / f"segment_eval_{config.task.name}_{demo_id}_{segment_level}{segment_idx:03d}.json"
-        with open(out_path, "w") as f:
-            json.dump(result, f, indent=2)
+        if write_metrics:
+            out_path = (
+                ctx["metrics_path"]
+                / f"segment_eval_{ctx['task_name']}_{ctx['demo_id']}_{ctx['segment_level']}{ctx['segment_idx']:03d}.json"
+            )
+            with open(out_path, "w") as f:
+                json.dump(result, f, indent=2)
+            result["_metrics_path"] = str(out_path)
+            logger.info(f"Saved metrics to {out_path}")
 
-        logger.info(f"Saved metrics to {out_path}")
-        if config.write_video and video_name is not None:
+        if ctx["write_video"] and video_name is not None:
+            # Flush + close the writer so the mp4 is finalized before we move on.
             evaluator.video_writer = None
             logger.info(f"Saved video to {video_name}")
 
+        return result
+    finally:
         raw = getattr(evaluator, "current_rawdata_hdf5", None)
         if raw is not None:
             try:
@@ -1134,5 +1258,75 @@ if __name__ == "__main__":
             except Exception:
                 pass
             evaluator.current_rawdata_hdf5 = None
-
         evaluator.current_primitive_state_cache = None
+
+
+def _build_sample_from_cli_config(config: DictConfig) -> Dict[str, Any]:
+    """Build a sample dict from the Hydra CLI config so the CLI entrypoint
+    can route through ``run_segment_on_env``.
+    """
+    segment_level = config.get("segment_level", "primitive")
+    segment_idx = config.get("segment_idx", None)
+    if segment_idx is None:
+        raise RuntimeError("Missing required config: segment_idx")
+    segment_idx = int(segment_idx)
+
+    demo_id_cfg = config.get("demo_id", None)
+    if demo_id_cfg is not None:
+        demo_id = _as_demo_id(demo_id_cfg)
+    else:
+        demo_data_path = config.get("demo_data_path", None)
+        if demo_data_path is None:
+            raise RuntimeError("demo_data_path must be specified (points to 2025-challenge-demos)")
+        demo_ids = get_demo_ids_for_task(
+            demo_data_path=str(demo_data_path),
+            task_name=config.task.name,
+            limit=1,
+        )
+        if not demo_ids:
+            raise RuntimeError(f"No demos found for task {config.task.name}")
+        demo_id = demo_ids[0]
+
+    return {
+        "task_name": str(config.task.name),
+        "demo_id": demo_id,
+        "segment_level": segment_level,
+        "segment_idx": segment_idx,
+        "segment_max_steps": config.get("segment_max_steps", None),
+        "success_mode": config.get("success_mode", "predicate_subgoal"),
+        "dry_run": bool(config.get("dry_run", False)),
+        "write_video": bool(config.get("write_video", False)),
+        "test_hidden": bool(config.get("test_hidden", False)),
+        "log_path": str(Path(str(config.log_path)).expanduser()),
+        "expected_skill": config.get("expected_skill", None),
+    }
+
+
+if __name__ == "__main__":
+    register_omegaconf_resolvers()
+
+    src = getsourcefile(lambda: 0) or __file__
+    with hydra.initialize_config_dir(
+        f"{Path(src).parents[0]}/configs",
+        version_base="1.1",
+    ):
+        config = hydra.compose("eval_segment_config.yaml", overrides=sys.argv[1:])
+
+    OmegaConf.resolve(config)
+    OmegaConf.set_struct(config, False)
+
+    if config.get("demo_data_path", None) is None:
+        logger.error("demo_data_path must be specified (points to 2025-challenge-demos)")
+        sys.exit(1)
+
+    with gm.unlocked():
+        gm.HEADLESS = config.headless
+
+    try:
+        sample = _build_sample_from_cli_config(config)
+    except RuntimeError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+    with SubTaskEvaluator(config) as evaluator:
+        run_segment_on_env(evaluator, sample, write_metrics=True)

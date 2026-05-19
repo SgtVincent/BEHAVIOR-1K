@@ -295,7 +295,7 @@ def _resolve_role_name(info: Dict[str, Optional[str]], role: str) -> Optional[st
         "dst_or_target": dst or target,
         "support_target": parsed_a or dst or target,
         "neighbor_target": parsed_b or target,
-        "payload_or_obj": parsed_obj or obj,
+        "payload_or_obj": parsed_obj,
         "target_obj": parsed_a or target,
         "target_obj_or_surface": parsed_a or target,
         "unary_target": dst or target or obj,
@@ -341,6 +341,7 @@ def build_template_predicates(
         return [], {"registry_missing": True}
 
     specs: List[SegmentPredicate] = []
+    missing_template_roles: List[Dict[str, Any]] = []
     for metric in entry.get("metrics", []):
         metric_type = metric.get("type")
         if metric_type == "predicate":
@@ -353,10 +354,21 @@ def build_template_predicates(
                 resolved = _resolve_role_name(info, role)
                 if resolved is None:
                     valid = False
+                    if not bool(metric.get("optional", False)):
+                        missing_template_roles.append(
+                            {
+                                "metric_type": metric_type,
+                                "metric_name": metric.get("name"),
+                                "role": role,
+                            }
+                        )
                     break
                 args.append(resolved)
             if not valid:
                 continue
+            params = {"metric_family": entry["metric_family"], "success_rule": entry["success_rule"]}
+            if bool(metric.get("optional", False)):
+                params["optional"] = True
             specs.append(
                 SegmentPredicate(
                     metric_type="predicate",
@@ -364,12 +376,20 @@ def build_template_predicates(
                     args=args,
                     desired=bool(metric["desired"]),
                     source="registry",
-                    params={"metric_family": entry["metric_family"], "success_rule": entry["success_rule"]},
+                    params=params,
                 )
             )
         elif metric_type in {"base_to_object", "face_object", "object_pose_match", "object_orientation_match"}:
             resolved = _resolve_role_name(info, metric["role"])
             if resolved is None:
+                if not bool(metric.get("optional", False)):
+                    missing_template_roles.append(
+                        {
+                            "metric_type": metric_type,
+                            "metric_name": metric.get("name", metric_type),
+                            "role": metric.get("role"),
+                        }
+                    )
                 continue
             params = dict(metric)
             params["resolved_role_name"] = resolved
@@ -423,6 +443,8 @@ def build_template_predicates(
         "combine_mode": entry.get("combine_mode", "all_of"),
         "require_unsatisfied_at_start": bool(entry.get("require_unsatisfied_at_start", True)),
     }
+    if missing_template_roles:
+        debug["missing_template_roles"] = missing_template_roles
     debug.update(
         {
             key: value
@@ -633,9 +655,22 @@ def trace_has_missing_object(trace: Sequence[Dict[str, Any]]) -> bool:
     return bool(trace_missing_objects(trace))
 
 
-def predicate_window_satisfied(history: Sequence[List[Dict[str, Any]]], mode: str = "anytime", last_k: int = 20, min_consecutive: int = 1, combine_mode: str = "all_of") -> bool:
+def predicate_window_satisfied(
+    history: Sequence[List[Dict[str, Any]]],
+    mode: str = "anytime",
+    last_k: int = 20,
+    min_consecutive: int = 1,
+    combine_mode: str = "all_of",
+    min_history_index: int = 0,
+) -> bool:
     if not history:
         return False
+    min_history_index = max(int(min_history_index), 0)
+    if min_history_index:
+        history = history[min_history_index:]
+    if not history:
+        return False
+
     def step_trace_satisfied(step_trace: List[Dict[str, Any]]) -> bool:
         if not step_trace or trace_has_missing_object(step_trace):
             return False
