@@ -29,6 +29,7 @@ import omnigibson as og
 import omnigibson.utils.transform_utils as T
 import os
 import pandas as pd
+import re
 import sys
 import torch as th
 import traceback
@@ -55,6 +56,20 @@ from typing import Any, Dict, List, Optional, Tuple
 # create module logger
 logger = logging.getLogger("subtask_evaluator")
 logger.setLevel(20)  # info
+
+
+# Some tasks create transition-generated objects mid-episode (e.g. diced ingredients
+# in make_pizza). Rawdata / primitive-state artifacts for skill eval only provide the
+# static scene snapshot, so serialized full-state restore can reference objects that do
+# not exist in the reconstructed registry. Keep this skill-eval-only guard local here
+# instead of changing the official task-level eval env loading path in eval.py.
+SERIALIZED_FULL_STATE_RESTORE_UNSUPPORTED_TASKS = {
+    "make_pizza",
+}
+
+
+def _task_supports_serialized_full_state_restore(task_name: str) -> bool:
+    return task_name not in SERIALIZED_FULL_STATE_RESTORE_UNSUPPORTED_TASKS
 
 
 class SubTaskEvaluator(Evaluator):
@@ -108,6 +123,8 @@ class SubTaskEvaluator(Evaluator):
         self.current_primitive_idx = 0
         self.current_demo_data = None
         self.current_demo_id = None
+        self._last_rawdata_restore_result: Dict[str, Any] = {"attempted": False}
+        self._last_restore_debug: Dict[str, Any] = {"selected_method": "none"}
 
         # Video annotation state
         self._video_primitive_desc = None
@@ -120,6 +137,49 @@ class SubTaskEvaluator(Evaluator):
         self._last_primitive_success_reason: Optional[str] = None
         
         logger.info("SubTaskEvaluator initialized with primitive evaluation support")
+
+    @staticmethod
+    def _parse_restore_exception_details(exc: Exception) -> Dict[str, Any]:
+        details: Dict[str, Any] = {
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+        }
+        match = re.search(r"hash_key\s+(?P<hash_key>\w+):\s+(?P<value>\d+)", str(exc))
+        if match:
+            details["missing_hash_key"] = match.group("hash_key")
+            details["missing_hash_value"] = int(match.group("value"))
+        return details
+
+    def _set_last_rawdata_restore_result(
+        self,
+        *,
+        attempted: bool,
+        restored: bool,
+        frame_idx: int,
+        hdf5_path: Optional[str],
+        stage: Optional[str] = None,
+        reason: Optional[str] = None,
+        exception: Optional[Exception] = None,
+        selected_key: Optional[str] = None,
+        available_groups: Optional[List[str]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "attempted": attempted,
+            "restored": restored,
+            "frame_idx": int(frame_idx),
+            "hdf5_path": hdf5_path,
+        }
+        if stage is not None:
+            payload["stage"] = stage
+        if reason is not None:
+            payload["reason"] = reason
+        if selected_key is not None:
+            payload["selected_demo_group"] = selected_key
+        if available_groups is not None:
+            payload["available_demo_groups"] = list(available_groups)
+        if exception is not None:
+            payload.update(self._parse_restore_exception_details(exception))
+        self._last_rawdata_restore_result = payload
 
     #region debug-point restore-grasp-state
     def _debug_log_grasp_state(self, tag: str) -> None:
@@ -481,19 +541,83 @@ class SubTaskEvaluator(Evaluator):
         Returns:
             True if state was successfully restored, False otherwise
         """
+        hdf5_path = getattr(hdf5_file, "filename", None)
+        self._set_last_rawdata_restore_result(
+            attempted=True,
+            restored=False,
+            frame_idx=frame_idx,
+            hdf5_path=hdf5_path,
+            stage="begin",
+            reason="started",
+        )
         try:
-            # Find the demo group (usually demo_0 for single episode files)
+            # Find the demo group.
+            # Most files contain a single demo group, but some rawdata files include
+            # a short bootstrap / warmup group (e.g. demo_0) plus the full episode
+            # in a later group (e.g. demo_1). Selecting demo_0 unconditionally can
+            # make valid frame indices look out-of-range and force an unnecessary
+            # robot-only fallback.
             data_grp = hdf5_file["data"]
             demo_keys = [k for k in data_grp.keys() if k.startswith("demo_")]
             if not demo_keys:
                 logger.warning("No demo groups found in HDF5 file")
+                self._set_last_rawdata_restore_result(
+                    attempted=True,
+                    restored=False,
+                    frame_idx=frame_idx,
+                    hdf5_path=hdf5_path,
+                    stage="select_demo_group",
+                    reason="no_demo_keys",
+                )
                 return False
-                
-            demo_grp = data_grp[demo_keys[0]]
+
+            demo_candidates = []
+            target_len = len(self.current_demo_data) if getattr(self, "current_demo_data", None) is not None else None
+            for key in demo_keys:
+                grp = data_grp[key]
+                if "state" not in grp or "state_size" not in grp:
+                    continue
+                state_len = len(grp["state"])
+                fits_frame = frame_idx < state_len
+                len_gap = abs(state_len - target_len) if target_len is not None else state_len
+                demo_candidates.append((not fits_frame, len_gap, -state_len, key, grp, state_len))
+
+            if not demo_candidates:
+                logger.warning("No state data found in HDF5 file")
+                self._set_last_rawdata_restore_result(
+                    attempted=True,
+                    restored=False,
+                    frame_idx=frame_idx,
+                    hdf5_path=hdf5_path,
+                    stage="select_demo_group",
+                    reason="no_state_data_groups",
+                    available_groups=demo_keys,
+                )
+                return False
+
+            _, _, _, selected_key, demo_grp, selected_len = min(demo_candidates)
+            if selected_key != demo_keys[0]:
+                logger.info(
+                    "Selected rawdata demo group %s for frame %s (available groups=%s, selected_len=%s)",
+                    selected_key,
+                    frame_idx,
+                    demo_keys,
+                    selected_len,
+                )
             
             # Check if state data is available
             if "state" not in demo_grp:
                 logger.warning("No state data found in HDF5 file")
+                self._set_last_rawdata_restore_result(
+                    attempted=True,
+                    restored=False,
+                    frame_idx=frame_idx,
+                    hdf5_path=hdf5_path,
+                    stage="load_state",
+                    reason="missing_state_dataset",
+                    selected_key=selected_key,
+                    available_groups=demo_keys,
+                )
                 return False
                 
             state = demo_grp["state"]
@@ -501,6 +625,16 @@ class SubTaskEvaluator(Evaluator):
             
             if frame_idx >= len(state):
                 logger.warning(f"Frame {frame_idx} exceeds state data length {len(state)}")
+                self._set_last_rawdata_restore_result(
+                    attempted=True,
+                    restored=False,
+                    frame_idx=frame_idx,
+                    hdf5_path=hdf5_path,
+                    stage="load_state",
+                    reason="frame_exceeds_state_length",
+                    selected_key=selected_key,
+                    available_groups=demo_keys,
+                )
                 return False
                 
             # Load and restore the simulation state
@@ -527,11 +661,30 @@ class SubTaskEvaluator(Evaluator):
             self._debug_log_grasp_state(f"rawdata_restore_frame_{frame_idx}_after_render")
                 
             logger.info(f"Restored full simulation state from frame {frame_idx}")
+            self._set_last_rawdata_restore_result(
+                attempted=True,
+                restored=True,
+                frame_idx=frame_idx,
+                hdf5_path=hdf5_path,
+                stage="restored",
+                reason="ok",
+                selected_key=selected_key,
+                available_groups=demo_keys,
+            )
             return True
             
         except Exception as e:
             logger.error(f"Failed to restore full state from rawdata: {e}")
             traceback.print_exc()
+            self._set_last_rawdata_restore_result(
+                attempted=True,
+                restored=False,
+                frame_idx=frame_idx,
+                hdf5_path=hdf5_path,
+                stage="deserialize",
+                reason="exception",
+                exception=e,
+            )
             return False
 
     def _try_restore_to_frame(self, frame_idx: int) -> Tuple[bool, str]:
@@ -545,20 +698,72 @@ class SubTaskEvaluator(Evaluator):
         Returns:
             (restored, method) where method is one of: rawdata | cache | robot | none
         """
+        debug: Dict[str, Any] = {
+            "frame_idx": int(frame_idx),
+            "selected_method": "none",
+            "fallback_used": False,
+            "rawdata": {"attempted": False, "restored": False},
+            "cache": {"attempted": False, "restored": False},
+            "robot": {"attempted": False, "restored": False},
+        }
+        task_name = str(self.cfg.task.name)
+        serialized_full_state_restore_allowed = _task_supports_serialized_full_state_restore(task_name)
+
         # 1) rawdata
         if getattr(self, "current_rawdata_hdf5", None) is not None:
-            if self.restore_full_state_from_rawdata(self.current_rawdata_hdf5, frame_idx):
-                return True, "rawdata"
-            logger.warning("Rawdata state restore failed; falling back")
+            if serialized_full_state_restore_allowed:
+                debug["rawdata"]["attempted"] = True
+                if self.restore_full_state_from_rawdata(self.current_rawdata_hdf5, frame_idx):
+                    debug["rawdata"] = dict(getattr(self, "_last_rawdata_restore_result", {}) or {})
+                    debug["selected_method"] = "rawdata"
+                    self._last_restore_debug = debug
+                    return True, "rawdata"
+                debug["rawdata"] = dict(getattr(self, "_last_rawdata_restore_result", {}) or {})
+                logger.warning("Rawdata state restore failed; falling back")
+            else:
+                rawdata_hdf5 = getattr(self, "current_rawdata_hdf5", None)
+                self._set_last_rawdata_restore_result(
+                    attempted=False,
+                    restored=False,
+                    frame_idx=frame_idx,
+                    hdf5_path=getattr(rawdata_hdf5, "filename", None),
+                    stage="precheck",
+                    reason=f"serialized_full_state_restore_disabled_for_task:{task_name}",
+                )
+                debug["rawdata"] = dict(getattr(self, "_last_rawdata_restore_result", {}) or {})
+                logger.warning(
+                    "Skipping rawdata serialized full-state restore for task=%s because current artifacts can omit "
+                    "transition-generated objects; falling back.",
+                    task_name,
+                )
 
         # 2) cache
-        if self.restore_full_state_from_cache(frame_idx):
-            return True, "cache"
+        if getattr(self, "current_primitive_state_cache", None) is not None and serialized_full_state_restore_allowed:
+            debug["cache"]["attempted"] = True
+        if serialized_full_state_restore_allowed:
+            if self.restore_full_state_from_cache(frame_idx):
+                debug["cache"]["restored"] = True
+                debug["selected_method"] = "cache"
+                debug["fallback_used"] = bool(debug["rawdata"].get("attempted"))
+                self._last_restore_debug = debug
+                return True, "cache"
+        elif getattr(self, "current_primitive_state_cache", None) is not None:
+            logger.warning(
+                "Skipping primitive-cache serialized full-state restore for task=%s because current artifacts can omit "
+                "transition-generated objects; falling back.",
+                task_name,
+            )
 
         # 3) robot-only
+        debug["robot"]["attempted"] = True
         if self.restore_robot_state_from_frame(frame_idx):
+            debug["robot"]["restored"] = True
+            debug["selected_method"] = "robot"
+            debug["fallback_used"] = bool(debug["rawdata"].get("attempted") or debug["cache"].get("attempted"))
+            self._last_restore_debug = debug
             return True, "robot"
 
+        self._last_restore_debug = debug
         return False, "none"
 
     @staticmethod
@@ -1251,7 +1456,8 @@ if __name__ == "__main__":
     OmegaConf.resolve(config)
     
     # Set headless mode
-    gm.HEADLESS = config.headless
+    with gm.unlocked():
+        gm.HEADLESS = config.headless
     
     # Set video path
     if config.write_video:

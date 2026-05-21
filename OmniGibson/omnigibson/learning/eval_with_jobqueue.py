@@ -23,9 +23,10 @@ gpu_id = (
 )
 
 # set global variables to boost performance
-gm.ENABLE_FLATCACHE = True
-gm.USE_GPU_DYNAMICS = False
-gm.ENABLE_TRANSITION_RULES = True
+with gm.unlocked():
+    gm.ENABLE_FLATCACHE = True
+    gm.USE_GPU_DYNAMICS = False
+    gm.ENABLE_TRANSITION_RULES = True
 gm.HEADLESS = True
 scratch_disk = "/scr-ssd" if os.path.exists("/scr-ssd") else "/scr"
 user = os.environ["USER"]

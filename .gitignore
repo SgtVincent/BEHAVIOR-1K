@@ -8,6 +8,8 @@ gha-creds-*.json
 /site
 .vscode
 .trae/tmp/
+.trae/documents/tmp/
+trae/documents/tmp/
 .DS_Store
 
 # training

@@ -52,6 +52,9 @@ import omnigibson.utils.transform_utils as T
 from PIL import Image
 import torch as th
 
+from omnigibson.learning.eval import _has_full_state_restore_source
+from omnigibson.learning.eval import _resolve_rawdata_scene_file
+
 m = create_module_macros(module_path=__file__)
 m.NUM_EVAL_EPISODES = 1
 m.NUM_EVAL_INSTANCES = 10
@@ -166,10 +169,30 @@ class Evaluator:
         robot_type = self.cfg.robot.type
         assert robot_type == "R1Pro", f"Got invalid robot type: {robot_type}, only R1Pro is supported."
         cfg = generate_basic_environment_config(task_name=task_name, task_cfg=task_cfg)
-        if self.cfg.partial_scene_load:
+        full_state_restore_expected = _has_full_state_restore_source(self.cfg)
+        if self.cfg.partial_scene_load and full_state_restore_expected:
+            logger.warning(
+                "partial_scene_load requested for task=%s, but full-state restore source is configured; "
+                "skipping room filtering to keep serialized restore compatible.",
+                task_name,
+            )
+        elif self.cfg.partial_scene_load:
             relevant_rooms = get_task_relevant_room_types(activity_name=task_name)
             relevant_rooms = augment_rooms(relevant_rooms, task_cfg["scene_model"], task_name)
             cfg["scene"]["load_room_types"] = relevant_rooms
+
+        if full_state_restore_expected:
+            merged_scene_file = _resolve_rawdata_scene_file(self.cfg, task_name=task_name, task_cfg=task_cfg)
+            if merged_scene_file is not None:
+                cfg["scene"]["scene_file"] = merged_scene_file
+                cfg["scene"]["scene_instance"] = None
+                cfg["scene"]["load_room_types"] = None
+                cfg["scene"]["load_room_instances"] = None
+                # Raw / merged scene snapshots do not carry cached task metadata such as
+                # robot_poses, so BehaviorTask.reset() cannot rely on presampled poses at
+                # initial env construction time. Later task loading still restores the robot
+                # pose explicitly from tro_state.
+                cfg["task"]["use_presampled_robot_pose"] = False
 
         cfg["robots"] = [
             generate_robot_config(

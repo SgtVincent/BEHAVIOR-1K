@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import sys
+import copy
 from inspect import getsourcefile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -80,6 +81,35 @@ from omnigibson.macros import gm
 
 logger = logging.getLogger("segment_evaluator")
 logger.setLevel(logging.INFO)
+
+
+def _sanitize_restore_debug(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _sanitize_restore_debug(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_restore_debug(v) for v in value]
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return repr(value)
+
+
+def _snapshot_restore_debug(evaluator: SubTaskEvaluator) -> Optional[Dict[str, Any]]:
+    debug = getattr(evaluator, "_last_restore_debug", None)
+    if debug is None:
+        return None
+    try:
+        return copy.deepcopy(debug)
+    except Exception as exc:
+        logger.warning("Failed to deepcopy restore telemetry; sanitizing debug payload instead: %s", exc)
+        sanitized = _sanitize_restore_debug(debug)
+        return sanitized if isinstance(sanitized, dict) else {"value": sanitized}
 
 
 def _as_demo_id(x: Any) -> str:
@@ -409,6 +439,12 @@ def run_single_segment(
         return {"error": "no_ground_goal_state_options"}
 
     if success_mode == "segment_predicates":
+        def _restore_entry(restored: bool, method: str, debug: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            entry: Dict[str, Any] = {"restored": bool(restored), "method": method}
+            if debug is not None:
+                entry["debug"] = debug
+            return entry
+
         review_artifacts = {
             "start_restore_rgb": None,
             "end_restore_rgb": None,
@@ -420,12 +456,14 @@ def run_single_segment(
             evaluator.current_primitive_state_cache = evaluator.load_primitive_state_cache(demo_id)
 
         restored_start, method_start, _ = restore_and_eval_predicates(evaluator, start_frame)
+        restore_debug_start = _snapshot_restore_debug(evaluator)
         if restored_start:
             review_artifacts["start_restore_rgb"] = _capture_review_frame(
                 evaluator,
                 review_dir / "start_restore.png" if review_dir is not None else None,
             )
         restored_end, method_end, _ = restore_and_eval_predicates(evaluator, end_frame)
+        restore_debug_end = _snapshot_restore_debug(evaluator)
         if restored_end:
             review_artifacts["end_restore_rgb"] = _capture_review_frame(
                 evaluator,
@@ -439,8 +477,8 @@ def run_single_segment(
                 "segment_desc": segment_desc,
                 "frame_duration": [int(start_frame), int(end_frame)],
                 "restore": {
-                    "start": {"restored": restored_start, "method": method_start},
-                    "end": {"restored": restored_end, "method": method_end},
+                    "start": _restore_entry(restored_start, method_start, restore_debug_start),
+                    "end": _restore_entry(restored_end, method_end, restore_debug_end),
                 },
                 "success_mode": str(success_mode),
                 "success": False,
@@ -450,6 +488,7 @@ def run_single_segment(
 
         template_specs, metric_debug = build_template_predicates(segment_level, segment, evaluator.env)
         restored_start_for_compare, _, _ = restore_and_eval_predicates(evaluator, start_frame)
+        restore_debug_start_for_compare = _snapshot_restore_debug(evaluator)
         if not restored_start_for_compare:
             return {
                 "demo_id": demo_id,
@@ -458,8 +497,8 @@ def run_single_segment(
                 "segment_desc": segment_desc,
                 "frame_duration": [int(start_frame), int(end_frame)],
                 "restore": {
-                    "start": {"restored": False, "method": method_start},
-                    "end": {"restored": True, "method": method_end},
+                    "start": _restore_entry(False, method_start, restore_debug_start_for_compare),
+                    "end": _restore_entry(True, method_end, restore_debug_end),
                 },
                 "success_mode": str(success_mode),
                 "success": False,
@@ -468,6 +507,7 @@ def run_single_segment(
             }
         start_truth_map, start_trace = eval_segment_predicates(evaluator.env, template_specs)
         restored_end, method_end, _ = restore_and_eval_predicates(evaluator, end_frame)
+        restore_debug_end_for_compare = _snapshot_restore_debug(evaluator)
         end_truth_map, end_trace = eval_segment_predicates(evaluator.env, template_specs)
         auto_specs = build_auto_mined_predicates(
             segment_level,
@@ -485,8 +525,8 @@ def run_single_segment(
                 "segment_desc": segment_desc,
                 "frame_duration": [int(start_frame), int(end_frame)],
                 "restore": {
-                    "start": {"restored": True, "method": method_start},
-                    "end": {"restored": True, "method": method_end},
+                    "start": _restore_entry(True, method_start, restore_debug_start_for_compare),
+                    "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
                 },
                 "success_mode": str(success_mode),
                 "effective_success_mode": "segment_predicates",
@@ -534,8 +574,8 @@ def run_single_segment(
                 "segment_desc": segment_desc,
                 "frame_duration": [int(start_frame), int(end_frame)],
                 "restore": {
-                    "start": {"restored": True, "method": method_start},
-                    "end": {"restored": True, "method": method_end},
+                    "start": _restore_entry(True, method_start, restore_debug_start_for_compare),
+                    "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
                 },
                 "success_mode": str(success_mode),
                 "effective_success_mode": "segment_predicates",
@@ -546,6 +586,7 @@ def run_single_segment(
 
         # Segment rollout must start from the segment start frame, not the end frame used for target metric capture.
         restored_rollout_start, _, _ = restore_and_eval_predicates(evaluator, start_frame)
+        restore_debug_rollout_start = _snapshot_restore_debug(evaluator)
         if not restored_rollout_start:
             return {
                 "demo_id": demo_id,
@@ -554,8 +595,9 @@ def run_single_segment(
                 "segment_desc": segment_desc,
                 "frame_duration": [int(start_frame), int(end_frame)],
                 "restore": {
-                    "start": {"restored": False, "method": method_start},
-                    "end": {"restored": True, "method": method_end},
+                    "start": _restore_entry(False, method_start, restore_debug_rollout_start),
+                    "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
+                    "rollout_start": _restore_entry(False, method_start, restore_debug_rollout_start),
                 },
                 "success_mode": str(success_mode),
                 "effective_success_mode": "segment_predicates",
@@ -571,8 +613,9 @@ def run_single_segment(
             "segment_desc": segment_desc,
             "frame_duration": [int(start_frame), int(end_frame)],
             "restore": {
-                "start": {"restored": True, "method": method_start},
-                "end": {"restored": True, "method": method_end},
+                "start": _restore_entry(True, method_start, restore_debug_start_for_compare),
+                "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
+                "rollout_start": _restore_entry(True, method_start, restore_debug_rollout_start),
             },
             "success_mode": str(success_mode),
             "effective_success_mode": "segment_predicates",
