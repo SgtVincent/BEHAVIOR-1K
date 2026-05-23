@@ -89,6 +89,9 @@ class WebsocketPolicy:
 
     def forward(self, obs: dict, *args, **kwargs) -> th.Tensor:
         if "need_new_action" in obs and not obs["need_new_action"] and self.last_action is not None:
+            if hasattr(self.policy, "cached_actions_remaining") and getattr(self.policy, "cached_actions_remaining") > 0:
+                self.last_action = self.policy.pop_cached_action()
+                return self.last_action
             return self.last_action
         # convert observation to numpy
         obs = torch_to_numpy(obs)

@@ -588,10 +588,13 @@ class Environment(gym.Env, GymObservable, Recreatable):
         for robot in self.robots:
             robot.apply_action(action_dict[robot.name])
 
-    def _post_step(self, action):
+    def _post_step(self, action, skip_obs=False):
         """Apply the post-sim-step part of an environment step, i.e. grab observations and return the step results."""
         # Grab observations
-        obs, obs_info = self.get_obs()
+        if skip_obs:
+            obs, obs_info = {}, {}
+        else:
+            obs, obs_info = self.get_obs()
 
         # Step the scene graph builder if necessary
         if self._scene_graph_builder is not None:
@@ -622,7 +625,7 @@ class Environment(gym.Env, GymObservable, Recreatable):
         self._current_step += 1
         return obs, reward, terminated, truncated, info
 
-    def step(self, action, n_render_iterations=1):
+    def step(self, action, n_render_iterations=1, skip_obs=False, render=True):
         """
         Apply robot's action and return the next state, reward, done and info,
         following OpenAI Gym's convention
@@ -632,6 +635,9 @@ class Environment(gym.Env, GymObservable, Recreatable):
                 map robot name to corresponding action. If a th.tensor, it should be the flattened, concatenated set
                 of actions
             n_render_iterations (int): Number of rendering iterations to use before returning observations
+            skip_obs (bool): Whether to skip observation collection on this step
+            render (bool): Whether to render during the simulator step. This defaults to True for baseline behavior,
+                but callers that also skip observations can set this to False to avoid Replicator / render-product work.
 
         Returns:
             5-tuple:
@@ -645,15 +651,20 @@ class Environment(gym.Env, GymObservable, Recreatable):
         action = self._convert_action_to_tensor(action)
         self._pre_step(action)
 
-        # Step simulation
-        og.sim.step()
+        # Step simulation. When observations are intentionally skipped, allow callers to suppress the render-on-step
+        # path as well; otherwise skip_obs only avoids get_obs() while still advancing the renderer.
+        if render:
+            og.sim.step()
+        else:
+            with og.sim.render_on_step(False):
+                og.sim.step()
 
         # Render any additional times requested
-        for _ in range(n_render_iterations - 1):
+        for _ in range(n_render_iterations - 1 if render else 0):
             og.sim.render()
 
         # Run final post-processing
-        return self._post_step(action)
+        return self._post_step(action, skip_obs=skip_obs)
 
     def render(self):
         """Render the environment for debug viewing."""

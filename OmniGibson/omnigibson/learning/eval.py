@@ -65,6 +65,43 @@ logger = logging.getLogger("evaluator")
 logger.setLevel(20)  # info
 
 
+def _apply_runtime_renderer_settings(cfg: DictConfig) -> None:
+    """Apply lightweight RLinf-style renderer overrides after Isaac/OG launch."""
+
+    memory_budget = getattr(cfg, "renderer_texturestreaming_memory_budget", None)
+    if memory_budget is None:
+        return
+
+    try:
+        memory_budget = float(memory_budget)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid renderer_texturestreaming_memory_budget=%r; skipping renderer override.",
+            memory_budget,
+        )
+        return
+
+    if memory_budget <= 0:
+        return
+
+    try:
+        import omnigibson.lazy as lazy
+
+        lazy.carb.settings.get_settings().set_float(
+            "/rtx-transient/resourcemanager/texturestreaming/memoryBudget",
+            memory_budget,
+        )
+        logger.info(
+            "Applied renderer texture streaming memory budget override: %s",
+            memory_budget,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to apply renderer texture streaming memory budget override: %s",
+            exc,
+        )
+
+
 class Evaluator:
     """
     Evaluator class for running and evaluating policies for behavior task.
@@ -154,6 +191,7 @@ class Evaluator:
             cfg["task"]["termination_config"]["max_steps"] = self.cfg.max_steps
         cfg["task"]["include_obs"] = False
         env = og.Environment(configs=cfg)
+        _apply_runtime_renderer_settings(self.cfg)
         # Instantiate env wrapper when configured. Persistent eval may set
         # env_wrapper=None to avoid Isaac Replicator render-product
         # reconfiguration across soft restarts; in that mode, use the raw
@@ -190,6 +228,30 @@ class Evaluator:
         """
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
+    def _policy_client(self) -> Any:
+        return getattr(self.policy, "policy", None)
+
+    def _should_request_new_action(self) -> bool:
+        if not getattr(self.cfg, "skip_intermediate_obs_in_chunk", False):
+            return True
+        client = self._policy_client()
+        if client is None or not hasattr(client, "cached_actions_remaining"):
+            return True
+        return int(getattr(client, "cached_actions_remaining", 0)) <= 0
+
+    def _update_policy_debug_state(self, *, requested_new_action: bool) -> None:
+        client = getattr(self.policy, "policy", None)
+        if client is not None:
+            self._last_generated_subtask = getattr(client, "_last_generated_subtask", None)
+            self._last_prompt_debug = getattr(client, "_last_prompt_debug", None)
+            self._last_server_fresh_action = (
+                bool(getattr(client, "_last_server_fresh_action", False)) if requested_new_action else False
+            )
+        else:
+            self._last_generated_subtask = None
+            self._last_prompt_debug = None
+            self._last_server_fresh_action = bool(requested_new_action)
+
     def step(self) -> Tuple[bool, bool]:
         """
         Performs a single step of the task by executing the policy, interacting with the environment,
@@ -210,17 +272,34 @@ class Evaluator:
             5. Invokes step callbacks for all registered metrics to update their state.
             6. Returns the termination and truncation status.
         """
-        self.robot_action = self.policy.forward(obs=self.obs)
+        need_new_action = self._should_request_new_action()
+        policy_obs = self.obs if need_new_action else {"need_new_action": False}
+        self.robot_action = self.policy.forward(obs=policy_obs)
+        self._update_policy_debug_state(requested_new_action=need_new_action)
 
-        obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
+        client = self._policy_client()
+        cached_actions_remaining = int(getattr(client, "cached_actions_remaining", 0)) if client is not None else 0
+        skip_obs = bool(
+            getattr(self.cfg, "skip_intermediate_obs_in_chunk", False)
+            and not need_new_action
+            and cached_actions_remaining > 0
+        )
+
+        obs, _, terminated, truncated, info = self.env.step(
+            self.robot_action,
+            n_render_iterations=1,
+            skip_obs=skip_obs,
+            render=not skip_obs,
+        )
         self._last_step_info = info
         self._last_done_info = dict((info or {}).get("done", {}) or {})
         self._last_env_done_success = self._last_done_info.get("success")
         self._last_terminated = bool(terminated)
         self._last_truncated = bool(truncated)
+        self._last_obs_refreshed = not skip_obs
 
-        # process obs
-        self.obs = self._preprocess_obs(obs)
+        if not skip_obs:
+            self.obs = self._preprocess_obs(obs)
 
         if terminated or truncated:
             self.n_trials += 1
@@ -365,6 +444,15 @@ class Evaluator:
         Reset the environment, policy, and compute metrics.
         """
         self.obs = self._preprocess_obs(self.env.reset()[0])
+        self._last_generated_subtask = None
+        self._last_prompt_debug = None
+        self._last_server_fresh_action = False
+        self._last_obs_refreshed = True
+        self._last_step_info = None
+        self._last_done_info = {}
+        self._last_env_done_success = None
+        self._last_terminated = False
+        self._last_truncated = False
         # run metric start callbacks
         for metric in self.metrics:
             metric.start_callback(self.env)
@@ -405,6 +493,8 @@ if __name__ == "__main__":
     # set headless mode
     with gm.unlocked():
         gm.HEADLESS = config.headless
+        gm.RENDER_VIEWER_CAMERA = bool(getattr(config, "render_viewer_camera", False))
+        gm.GUI_VIEWPORT_ONLY = bool(getattr(config, "gui_viewport_only", False))
     # set video path
     if config.write_video:
         video_path = Path(config.log_path).expanduser() / "videos"
