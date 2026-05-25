@@ -1,0 +1,76 @@
+# Segment-level Evaluation Configuration for BEHAVIOR-1K using BDDL predicate subgoal
+# This config is intended for OmniGibson/omnigibson/learning/eval_segment.py
+
+defaults:
+  - base_config.yaml
+  - _self_
+
+# Segment evaluation settings
+# Dataset root containing `annotations/` and `data/`
+demo_data_path: ???
+
+# Optional raw HDF5 folder for full-state restoration
+rawdata_path: null
+
+# Optional per-demo primitive world-state cache directory
+# Defaults to <demo_data_path>/meta/primitive_states if null
+primitive_state_cache_dir: null
+
+# Which demo to use. If null, script will pick the first available demo for the task.
+demo_id: null
+
+# Segment level: "primitive" or "skill"
+segment_level: primitive
+
+# Segment index after sorting by start frame (0-based)
+segment_idx: ???
+
+# Success mode for segment evaluation
+# - predicate_subgoal: segment succeeds if all subgoal predicates are satisfied
+# - predicate_progress: only record progress, no binary success
+# - state_match: fallback to state-match (like eval_primitive)
+# - segment_predicates: use per-segment predicate spec built from annotation + BDDL-compatible predicates
+success_mode: predicate_subgoal
+
+# Number of top grounding candidates to output
+grounding_topk: 3
+
+# Optional override for max steps to run within the segment
+segment_max_steps: null
+
+# Dry run mode: only extract subgoal, skip rollout
+dry_run: false
+
+# (Optional) Segment-eval guidance for hierarchical / VLM policies
+expected_skill: null
+
+# Override default settings
+eval_on_train_instances: true
+write_video: true
+skip_intermediate_obs_in_chunk: true
+
+# Primitive-level state-match thresholds (used when success_mode=state_match)
+primitive_success_use_state_match: true
+primitive_success_base_pos_threshold: 0.15
+primitive_success_yaw_threshold: 0.35
+primitive_success_eef_pos_threshold: 0.12
+primitive_success_gripper_qpos_threshold: 0.03
+primitive_success_std_joint_qpos_rmse_threshold: 0.25
+primitive_success_joint_qpos_rmse_threshold: 0.25
+
+# Per-segment predicate evaluation settings
+segment_predicate_generation: hybrid
+segment_predicate_window_mode: anytime
+segment_predicate_last_k: 20
+segment_predicate_min_consecutive: 1
+# Generic early-stop safeguard. A predicate hit before this many rollout steps is
+# treated as a transient / non-reviewable success candidate and rollout continues.
+segment_predicate_min_success_steps: 150
+segment_predicate_dump_trace: true
+# In segment-predicate mode, whole-task env success is telemetry, not the segment success condition.
+# Keep false so a task-level success (e.g. attached relation) does not cut off a still-unsatisfied final skill
+# predicate such as release / not-grasped.
+segment_predicate_env_termination_is_terminal: false
+
+# Review-video safeguard: pad very short clips with duplicate final-state frames up to this estimate.
+review_video_min_meaningful_frames: 30

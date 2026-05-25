@@ -12,13 +12,30 @@ class LazyImporter(ModuleType):
         self._not_module = set()
         self._submodules = {}
 
+    def _should_cache_miss(self) -> bool:
+        """Whether a failed module lookup should be memoized.
+
+        The top-level ``omnigibson.lazy`` wrapper is used for Isaac / Omniverse
+        modules such as ``carb`` and ``omni``. Those modules may become
+        importable only after the caller has populated Isaac-specific env vars or
+        adjusted ``sys.path`` later in process startup. Permanently memoizing a
+        top-level miss therefore turns a transient import-order issue into a
+        sticky failure for the rest of the process.
+
+        Nested lazy importers still cache misses because their parent package is
+        already importable and repeated negative lookups there are genuinely
+        stable.
+        """
+
+        return bool(self._module_path)
+
     def __getattr__(self, name: str):
         # First, try the argument as a module name.
         if name not in self._not_module:
             submodule = self._get_module(name)
             if submodule:
                 return submodule
-            else:
+            elif self._should_cache_miss():
                 # Record module not found so that we don't keep looking.
                 self._not_module.add(name)
 

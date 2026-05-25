@@ -27,7 +27,7 @@ from omnigibson.robots.robot_base import BaseRobot
 from omnigibson.utils.asset_utils import get_dataset_path
 from omnigibson.utils.backend_utils import _compute_backend as cb
 from omnigibson.utils.constants import JointType, PrimType
-from omnigibson.utils.python_utils import assert_valid_key, classproperty
+from omnigibson.utils.python_utils import assert_valid_key, classproperty, get_uuid
 from omnigibson.utils.sampling_utils import raytest_batch
 from omnigibson.utils.usd_utils import (
     ControllableObjectViewAPI,
@@ -58,6 +58,12 @@ m.AG_DEFAULT_GRASP_POINT_Z_PROP = 0.4
 m.CONSTRAINT_VIOLATION_THRESHOLD = 0.1
 m.GRASP_WINDOW = 1 / 30.0  # grasp window in seconds
 m.RELEASE_WINDOW = 1 / 30.0  # release window in seconds
+m.SERIALIZED_AG_SENTINEL = -7325.0
+m.SERIALIZED_AG_VERSION = 1.0
+
+
+def _restore_debug_enabled():
+    return os.environ.get("OG_DEBUG_ASSISTED_RESTORE", "0") == "1"
 
 AG_MODES = {
     "physical",
@@ -536,14 +542,36 @@ class ManipulationRobot(BaseRobot):
         contact_data = set()
         for con_data in raw_contact_data:
             if not return_contact_positions:
+                assert len(con_data) == 2
                 other_contact, link_contact = con_data
                 contact_data.add(other_contact)
             else:
+                assert len(con_data) == 3
                 other_contact, link_contact, point = con_data
                 contact_data.add((other_contact, point))
             if other_contact not in robot_contact_links:
                 robot_contact_links[other_contact] = set()
             robot_contact_links[other_contact].add(link_contact)
+
+        if _restore_debug_enabled():
+            if not return_contact_positions:
+                log.info(
+                    "[debug][assisted_restore][contacts] arm=%s raw=%d contacts=%s robot_links=%s",
+                    arm,
+                    len(raw_contact_data),
+                    sorted(contact_data),
+                    {k: sorted(v) for k, v in robot_contact_links.items()},
+                )
+            else:
+                summarized = {}
+                for prim_path, point in sorted(contact_data, key=lambda x: x[0]):
+                    summarized.setdefault(prim_path, []).append([float(v) for v in point.tolist()])
+                log.info(
+                    "[debug][assisted_restore][contact_points] arm=%s contacts=%s robot_links=%s",
+                    arm,
+                    summarized,
+                    {k: sorted(v) for k, v in robot_contact_links.items()},
+                )
 
         return contact_data, robot_contact_links
 
@@ -1106,7 +1134,7 @@ class ManipulationRobot(BaseRobot):
         base_link_quat = self.get_position_orientation()[1]
         return T.quat2mat(base_link_quat).T @ self.eef_links[arm].get_angular_velocity()
 
-    def _calculate_in_hand_object_rigid(self, arm="default"):
+    def _calculate_in_hand_object_rigid(self, arm="default", restore_fallback=False):
         """
         Calculates which object to assisted-grasp for arm @arm. Returns an (object_id, link_id) tuple or None
         if no valid AG-enabled object can be found.
@@ -1126,15 +1154,40 @@ class ManipulationRobot(BaseRobot):
         if self.grasping_mode != "physical":
             candidates_set, robot_contact_links = self._find_gripper_contacts(arm=arm)
             # If we're using assisted grasping, we further filter candidates via ray-casting
+            candidates_set_raycast = set()
             if self.grasping_mode == "assisted":
                 candidates_set_raycast = self._find_gripper_raycast_collisions(arm=arm)
+                if _restore_debug_enabled():
+                    log.info(
+                        "[debug][assisted_restore][raycast] arm=%s candidates=%s",
+                        arm,
+                        sorted(candidates_set_raycast),
+                    )
                 candidates_set = candidates_set.intersection(candidates_set_raycast)
         else:
             raise ValueError("Invalid grasping mode for calculating in hand object: {}".format(self.grasping_mode))
 
+        if _restore_debug_enabled():
+            log.info(
+                "[debug][assisted_restore][candidate_sets] arm=%s contact=%s filtered=%s restore_fallback=%s",
+                arm,
+                sorted(candidates_set if self.grasping_mode != "assisted" else candidates_set.union(set())),
+                sorted(candidates_set),
+                restore_fallback,
+            )
+
         # Immediately return if there are no valid candidates
         if len(candidates_set) == 0:
-            return None
+            if restore_fallback and self.grasping_mode == "assisted" and len(candidates_set_raycast) > 0:
+                candidates_set = candidates_set_raycast
+                if _restore_debug_enabled():
+                    log.info(
+                        "[debug][assisted_restore][fallback] arm=%s using raycast-only candidates=%s",
+                        arm,
+                        sorted(candidates_set),
+                    )
+            else:
+                return None
 
         # Find the closest object to the gripper center
         gripper_center_pos = self.eef_links[arm].get_position_orientation()[0]
@@ -1153,6 +1206,13 @@ class ManipulationRobot(BaseRobot):
         if not candidate_data:
             return None
 
+        if _restore_debug_enabled():
+            log.info(
+                "[debug][assisted_restore][candidate_data] arm=%s candidates=%s",
+                arm,
+                [(prim_path, float(dist.item())) for prim_path, dist in candidate_data],
+            )
+
         candidate_data = sorted(candidate_data, key=lambda x: x[-1])
         ag_prim_path, _ = candidate_data[0]
 
@@ -1166,6 +1226,14 @@ class ManipulationRobot(BaseRobot):
             if self.grasping_mode == "sticky"
             else len({link.prim_path for link in self.finger_links[arm]}.intersection(robot_contacts)) >= 2
         )
+        if _restore_debug_enabled():
+            log.info(
+                "[debug][assisted_restore][touch_check] arm=%s prim=%s robot_contacts=%s two_fingers=%s",
+                arm,
+                ag_prim_path,
+                sorted(robot_contacts),
+                touching_at_least_two_fingers,
+            )
 
         # TODO: Better heuristic, hacky, we assume the parent object prim path is the prim_path minus the last "/" item
         ag_obj_prim_path = "/".join(ag_prim_path.split("/")[:-1])
@@ -1173,8 +1241,16 @@ class ManipulationRobot(BaseRobot):
         ag_obj = self.scene.object_registry("prim_path", ag_obj_prim_path)
 
         # Return None if object cannot be assisted grasped or not touching at least two fingers
-        if ag_obj is None or not touching_at_least_two_fingers:
+        allow_restore_relaxed = restore_fallback and self.grasping_mode == "assisted"
+        if ag_obj is None or (not touching_at_least_two_fingers and not allow_restore_relaxed):
             return None
+
+        if _restore_debug_enabled() and allow_restore_relaxed and not touching_at_least_two_fingers:
+            log.info(
+                "[debug][assisted_restore][fallback] arm=%s relaxed touch check for prim=%s",
+                arm,
+                ag_prim_path,
+            )
 
         # Get object and its contacted link
         return ag_obj, ag_obj.links[ag_obj_link_name]
@@ -1809,6 +1885,47 @@ class ManipulationRobot(BaseRobot):
         state["ag_obj_constraint_params"] = ag_params
         return state
 
+    def _serialized_ag_state_size(self, arm):
+        return 1 + 1 + 1 + 1 + len(self.gripper_control_idx[arm]) + 1 + 3
+
+    def _serialize_ag_state(self, arm, ag_params, dtype):
+        gripper_dim = len(self.gripper_control_idx[arm])
+        if len(ag_params) == 0:
+            return th.zeros(self._serialized_ag_state_size(arm), dtype=dtype)
+
+        obj = self.scene.object_registry("prim_path", ag_params["ag_obj_prim_path"])
+        obj_uuid = obj.uuid if obj is not None else get_uuid(ag_params["ag_obj_prim_path"], deterministic=True)
+        link_uuid = get_uuid(ag_params["ag_link_prim_path"], deterministic=True)
+        joint_type_code = 1.0 if ag_params["joint_type"] == "FixedJoint" else 2.0
+        gripper_pos = ag_params["gripper_pos"].to(dtype=dtype)
+        max_force = th.tensor([float(ag_params["max_force"])], dtype=dtype)
+        contact_pos = ag_params["contact_pos"].to(dtype=dtype)
+        return th.cat(
+            [
+                th.tensor([1.0, float(obj_uuid), float(link_uuid), joint_type_code], dtype=dtype),
+                gripper_pos,
+                max_force,
+                contact_pos,
+            ]
+        )
+
+    def _deserialize_ag_state(self, arm, state):
+        has_constraint = bool(round(float(state[0].item())))
+        if not has_constraint:
+            return {}
+
+        gripper_dim = len(self.gripper_control_idx[arm])
+        joint_type_code = int(round(float(state[3].item())))
+        joint_type = "FixedJoint" if joint_type_code == 1 else "SphericalJoint"
+        return {
+            "ag_obj_uuid": int(round(float(state[1].item()))),
+            "ag_link_uuid": int(round(float(state[2].item()))),
+            "joint_type": joint_type,
+            "gripper_pos": state[4 : 4 + gripper_dim].clone(),
+            "max_force": float(state[4 + gripper_dim].item()),
+            "contact_pos": state[5 + gripper_dim : 8 + gripper_dim].clone(),
+        }
+
     def _load_state(self, state):
         super()._load_state(state=state)
 
@@ -1847,8 +1964,24 @@ class ManipulationRobot(BaseRobot):
 
             # Establish new grasp if needed
             if has_loaded_constraint and (not has_current_constraint or should_release):
-                obj = self.scene.object_registry("prim_path", loaded_ag_constraint["ag_obj_prim_path"])
-                link = obj.links[loaded_ag_constraint["ag_link_prim_path"].split("/")[-1]]
+                obj = None
+                link = None
+                if "ag_obj_prim_path" in loaded_ag_constraint:
+                    obj = self.scene.object_registry("prim_path", loaded_ag_constraint["ag_obj_prim_path"])
+                    if obj is not None:
+                        link = obj.links.get(loaded_ag_constraint["ag_link_prim_path"].split("/")[-1], None)
+                elif "ag_obj_uuid" in loaded_ag_constraint:
+                    obj = self.scene.object_registry("uuid", int(loaded_ag_constraint["ag_obj_uuid"]))
+                    if obj is not None:
+                        target_link_uuid = int(loaded_ag_constraint["ag_link_uuid"])
+                        for candidate_link in obj.links.values():
+                            if get_uuid(candidate_link.prim_path, deterministic=True) == target_link_uuid:
+                                link = candidate_link
+                                break
+
+                if obj is None or link is None:
+                    log.warning("Failed to resolve assisted grasp object/link during load_state for arm=%s", arm)
+                    continue
                 contact_pos_global = loaded_ag_constraint["contact_pos"]
                 assert self.scene is not None, "Cannot set position and orientation relative to scene without a scene"
                 contact_pos_global, _ = self.scene.convert_scene_relative_pose_to_world(
@@ -1856,6 +1989,13 @@ class ManipulationRobot(BaseRobot):
                     th.tensor([0, 0, 0, 1], dtype=th.float32),
                 )
                 self._establish_grasp(arm=arm, ag_data=(obj, link), contact_pos=contact_pos_global)
+                if len(self._ag_obj_constraint_params[arm]) > 0:
+                    if "gripper_pos" in loaded_ag_constraint:
+                        self._ag_obj_constraint_params[arm]["gripper_pos"] = loaded_ag_constraint["gripper_pos"].clone()
+                    if "max_force" in loaded_ag_constraint:
+                        self._ag_obj_constraint_params[arm]["max_force"] = loaded_ag_constraint["max_force"]
+                    if "joint_type" in loaded_ag_constraint:
+                        self._ag_obj_constraint_params[arm]["joint_type"] = loaded_ag_constraint["joint_type"]
 
     def serialize(self, state):
         # Call super first
@@ -1864,9 +2004,13 @@ class ManipulationRobot(BaseRobot):
         # No additional serialization needed if we're using physical grasping
         if self.grasping_mode == "physical":
             return state_flat
-
-        # TODO AG
-        return state_flat
+        ag_params = state.get("ag_obj_constraint_params", {arm: {} for arm in self.arm_names})
+        ag_flat = [
+            th.tensor([m.SERIALIZED_AG_SENTINEL, m.SERIALIZED_AG_VERSION], dtype=state_flat.dtype),
+        ]
+        for arm in self.arm_names:
+            ag_flat.append(self._serialize_ag_state(arm=arm, ag_params=ag_params.get(arm, {}), dtype=state_flat.dtype))
+        return th.cat([state_flat, *ag_flat])
 
     def deserialize(self, state):
         # Call super first
@@ -1875,8 +2019,26 @@ class ManipulationRobot(BaseRobot):
         # No additional deserialization needed if we're using physical grasping
         if self.grasping_mode == "physical":
             return state_dict, idx
+        if idx + 1 >= len(state):
+            return state_dict, idx
+        if float(state[idx].item()) != m.SERIALIZED_AG_SENTINEL:
+            return state_dict, idx
+        version = float(state[idx + 1].item())
+        idx += 2
+        if version != m.SERIALIZED_AG_VERSION:
+            log.warning("Unknown serialized AG version=%s, skipping AG deserialize", version)
+            return state_dict, idx
 
-        # TODO AG
+        ag_params = {}
+        for arm in self.arm_names:
+            arm_state_size = self._serialized_ag_state_size(arm)
+            if idx + arm_state_size > len(state):
+                log.warning("Serialized AG state truncated for arm=%s", arm)
+                ag_params[arm] = {}
+                continue
+            ag_params[arm] = self._deserialize_ag_state(arm=arm, state=state[idx : idx + arm_state_size])
+            idx += arm_state_size
+        state_dict["ag_obj_constraint_params"] = ag_params
         return state_dict, idx
 
     @classproperty

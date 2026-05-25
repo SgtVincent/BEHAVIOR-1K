@@ -1,0 +1,39 @@
+# Subtask Evaluation Configuration for BEHAVIOR-1K
+# This config extends the base evaluation config with primitive-level evaluation support
+
+defaults:
+  - base_config.yaml
+
+# Subtask evaluation settings
+use_primitive_eval: true  # Enable primitive-level evaluation
+demo_data_path: ???  # Path to the demo data folder (required)
+rawdata_path: null  # Optional path to raw HDF5 data for accurate state restoration
+primitive_state_cache_dir: null  # Optional path to per-demo primitive state caches (defaults to <demo_data_path>/meta/primitive_states)
+num_demos: null  # Number of demos to evaluate (null = all available)
+reset_on_primitive_failure: true  # Reset to next primitive start if current fails
+restore_at_each_primitive_start: false  # If true, restore to each primitive start frame (debug / stricter subtask eval)
+primitive_timeout_multiplier: 2.0  # Timeout = demo_duration * multiplier
+
+# Primitive-level success criterion (task-agnostic default)
+#
+# Background:
+# - OmniGibson `terminated=True` means the FULL task is complete.
+# - For mid-trajectory primitives, we instead (optionally) treat a primitive as successful
+#   if the current low-dim robot state matches the demo's end-frame state for that primitive.
+primitive_success_use_state_match: true
+
+# Thresholds for the state-match criterion.
+primitive_success_base_pos_threshold: 0.15
+primitive_success_yaw_threshold: 0.35
+primitive_success_eef_pos_threshold: 0.12
+primitive_success_gripper_qpos_threshold: 0.03
+primitive_success_std_joint_qpos_rmse_threshold: 0.25
+primitive_success_joint_qpos_rmse_threshold: 0.25
+
+# (Optional) Primitive-eval debug guidance for hierarchical / VLM policies
+# - expected_skill: soft hint included in the VLM prompt
+expected_skill: null
+
+# Override default settings for subtask eval
+eval_on_train_instances: true  # Use training instances to match demo data
+write_video: true

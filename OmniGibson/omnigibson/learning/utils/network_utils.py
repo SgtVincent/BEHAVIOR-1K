@@ -5,6 +5,7 @@ Adapted from https://github.com/Physical-Intelligence/openpi
 import asyncio
 import functools
 import http
+import json
 import logging
 import msgpack
 import numpy as np
@@ -38,6 +39,10 @@ class WebsocketClientPolicy:
         port: Optional[int] = None,
         api_key: Optional[str] = None,
         allow_reconnect: bool = False,
+        expected_task_name: Optional[str] = None,
+        expected_task_prompt_sha256: Optional[str] = None,
+        expected_server_run_id: Optional[str] = None,
+        expected_server_token: Optional[str] = None,
     ) -> None:
         self._uri = f"wss://{host}" if int(port) == 443 else f"ws://{host}"
         if port is not None:
@@ -46,9 +51,34 @@ class WebsocketClientPolicy:
         self._api_key = api_key
         self._ws, self._server_metadata = None, None
         self._allow_reconnect = allow_reconnect
+        self._last_generated_subtask = None
+        self._last_server_fresh_action = False
+        self._last_prompt_debug = None
+        self._cached_action_queue = []
+        self._cached_actions_remaining = 0
+        self._expected_server_identity = {
+            "task_name": expected_task_name,
+            "task_prompt_sha256": expected_task_prompt_sha256,
+            "server_run_id": expected_server_run_id,
+            "server_token": expected_server_token,
+        }
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
+
+    def _validate_server_identity(self, metadata: Dict, *, source: str) -> None:
+        mismatches = []
+        for key, expected in self._expected_server_identity.items():
+            if expected is None:
+                continue
+            actual = metadata.get(key)
+            if actual != expected:
+                mismatches.append(f"{key}: expected={expected!r}, actual={actual!r}")
+        if mismatches:
+            raise RuntimeError(
+                f"Connected to unexpected policy server via {source}. "
+                + "; ".join(mismatches)
+            )
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         # TODO [Wensi]: use URL parser instead of this
@@ -63,10 +93,24 @@ class WebsocketClientPolicy:
         # First, wait for the health check to pass
         while True:
             try:
-                response = requests.get(health_url, timeout=2)
+                # Important: do NOT honor HTTP proxy env vars for localhost health checks.
+                # Some cluster environments set proxies globally, which breaks local requests
+                # and causes an infinite wait here.
+                response = requests.get(
+                    health_url,
+                    timeout=2,
+                    proxies={"http": None, "https": None},
+                )
                 if response.ok:
+                    if any(value is not None for value in self._expected_server_identity.values()):
+                        try:
+                            self._validate_server_identity(response.json(), source=f"healthz:{health_url}")
+                        except ValueError:
+                            raise RuntimeError(f"Health check response from {health_url} is not valid JSON")
                     logger.info("Health check passed, attempting websocket connection...")
                     break
+            except RuntimeError:
+                raise
             except Exception:
                 pass
             logger.info(f"Health check failed, waiting for server at {health_url}...")
@@ -81,10 +125,12 @@ class WebsocketClientPolicy:
                     compression=None,
                     max_size=None,
                     additional_headers=headers,
+                    proxy=None,
                     ping_interval=60,
                     ping_timeout=300,
                 )
                 metadata = unpackb(conn.recv())
+                self._validate_server_identity(metadata, source=f"websocket:{self._uri}")
                 logger.info("Connected to server!")
                 return conn, metadata
             except (ConnectionRefusedError, websockets.exceptions.InvalidMessage, EOFError) as e:
@@ -95,11 +141,18 @@ class WebsocketClientPolicy:
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
+        t0 = time.perf_counter()
         data = self._packer.pack(obs)
+        pack_s = time.perf_counter() - t0
         while True:
             try:
+                t1 = time.perf_counter()
                 self._ws.send(data)
+                send_s = time.perf_counter() - t1
+
+                t2 = time.perf_counter()
                 response = self._ws.recv()
+                recv_s = time.perf_counter() - t2
                 break
             except websockets.exceptions.ConnectionClosedError:
                 if self._allow_reconnect:
@@ -110,17 +163,58 @@ class WebsocketClientPolicy:
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
+        t3 = time.perf_counter()
         action_dict = unpackb(response)
+        unpack_s = time.perf_counter() - t3
         try:
             action_np = deepcopy(action_dict["action"])
         except KeyError:
             # We try getting action one more time before raising error
             logger.warning("No action received from server, retrying one more time...")
+            t1 = time.perf_counter()
             self._ws.send(data)
+            send_s = time.perf_counter() - t1
+
+            t2 = time.perf_counter()
             response = self._ws.recv()
+            recv_s = time.perf_counter() - t2
+
+            t3 = time.perf_counter()
             action_dict = unpackb(response)
+            unpack_s = time.perf_counter() - t3
             action_np = deepcopy(action_dict["action"])
+
+        self._last_client_timing = {
+            "pack_ms": pack_s * 1000,
+            "send_ms": send_s * 1000,
+            "recv_ms": recv_s * 1000,
+            "unpack_ms": unpack_s * 1000,
+            "rtt_ms": (pack_s + send_s + recv_s + unpack_s) * 1000,
+        }
+        self._last_server_timing = deepcopy(action_dict.get("server_timing", {}))
+        self._last_server_fresh_action = bool(action_dict.get("fresh_action_plan", False))
+        if "generated_subtask" in action_dict and action_dict["generated_subtask"] is not None:
+            self._last_generated_subtask = action_dict["generated_subtask"]
+        self._last_prompt_debug = deepcopy(action_dict.get("prompt_debug"))
+        if self._last_server_fresh_action and action_dict.get("action_chunk") is not None:
+            action_chunk = np.asarray(deepcopy(action_dict["action_chunk"]), dtype=np.float32)
+            if action_chunk.ndim == 2 and len(action_chunk) > 1:
+                self._cached_action_queue = [th.from_numpy(action_chunk[i : i + 1]).to(th.float32) for i in range(1, len(action_chunk))]
+            else:
+                self._cached_action_queue = []
+        self._cached_actions_remaining = len(self._cached_action_queue)
         action = th.from_numpy(action_np).to(th.float32)
+        return action
+
+    @property
+    def cached_actions_remaining(self) -> int:
+        return len(self._cached_action_queue)
+
+    def pop_cached_action(self) -> th.Tensor:
+        if not self._cached_action_queue:
+            raise RuntimeError("No cached action available")
+        action = self._cached_action_queue.pop(0)
+        self._cached_actions_remaining = len(self._cached_action_queue)
         return action
 
     def reset(self) -> None:
@@ -129,6 +223,8 @@ class WebsocketClientPolicy:
 
         data = self._packer.pack({"reset": True})
         self._ws.send(data)
+        self._cached_action_queue = []
+        self._cached_actions_remaining = 0
 
 
 class WebsocketPolicyServer:
@@ -149,6 +245,18 @@ class WebsocketPolicyServer:
         self._port = port
         self._metadata = metadata or {}
 
+    def _health_payload(self) -> dict:
+        return {"ok": True, **self._metadata}
+
+    def _process_request(self, connection, request) -> Optional[Any]:
+        if hasattr(request, "path") and request.path == "/healthz":
+            body = json.dumps(self._health_payload(), sort_keys=True).encode("utf-8") + b"\n"
+            headers = {"Content-Type": "application/json"}
+            if hasattr(connection, "respond"):
+                return connection.respond(http.HTTPStatus.OK, body.decode("utf-8"))
+            return http.HTTPStatus.OK, headers, body
+        return None
+
     def serve_forever(self) -> None:
         asyncio.run(self.run())
 
@@ -160,13 +268,27 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
-            process_request=_health_check,
+            process_request=self._process_request,
         ) as server:
             await server.serve_forever()
 
     async def _handler(self, websocket):
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = Packer()
+
+        # IMPORTANT:
+        # Many policies maintain rollout state (e.g., action queues / step counters).
+        # If multiple evaluators share a single websocket server, policy state must be
+        # isolated per connection, otherwise resets and rollout state will collide.
+        policy = self._policy
+        if hasattr(self._policy, "spawn_session"):
+            try:
+                policy = self._policy.spawn_session()
+            except Exception:
+                logger.warning(
+                    "Policy exposes spawn_session() but session creation failed; falling back to shared policy. "
+                    "This may break multi-client evaluation.\n" + traceback.format_exc()
+                )
 
         await websocket.send(packer.pack(self._metadata))
 
@@ -176,18 +298,29 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 result = unpackb(await websocket.recv(), strict_map_key=False)
                 if "reset" in result:
-                    self._policy.reset()
+                    policy.reset()
                     continue
 
                 obs = deepcopy(result)
 
                 infer_time = time.monotonic()
-                action = self._policy.act(obs)
+                action = policy.act(obs)
                 infer_time = time.monotonic() - infer_time
 
                 action = {
                     "action": action.cpu().numpy(),
                 }
+                generated_subtask = getattr(policy, "last_generated_subtask", None)
+                if generated_subtask is not None:
+                    action["generated_subtask"] = generated_subtask
+                prompt_debug = getattr(policy, "last_prompt_debug", None)
+                if prompt_debug is not None:
+                    action["prompt_debug"] = deepcopy(prompt_debug)
+                action["fresh_action_plan"] = bool(getattr(policy, "last_policy_inferred", False))
+                action_chunk = getattr(policy, "last_action_chunk", None)
+                if action_chunk is not None:
+                    action["action_chunk"] = deepcopy(action_chunk)
+                action["cached_actions_remaining"] = int(getattr(policy, "cached_actions_remaining", 0))
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }
@@ -215,19 +348,6 @@ class WebsocketPolicyServer:
                     # Fallback for older websockets versions
                     await websocket.close(code=1011, reason="Internal server error")
                 raise
-
-
-def _health_check(connection, request) -> Optional[Any]:
-    if hasattr(request, "path") and request.path == "/healthz":
-        if hasattr(connection, "respond"):
-            return connection.respond(http.HTTPStatus.OK, "OK\n")
-        else:
-            # For older websockets versions, return a simple response
-            return http.HTTPStatus.OK, {"Content-Type": "text/plain"}, b"OK\n"
-    # Continue with the normal request handling.
-    return None
-
-
 """
 Adds NumPy array support to msgpack.
 

@@ -106,6 +106,8 @@ class BehaviorIterableDataset(IterableDataset):
             seed (int): Random seed.
             shuffle (bool): Whether to shuffle the dataset.
         """
+        # `torch.utils.data.IterableDataset` does not accept extra args/kwargs.
+        # Keep them in the signature for backward compatibility with Hydra configs.
         super().__init__()
         self._data_path = data_path
         self._demo_keys = demo_keys

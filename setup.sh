@@ -235,7 +235,7 @@ fi
 if [ "$BDDL" = true ]; then
     echo "Installing BDDL..."
     [ ! -d "bddl3" ] && { echo "ERROR: bddl directory not found"; exit 1; }
-    pip install -e "$WORKDIR/bddl3"
+    pip install "$WORKDIR/bddl3"
 fi
 
 # Install OmniGibson with Isaac Sim

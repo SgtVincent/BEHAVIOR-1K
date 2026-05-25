@@ -254,6 +254,9 @@ SUPPORTED_PREDICATES = {
     "folded": get_unary_predicate_for_state(object_states.Folded, "folded"),
     "unfolded": get_unary_predicate_for_state(object_states.Unfolded, "unfolded"),
     "draped": get_binary_predicate_for_state(object_states.Draped, "draped"),
+    # domain_omnigibson.bddl includes (grasped ?obj1 ?obj2). In OmniGibson this is represented by the robot-related
+    # state IsGrasping, which currently tracks assisted grasp constraints (see robot_related_states.py).
+    "grasped": get_binary_predicate_for_state(object_states.IsGrasping, "grasped"),
     "future": ObjectStateFuturePredicate,
     "real": ObjectStateRealPredicate,
     "insource": ObjectStateInsourcePredicate,

@@ -1,8 +1,20 @@
+**/build/
+**/__pycache__/
+**/*.pyc
+**/*.egg
+**/*.egg-info/
+.github/
 gha-creds-*.json
 /site
 .vscode
+.trae/tmp/
+.trae/documents/tmp/
+trae/documents/tmp/
 .DS_Store
 
 # training
 outputs/
 /*.ipynb
+eval_logs/**
+*_logs*/
+*_reports*/
