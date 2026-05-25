@@ -12,6 +12,24 @@ BEHAVIOR-1K provides an installation script that handles all dependencies and co
 
 Please check out [Installation Guide](https://behavior.stanford.edu/getting_started/installation.html) for more details!
 
+# 📚 Repo-local Guides
+
+除了公开网站文档外，仓库内还维护了一组便于直接跟代码对照的说明文档，放在 [`BEHAVIOR-1K/.trae/documents/`](.trae/documents/)：
+
+| 你要做什么 | 直接看这里 |
+| --- | --- |
+| 先了解仓库模块与主要入口 | [`project_overview.md`](.trae/documents/project_overview.md) |
+| 跑 behavior / simulator 侧 eval、查 runtime flags | [`behavior_eval_runtime_guide.md`](.trae/documents/behavior_eval_runtime_guide.md) |
+| 看 skill / segment eval 的使用方式 | [`skill_eval_user_guide.md`](.trae/documents/skill_eval_user_guide.md) |
+| 看 RLinf-style 吞吐优化与默认推荐组合 | [`rlinf-style-eval-optimization.md`](.trae/documents/rlinf-style-eval-optimization.md) |
+
+如果你只想先用起来，建议按这个顺序：
+
+1. 先按本 README 和官方 Installation Guide 完成安装；
+2. 跑仿真 / eval 时先看 [`behavior_eval_runtime_guide.md`](.trae/documents/behavior_eval_runtime_guide.md)；
+3. 做 skill / segment eval 时再看 [`skill_eval_user_guide.md`](.trae/documents/skill_eval_user_guide.md)；
+4. 要优化吞吐、调 `partial_scene_load` / `skip_intermediate_obs_in_chunk` 时，再看 [`rlinf-style-eval-optimization.md`](.trae/documents/rlinf-style-eval-optimization.md)。
+
 ## 📄 Citation
 
 ```bibtex
