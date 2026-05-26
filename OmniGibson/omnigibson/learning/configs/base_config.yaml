@@ -4,21 +4,21 @@ defaults:
   - task: behavior
   - policy: ???
 
-# env_wrapper: 
-#   _target_: omnigibson.learning.wrappers.RGBLowResWrapper
+env_wrapper: 
+  _target_: omnigibson.learning.wrappers.RGBLowResWrapper
 policy_name: ???  # filled by policy
 headless: true  # whether to run in headless mode (no GUI)
+render_viewer_camera: false  # disable extra viewer camera for rollout throughput
+gui_viewport_only: false  # keep full UI disabled in headless mode
 eval_on_train_instances: false  # whether to eval on training instances
 eval_instance_ids: null  # specific list of instance ids to eval on, if null test on all instances
 write_video: true # whether we record videos during rollout
 partial_scene_load: false  # whether to only load task-relevant rooms for a specific task
+renderer_texturestreaming_memory_budget: 0.1  # RLinf-style RTX texture streaming budget override
 max_steps: null  # max steps per rollout episode, setting to null will use the default value (2 x average human demo completion steps)
+skip_intermediate_obs_in_chunk: false  # skip observation collection on interior cached-action steps only
 log_path: ???
 test_hidden: false  # [Internal use only] whether to eval on hidden test instances
-
-# + additional config
-env_wrapper: 
-  _target_: behavior.learning.wrappers.RGBWrapper
 
 save_rollout: false
 perturb_pose: false

@@ -22,8 +22,8 @@ class RGBLowResWrapper(EnvironmentWrapper):
             sensor_name = camera_name.split("::")[1]
             if camera_id == "head":
                 robot.sensors[sensor_name].horizontal_aperture = 40.0  # this is what we used in data collection
-            robot.sensors[sensor_name].image_height = 224
-            robot.sensors[sensor_name].image_width = 224
+            # Update resolution atomically so VisionSensor only rebuilds the render product once per sensor.
+            robot.sensors[sensor_name].set_image_resolution(width=224, height=224)
         # reload observation space
         env.load_observation_space()
         logger.info("Reloaded observation space!")

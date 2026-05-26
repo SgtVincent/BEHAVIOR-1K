@@ -60,7 +60,8 @@ python OmniGibson/omnigibson/learning/eval_segment.py \
   write_video=true \
   segment_predicate_dump_trace=true \
   env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper \
-  partial_scene_load=true
+  partial_scene_load=false \
+  skip_intermediate_obs_in_chunk=true
 ```
 
 常用参数：

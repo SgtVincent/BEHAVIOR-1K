@@ -52,8 +52,7 @@ import omnigibson.utils.transform_utils as T
 from PIL import Image
 import torch as th
 
-from omnigibson.learning.eval import _has_full_state_restore_source
-from omnigibson.learning.eval import _resolve_rawdata_scene_file
+from omnigibson.learning.eval import _apply_runtime_renderer_settings
 
 m = create_module_macros(module_path=__file__)
 m.NUM_EVAL_EPISODES = 1
@@ -127,10 +126,10 @@ class Evaluator:
 
         self.current_episode: int | None = None
         self.current_instance_id: int | None = None
-        self._last_step_timing: dict[str, Any] = {}
         self._last_generated_subtask: str | None = None
         self._last_prompt_debug: dict[str, Any] | None = None
         self._last_server_fresh_action = False
+        self._last_obs_refreshed = True
         self._stuck_motion_window = max(int(getattr(self.cfg, "stuck_motion_window", 0) or 0), 0)
         self._stuck_min_steps = max(int(getattr(self.cfg, "stuck_min_steps", 0) or 0), 0)
         self._stuck_motion_threshold = float(getattr(self.cfg, "stuck_motion_threshold", 0.0) or 0.0)
@@ -184,30 +183,13 @@ class Evaluator:
         robot_type = self.cfg.robot.type
         assert robot_type == "R1Pro", f"Got invalid robot type: {robot_type}, only R1Pro is supported."
         cfg = generate_basic_environment_config(task_name=task_name, task_cfg=task_cfg)
-        full_state_restore_expected = _has_full_state_restore_source(self.cfg)
-        if self.cfg.partial_scene_load and full_state_restore_expected:
-            logger.warning(
-                "partial_scene_load requested for task=%s, but full-state restore source is configured; "
-                "skipping room filtering to keep serialized restore compatible.",
-                task_name,
-            )
-        elif self.cfg.partial_scene_load:
+        # Keep the canonical task scene at env bootstrap time. Raw / merged scene snapshots can omit
+        # pedestrians and presampled robot pose metadata, which leaves the viewer showing an empty scene
+        # with the robot spawned at the origin before task-instance reset has a chance to run.
+        if self.cfg.partial_scene_load:
             relevant_rooms = get_task_relevant_room_types(activity_name=task_name)
             relevant_rooms = augment_rooms(relevant_rooms, task_cfg["scene_model"], task_name)
             cfg["scene"]["load_room_types"] = relevant_rooms
-
-        if full_state_restore_expected:
-            merged_scene_file = _resolve_rawdata_scene_file(self.cfg, task_name=task_name, task_cfg=task_cfg)
-            if merged_scene_file is not None:
-                cfg["scene"]["scene_file"] = merged_scene_file
-                cfg["scene"]["scene_instance"] = None
-                cfg["scene"]["load_room_types"] = None
-                cfg["scene"]["load_room_instances"] = None
-                # Raw / merged scene snapshots do not carry cached task metadata such as
-                # robot_poses, so BehaviorTask.reset() cannot rely on presampled poses at
-                # initial env construction time. Later task loading still restores the robot
-                # pose explicitly from tro_state.
-                cfg["task"]["use_presampled_robot_pose"] = False
 
         cfg["robots"] = [
             generate_robot_config(
@@ -236,6 +218,7 @@ class Evaluator:
             cfg["task"]["termination_config"]["max_steps"] = self.cfg.max_steps
         cfg["task"]["include_obs"] = False
         env = og.Environment(configs=cfg)
+        _apply_runtime_renderer_settings(self.cfg)
         # Instantiate env wrapper when configured. Persistent eval may set
         # env_wrapper=None to avoid Isaac Replicator render-product
         # reconfiguration across soft restarts; in that mode, use the raw
@@ -272,65 +255,54 @@ class Evaluator:
         """
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
-    def step(self) -> tuple[bool, bool, dict]:
-        """
-        Performs a single step of the task by executing the policy, interacting with the environment,
-        processing observations, updating metrics, and tracking trial success.
+    def _policy_client(self) -> Any:
+        return getattr(self.policy, "policy", None)
 
-        Returns:
-            Tuple[bool, bool]:
-                - terminated (bool): Whether the episode has terminated (i.e., reached a terminal state).
-                - truncated (bool): Whether the episode was truncated (i.e., stopped due to a time limit or other constraint).
+    def _should_request_new_action(self) -> bool:
+        if not getattr(self.cfg, "skip_intermediate_obs_in_chunk", False):
+            return True
+        client = self._policy_client()
+        if client is None or not hasattr(client, "cached_actions_remaining"):
+            return True
+        return int(getattr(client, "cached_actions_remaining", 0)) <= 0
 
-        Workflow:
-            1. Computes the next action using the policy based on the current observation.
-            2. Steps the environment with the computed action and retrieves the next observation,
-               termination and truncation flags, and additional info.
-            3. If the episode has ended (terminated or truncated), increments the trial counter and
-               updates the count of successful trials if the task was completed successfully.
-            4. Preprocesses the new observation.
-            5. Invokes step callbacks for all registered metrics to update their state.
-            6. Returns the termination and truncation status.
-        """
-        t0 = time.perf_counter()
-        self.robot_action = self.policy.forward(obs=self.obs)
-        policy_s = time.perf_counter() - t0
-
-        t1 = time.perf_counter()
-        obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
-        env_step_s = time.perf_counter() - t1
-
-        t2 = time.perf_counter()
-        self.obs = self._preprocess_obs(obs)
-        preprocess_s = time.perf_counter() - t2
-
-        client_timing = {}
-        server_timing = {}
-        client = getattr(self.policy, "policy", None)
+    def _update_policy_debug_state(self, *, requested_new_action: bool) -> None:
+        client = self._policy_client()
         if client is not None:
-            client_timing = getattr(client, "_last_client_timing", {}) or {}
-            server_timing = getattr(client, "_last_server_timing", {}) or {}
             self._last_generated_subtask = getattr(client, "_last_generated_subtask", None)
             self._last_prompt_debug = getattr(client, "_last_prompt_debug", None)
-            self._last_server_fresh_action = bool(getattr(client, "_last_server_fresh_action", False))
+            self._last_server_fresh_action = (
+                bool(getattr(client, "_last_server_fresh_action", False)) if requested_new_action else False
+            )
         else:
             self._last_generated_subtask = None
             self._last_prompt_debug = None
-            self._last_server_fresh_action = False
+            self._last_server_fresh_action = bool(requested_new_action)
 
-        self._last_step_timing = {
-            "policy_ms": policy_s * 1000,
-            "env_step_ms": env_step_s * 1000,
-            "preprocess_ms": preprocess_s * 1000,
-            "pack_ms": client_timing.get("pack_ms"),
-            "send_ms": client_timing.get("send_ms"),
-            "recv_ms": client_timing.get("recv_ms"),
-            "unpack_ms": client_timing.get("unpack_ms"),
-            "rtt_ms": client_timing.get("rtt_ms"),
-            "server_infer_ms": server_timing.get("infer_ms"),
-            "server_prev_total_ms": server_timing.get("prev_total_ms"),
-            "fresh_action_plan": self._last_server_fresh_action,
-        }
+    def step(self) -> tuple[bool, bool, dict]:
+        need_new_action = self._should_request_new_action()
+        policy_obs = self.obs if need_new_action else {"need_new_action": False}
+        self.robot_action = self.policy.forward(obs=policy_obs)
+        self._update_policy_debug_state(requested_new_action=need_new_action)
+
+        client = self._policy_client()
+        cached_actions_remaining = int(getattr(client, "cached_actions_remaining", 0)) if client is not None else 0
+        skip_obs = bool(
+            getattr(self.cfg, "skip_intermediate_obs_in_chunk", False)
+            and not need_new_action
+            and cached_actions_remaining > 0
+        )
+
+        obs, _, terminated, truncated, info = self.env.step(
+            self.robot_action,
+            n_render_iterations=1,
+            skip_obs=skip_obs,
+            render=not skip_obs,
+        )
+        self._last_obs_refreshed = not skip_obs
+
+        if not skip_obs:
+            self.obs = self._preprocess_obs(obs)
 
         for metric in self.metrics:
             metric.step_callback(self.env)
@@ -521,14 +493,6 @@ class Evaluator:
             return True
         return False
 
-    def should_write_video_frame(self) -> bool:
-        if not getattr(self.cfg, "video_on_replan_only", False):
-            return self.env._current_step % 20 == 0
-        client = getattr(self.policy, "policy", None)
-        if client is None:
-            return self.env._current_step % 20 == 0
-        return self._last_server_fresh_action
-
     def _write_video(self) -> None:
         """Write the current robot observations to video."""
         # Export the same per-camera spatial view the model actually consumes:
@@ -620,7 +584,10 @@ class Evaluator:
             metric.start_callback(self.env)
         self.policy.reset()
         self.n_success_trials, self.n_trials = 0, 0
+        self._last_generated_subtask = None
+        self._last_prompt_debug = None
         self._last_server_fresh_action = False
+        self._last_obs_refreshed = True
         self._reset_stuck_monitor()
 
     def __enter__(self):
@@ -664,30 +631,6 @@ if __name__ == "__main__":
         gm.DEFAULT_VIEWER_WIDTH = int(getattr(config, "viewer_width", gm.DEFAULT_VIEWER_WIDTH))
         gm.DEFAULT_VIEWER_HEIGHT = int(getattr(config, "viewer_height", gm.DEFAULT_VIEWER_HEIGHT))
 
-    timing_path = Path(config.log_path).expanduser() / "timing.csv"
-    timing_path.parent.mkdir(parents=True, exist_ok=True)
-    timing_f = open(timing_path, "w", newline="")
-    timing_fields = [
-        "timestamp_s",
-        "task_name",
-        "episode",
-        "instance_id",
-        "step_idx",
-        "env_current_step",
-        "policy_ms",
-        "env_step_ms",
-        "preprocess_ms",
-        "pack_ms",
-        "send_ms",
-        "recv_ms",
-        "unpack_ms",
-        "rtt_ms",
-        "server_infer_ms",
-        "server_prev_total_ms",
-        "fresh_action_plan",
-    ]
-    timing_writer = csv.DictWriter(timing_f, fieldnames=timing_fields)
-    timing_writer.writeheader()
     subtask_predictions_f = None
     if config.save_subtask_predictions:
         subtask_predictions_path = Path(config.log_path).expanduser() / "subtask_predictions.jsonl"
@@ -806,7 +749,6 @@ if __name__ == "__main__":
                     metric.start_callback(evaluator.env)
 
                 step_idx = 0
-                rolling = []
                 while not done:
                     time_start = time.time()
                     terminated, truncated, info = evaluator.step()
@@ -818,23 +760,13 @@ if __name__ == "__main__":
 
                     if terminated or truncated:
                         done = True
-                    if config.save_rollout:
+                    if config.save_rollout and evaluator._last_obs_refreshed:
                         evaluator._write_rollout()
-                    if config.write_video and evaluator.should_write_video_frame():
+                    if config.write_video and evaluator._last_obs_refreshed and evaluator.env._current_step % 20 == 0:
                         evaluator._write_video()
                     if evaluator.env._current_step % 1000 == 0:
                         logger.info(f"Current step: {evaluator.env._current_step}")
 
-                    row = {
-                        "timestamp_s": time.time(),
-                        "task_name": config.task.name,
-                        "episode": evaluator.current_episode,
-                        "instance_id": evaluator.current_instance_id,
-                        "step_idx": step_idx,
-                        "env_current_step": evaluator.env._current_step,
-                    }
-                    row.update(evaluator._last_step_timing)
-                    timing_writer.writerow(row)
                     if subtask_predictions_f is not None:
                         termination_summary = build_termination_summary(
                             terminated=terminated,
@@ -847,12 +779,12 @@ if __name__ == "__main__":
                         subtask_predictions_f.write(
                             json.dumps(
                                 {
-                                    "timestamp_s": row["timestamp_s"],
-                                    "task_name": row["task_name"],
-                                    "episode": row["episode"],
-                                    "instance_id": row["instance_id"],
-                                    "step_idx": row["step_idx"],
-                                    "env_current_step": row["env_current_step"],
+                                    "timestamp_s": time.time(),
+                                    "task_name": config.task.name,
+                                    "episode": evaluator.current_episode,
+                                    "instance_id": evaluator.current_instance_id,
+                                    "step_idx": step_idx,
+                                    "env_current_step": evaluator.env._current_step,
                                     "generated_subtask": evaluator._last_generated_subtask,
                                     "prompt_debug": evaluator._last_prompt_debug,
                                     "termination_summary": termination_summary,
@@ -861,30 +793,8 @@ if __name__ == "__main__":
                             + "\n"
                         )
                     step_idx += 1
-
-                    rolling.append(evaluator._last_step_timing)
-                    if len(rolling) > 20:
-                        rolling.pop(0)
-                    if step_idx % 20 == 0 and len(rolling) > 0:
-                        def _mean(key: str) -> float:
-                            vals = [r.get(key) for r in rolling if r.get(key) is not None]
-                            return float(sum(vals) / max(1, len(vals)))
-
-                        logger.info(
-                            "timing[20]: "
-                            + ", ".join(
-                                [
-                                    f"policy_ms={_mean('policy_ms'):.1f}",
-                                    f"env_step_ms={_mean('env_step_ms'):.1f}",
-                                    f"preprocess_ms={_mean('preprocess_ms'):.1f}",
-                                    f"rtt_ms={_mean('rtt_ms'):.1f}",
-                                    f"infer_ms={_mean('server_infer_ms'):.1f}",
-                                ]
-                            )
-                        )
-                        timing_f.flush()
-                        if subtask_predictions_f is not None:
-                            subtask_predictions_f.flush()
+                    if step_idx % 20 == 0 and subtask_predictions_f is not None:
+                        subtask_predictions_f.flush()
 
                     if terminated or truncated:
                         evaluator.success_callback(info["done"]["success"])
@@ -921,4 +831,5 @@ if __name__ == "__main__":
                     logger.info(f"Saved rollout video to {evaluator.rollout_paths}")
                 else:
                     logger.warning("No observations were recorded.")
-    timing_f.close()
+    if subtask_predictions_f is not None:
+        subtask_predictions_f.close()

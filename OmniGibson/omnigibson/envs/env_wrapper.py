@@ -46,13 +46,15 @@ class EnvironmentWrapper(Wrapper, Registerable):
         # Run super
         super().__init__(obj=env)
 
-    def step(self, action, n_render_iterations=1):
+    def step(self, action, n_render_iterations=1, skip_obs=False, render=True):
         """
         By default, run the normal environment step() function
 
         Args:
             action (th.tensor): action to take in environment
             n_render_iterations (int): Number of rendering iterations to use before returning observations
+            skip_obs (bool): Whether to skip observation collection on this step
+            render (bool): Whether to render during the simulator step
 
         Returns:
             4-tuple:
@@ -62,7 +64,7 @@ class EnvironmentWrapper(Wrapper, Registerable):
                 - (bool) whether the current episode is truncated
                 - (dict) misc information
         """
-        return self.env.step(action, n_render_iterations=n_render_iterations)
+        return self.env.step(action, n_render_iterations=n_render_iterations, skip_obs=skip_obs, render=render)
 
     def reset(self):
         """

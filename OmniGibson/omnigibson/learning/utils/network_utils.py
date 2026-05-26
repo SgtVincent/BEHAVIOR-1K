@@ -54,6 +54,8 @@ class WebsocketClientPolicy:
         self._last_generated_subtask = None
         self._last_server_fresh_action = False
         self._last_prompt_debug = None
+        self._cached_action_queue = []
+        self._cached_actions_remaining = 0
         self._expected_server_identity = {
             "task_name": expected_task_name,
             "task_prompt_sha256": expected_task_prompt_sha256,
@@ -194,7 +196,25 @@ class WebsocketClientPolicy:
         if "generated_subtask" in action_dict and action_dict["generated_subtask"] is not None:
             self._last_generated_subtask = action_dict["generated_subtask"]
         self._last_prompt_debug = deepcopy(action_dict.get("prompt_debug"))
+        if self._last_server_fresh_action and action_dict.get("action_chunk") is not None:
+            action_chunk = np.asarray(deepcopy(action_dict["action_chunk"]), dtype=np.float32)
+            if action_chunk.ndim == 2 and len(action_chunk) > 1:
+                self._cached_action_queue = [th.from_numpy(action_chunk[i : i + 1]).to(th.float32) for i in range(1, len(action_chunk))]
+            else:
+                self._cached_action_queue = []
+        self._cached_actions_remaining = len(self._cached_action_queue)
         action = th.from_numpy(action_np).to(th.float32)
+        return action
+
+    @property
+    def cached_actions_remaining(self) -> int:
+        return len(self._cached_action_queue)
+
+    def pop_cached_action(self) -> th.Tensor:
+        if not self._cached_action_queue:
+            raise RuntimeError("No cached action available")
+        action = self._cached_action_queue.pop(0)
+        self._cached_actions_remaining = len(self._cached_action_queue)
         return action
 
     def reset(self) -> None:
@@ -203,6 +223,8 @@ class WebsocketClientPolicy:
 
         data = self._packer.pack({"reset": True})
         self._ws.send(data)
+        self._cached_action_queue = []
+        self._cached_actions_remaining = 0
 
 
 class WebsocketPolicyServer:
@@ -295,6 +317,10 @@ class WebsocketPolicyServer:
                 if prompt_debug is not None:
                     action["prompt_debug"] = deepcopy(prompt_debug)
                 action["fresh_action_plan"] = bool(getattr(policy, "last_policy_inferred", False))
+                action_chunk = getattr(policy, "last_action_chunk", None)
+                if action_chunk is not None:
+                    action["action_chunk"] = deepcopy(action_chunk)
+                action["cached_actions_remaining"] = int(getattr(policy, "cached_actions_remaining", 0))
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }

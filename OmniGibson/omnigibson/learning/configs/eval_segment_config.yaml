@@ -47,6 +47,7 @@ expected_skill: null
 # Override default settings
 eval_on_train_instances: true
 write_video: true
+skip_intermediate_obs_in_chunk: true
 
 # Primitive-level state-match thresholds (used when success_mode=state_match)
 primitive_success_use_state_match: true

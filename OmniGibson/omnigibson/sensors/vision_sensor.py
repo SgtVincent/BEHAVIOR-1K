@@ -1,3 +1,5 @@
+import os
+
 import gymnasium as gym
 import numpy as np
 import torch as th
@@ -31,6 +33,27 @@ def render():
     set_carb_setting(og.app._carb_settings, "/app/player/playSimulations", False)
     og.app.update()
     set_carb_setting(og.app._carb_settings, "/app/player/playSimulations", True)
+
+
+def _skip_persistent_load_warmup_renders():
+    """Skip load-time sensor warmup renders in persistent headless eval if requested.
+
+    In long-lived persistent workers we have observed Isaac Sim hang inside
+    ``SimulationApp.update()`` during ``VisionSensor._post_load()`` warmup renders
+    while loading some tasks (notably ``sorting_household_items``). The actual
+    rollout can still render later during normal simulator stepping, so gate these
+    eager warmup renders behind an opt-in env var instead of forcing them during
+    environment construction.
+    """
+
+    return os.environ.get("PERSISTENT_EVAL_SKIP_VISION_SENSOR_WARMUP", "0").lower() in {"1", "true", "yes"}
+
+
+def _maybe_warmup_render(steps=1):
+    if _skip_persistent_load_warmup_renders():
+        return
+    for _ in range(steps):
+        render()
 
 
 class VisionSensor(BaseSensor):
@@ -220,31 +243,32 @@ class VisionSensor(BaseSensor):
         else:
             viewport = lazy.omni.kit.viewport.utility.create_viewport_window()
             # Take a render step to make sure the viewport is generated before docking it
-            render()
-            # Grab the newly created viewport and dock it to the GUI
-            # The first viewport is always the "main" global camera, and any additional cameras are auxiliary views
-            # These auxiliary views will be stacked in a single column
-            # Thus, the first auxiliary viewport should be generated to the left of the main dockspace, and any
-            # subsequent viewports should be equally spaced according to the number of pre-existing auxiliary views
-            n_auxiliary_sensors = len(self.SENSORS) - 1
-            if n_auxiliary_sensors == 1:
-                # This is the first auxiliary viewport, dock to the left of the main dockspace
-                dock_window(
-                    space=lazy.omni.ui.Workspace.get_window("DockSpace"),
-                    name=viewport.name,
-                    location=lazy.omni.ui.DockPosition.LEFT,
-                    ratio=0.25,
-                )
-            elif n_auxiliary_sensors > 1:
-                # This is any additional auxiliary viewports, dock equally-spaced in the auxiliary column
-                # We also need to re-dock any prior viewports!
-                for i in range(2, n_auxiliary_sensors + 1):
+            if not _skip_persistent_load_warmup_renders():
+                render()
+                # Grab the newly created viewport and dock it to the GUI
+                # The first viewport is always the "main" global camera, and any additional cameras are auxiliary views
+                # These auxiliary views will be stacked in a single column
+                # Thus, the first auxiliary viewport should be generated to the left of the main dockspace, and any
+                # subsequent viewports should be equally spaced according to the number of pre-existing auxiliary views
+                n_auxiliary_sensors = len(self.SENSORS) - 1
+                if n_auxiliary_sensors == 1:
+                    # This is the first auxiliary viewport, dock to the left of the main dockspace
                     dock_window(
-                        space=lazy.omni.ui.Workspace.get_window(f"Viewport {i - 1}"),
-                        name=f"Viewport {i}",
-                        location=lazy.omni.ui.DockPosition.BOTTOM,
-                        ratio=(1 + n_auxiliary_sensors - i) / (2 + n_auxiliary_sensors - i),
+                        space=lazy.omni.ui.Workspace.get_window("DockSpace"),
+                        name=viewport.name,
+                        location=lazy.omni.ui.DockPosition.LEFT,
+                        ratio=0.25,
                     )
+                elif n_auxiliary_sensors > 1:
+                    # This is any additional auxiliary viewports, dock equally-spaced in the auxiliary column
+                    # We also need to re-dock any prior viewports!
+                    for i in range(2, n_auxiliary_sensors + 1):
+                        dock_window(
+                            space=lazy.omni.ui.Workspace.get_window(f"Viewport {i - 1}"),
+                            name=f"Viewport {i}",
+                            location=lazy.omni.ui.DockPosition.BOTTOM,
+                            ratio=(1 + n_auxiliary_sensors - i) / (2 + n_auxiliary_sensors - i),
+                        )
 
         self._viewport = viewport
 
@@ -252,8 +276,7 @@ class VisionSensor(BaseSensor):
         self._viewport.viewport_api.set_active_camera(self.prim_path)
 
         # Requires 3 render updates to propagate changes
-        for i in range(3):
-            render()
+        _maybe_warmup_render(3)
 
         # Set the viewer size (requires taking one render step afterwards)
         self._viewport.viewport_api.set_texture_resolution(resolution)
@@ -266,8 +289,7 @@ class VisionSensor(BaseSensor):
         self.clipping_range = self._load_config["clipping_range"]
 
         # Requires 3 render updates to propagate changes
-        for i in range(3):
-            render()
+        _maybe_warmup_render(3)
 
     def _initialize(self):
         # Run super first
@@ -277,8 +299,7 @@ class VisionSensor(BaseSensor):
 
         # Initialize sensors
         self.initialize_sensors(names=self._modalities)
-        for _ in range(3):
-            render()
+        _maybe_warmup_render(3)
 
     def initialize_sensors(self, names):
         """Initializes a raw sensor in the simulation.

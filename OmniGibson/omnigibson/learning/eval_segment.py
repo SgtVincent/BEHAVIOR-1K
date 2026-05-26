@@ -781,9 +781,12 @@ def run_single_segment(
             "first_env_done_success_step": None,
             "env_termination_count": 0,
         }
+
         for step in range(max_steps):
             evaluator.obs["_meta"] = meta
+
             terminated, truncated = evaluator.step()
+
             final_step = step + 1
             last_terminated = bool(terminated)
             last_truncated = bool(truncated)
@@ -800,7 +803,7 @@ def run_single_segment(
             activation_trace_history.append(step_trace)
 
             evaluator._video_primitive_progress = (step + 1) / float(max_steps)
-            if evaluator.cfg.write_video:
+            if evaluator.cfg.write_video and getattr(evaluator, "_last_obs_refreshed", True):
                 evaluator._write_video()
 
             step_missing_objects = trace_missing_objects(step_trace)
@@ -1364,6 +1367,8 @@ if __name__ == "__main__":
 
     with gm.unlocked():
         gm.HEADLESS = config.headless
+        gm.RENDER_VIEWER_CAMERA = bool(getattr(config, "render_viewer_camera", False))
+        gm.GUI_VIEWPORT_ONLY = bool(getattr(config, "gui_viewport_only", False))
 
     try:
         sample = _build_sample_from_cli_config(config)
