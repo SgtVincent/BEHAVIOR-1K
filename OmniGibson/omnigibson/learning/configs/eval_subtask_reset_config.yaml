@@ -10,6 +10,7 @@ demo_data_path: ???  # Path to the demo data folder (required)
 rawdata_path: null  # Optional path to raw HDF5 data for accurate state restoration
 primitive_state_cache_dir: null  # Optional path to per-demo primitive state caches (defaults to <demo_data_path>/meta/primitive_states)
 num_demos: null  # Number of demos to evaluate (null = all available)
+demo_ids: null  # Optional explicit demo IDs to evaluate (string or list)
 reset_on_primitive_failure: true  # Reset to next primitive start if current fails
 restore_at_each_primitive_start: false  # If true, restore to each primitive start frame (debug / stricter subtask eval)
 primitive_timeout_multiplier: 2.0  # Timeout = demo_duration * multiplier

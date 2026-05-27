@@ -1,0 +1,12 @@
+# @package _global_
+
+policy_name: demo_action_replay
+
+model:
+  _target_: omnigibson.learning.policies.DemoActionReplayPolicy
+  demo_data_path: ???
+  demo_id: ???
+  task_id: null
+  start_frame: 0
+  end_frame: null
+  action_dim: 23

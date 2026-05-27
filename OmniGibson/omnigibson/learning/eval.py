@@ -300,6 +300,8 @@ class Evaluator:
 
         if not skip_obs:
             self.obs = self._preprocess_obs(obs)
+            if self.cfg.save_rollout:
+                self._record_rollout_trace(step_idx=self.env._current_step)
 
         if terminated or truncated:
             self.n_trials += 1
@@ -453,11 +455,50 @@ class Evaluator:
         self._last_env_done_success = None
         self._last_terminated = False
         self._last_truncated = False
+        self.rollout_trace = []
+        if self.cfg.save_rollout:
+            self._record_rollout_trace(step_idx=0)
         # run metric start callbacks
         for metric in self.metrics:
             metric.start_callback(self.env)
         self.policy.reset()
         self.n_success_trials, self.n_trials = 0, 0
+
+    def _record_rollout_trace(self, step_idx: int) -> None:
+        """Record robot state for offline state-replay vs action-replay diagnostics."""
+        base_pos, base_quat = self.robot.get_position_orientation()
+        joint_qpos = self.robot.get_joint_positions()
+        proprio = self.obs.get("robot_r1::proprio")
+        if proprio is None:
+            proprio = th.empty(0, dtype=th.float32)
+        self.rollout_trace.append(
+            {
+                "step": int(step_idx),
+                "base_pos": th.as_tensor(base_pos, dtype=th.float32).detach().cpu().numpy(),
+                "base_quat": th.as_tensor(base_quat, dtype=th.float32).detach().cpu().numpy(),
+                "joint_qpos": th.as_tensor(joint_qpos, dtype=th.float32).detach().cpu().numpy(),
+                "proprio": th.as_tensor(proprio, dtype=th.float32).detach().cpu().numpy(),
+            }
+        )
+
+    def save_rollout_trace(self, path: str) -> None:
+        """Persist the collected rollout robot-state trace as an npz file."""
+        if not self.cfg.save_rollout:
+            return
+        if not self.rollout_trace:
+            logger.warning("No rollout trace was collected; skip saving rollout npz.")
+            return
+        path = Path(path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            path,
+            step=np.asarray([x["step"] for x in self.rollout_trace], dtype=np.int64),
+            base_pos=np.asarray([x["base_pos"] for x in self.rollout_trace], dtype=np.float32),
+            base_quat=np.asarray([x["base_quat"] for x in self.rollout_trace], dtype=np.float32),
+            joint_qpos=np.asarray([x["joint_qpos"] for x in self.rollout_trace], dtype=np.float32),
+            proprio=np.asarray([x["proprio"] for x in self.rollout_trace], dtype=np.float32),
+        )
+        logger.info(f"Saved rollout trace to {path}")
 
     def __enter__(self):
         signal(SIGINT, self._sigint_handler)
@@ -590,6 +631,10 @@ if __name__ == "__main__":
                     metrics.update(metric.gather_results())
                 with open(metrics_path / f"{config.task.name}_{idx}_{epi}.json", "w") as f:
                     json.dump(metrics, f)
+                if config.save_rollout:
+                    evaluator.save_rollout_trace(
+                        Path(config.log_path).expanduser() / "rollouts" / f"{config.task.name}_{idx}_{epi}.npz"
+                    )
                 # reset video writer
                 if config.write_video:
                     evaluator.video_writer = None

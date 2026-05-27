@@ -113,6 +113,7 @@ def replay_hdf5_file(
     generate_bbox: bool = False,
     flush_every_n_steps: int = 500,
     offline_rgbd: bool = False,
+    record_data: bool = True,
 ) -> None:
     """
     Replays a single HDF5 file and saves videos to a new folder
@@ -145,6 +146,10 @@ def replay_hdf5_file(
         modalities += ["rgb", "depth_linear"]
     if generate_seg:
         modalities += ["seg_semantic", "seg_instance_id"]
+    # If we only need low-dimensional outputs, avoid unnecessary render iterations.
+    # The playback still restores every recorded simulator state and steps through the
+    # action sequence, but no visual observations are requested in this mode.
+    n_render_iterations = 3 if modalities else 0
     # Robot sensor configuration
     robot_sensor_config = {
         "VisionSensor": {
@@ -193,7 +198,7 @@ def replay_hdf5_file(
         robot_proprio_keys=list(PROPRIOCEPTION_INDICES["R1Pro"].keys()),
         robot_sensor_config=robot_sensor_config,
         external_sensors_config=dict(),
-        n_render_iterations=3,
+        n_render_iterations=n_render_iterations,
         flush_every_n_traj=1,
         flush_every_n_steps=flush_every_n_steps,
         additional_wrapper_configs=additional_wrapper_configs,
@@ -256,9 +261,16 @@ def replay_hdf5_file(
 
     env.playback_episode(
         episode_id=episode_id,
-        record_data=True,
+        record_data=record_data,
         video_writers=video_writers if not offline_rgbd else None,
     )
+
+    task_success = bool(env.env.task.success)
+    log.info(f"Task success after playback: {task_success}")
+
+    if not record_data:
+        log.info(f"Replay-only playback complete for episode_{demo_id:08d}")
+        return episode_id
 
     # now store obs as videos
     for camera_id, camera_name in camera_names.items():
@@ -546,6 +558,11 @@ def main():
     )
     parser.add_argument("--seg", action="store_true", help="Include this flag to generate segmentation maps")
     parser.add_argument("--bbox", action="store_true", help="Include this flag to generate bounding box data")
+    parser.add_argument(
+        "--replay_only",
+        action="store_true",
+        help="Only replay the trajectory and report task success; do not write observations/videos/parquet",
+    )
     # [Internal use only] the following arguments are for Google Sheets integration
     parser.add_argument("--update_sheet", action="store_true", help="Include this flag to update the Google Sheet")
     parser.add_argument("--row", type=int, required=False, help="Row number to update")
@@ -567,7 +584,7 @@ def main():
             raise FileNotFoundError(
                 f"Error: File episode_{args.demo_id:08d}.hdf5 does not exists under {args.data_folder}"
             )
-    if args.rgbd or args.seg or args.bbox:
+    if args.rgbd or args.seg or args.bbox or args.low_dim or args.replay_only:
         episode_id = replay_hdf5_file(
             data_folder=args.data_folder,
             task_id=task_id,
@@ -577,6 +594,7 @@ def main():
             generate_bbox=args.bbox,
             flush_every_n_steps=FLUSH_EVERY_N_STEPS,
             offline_rgbd=args.offline_rgbd,
+            record_data=not args.replay_only,
         )
     else:
         # TODO: change this

@@ -7,13 +7,14 @@ defaults:
 
 # Golden rule specific settings
 use_gt_plan: true
-demo_data_path: /mnt/bn/robot-mllm-data-lf-3/mlx/users/chenjunting/data/2025-challenge-demos
+demo_data_path: /mnt/bn/navigation-hl/mlx/users/chenjunting/data/2025-challenge-demos
 demo_id: "00000010"
 skill_timeout_steps: 300
 skill_max_steps_multiplier: 2.0
 control_mode: receeding_horizon
 max_len: 32
 fine_grained_level: 2
+diagnostic_skill_idx: null
 
 # When true, the evaluator will try to import GoldenRulePolicyWrapper from
 # openpi-comet and wrap the policy locally.  This requires both repos to be
@@ -43,3 +44,7 @@ primitive_success_joint_qpos_rmse_threshold: 0.25
 # Override default settings for golden rule eval
 eval_on_train_instances: true
 write_video: true
+
+# Use omnigibson wrapper (behavior package may not be installed)
+env_wrapper:
+  _target_: omnigibson.learning.wrappers.RGBWrapper

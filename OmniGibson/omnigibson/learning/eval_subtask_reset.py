@@ -511,11 +511,17 @@ class SubTaskEvaluator(Evaluator):
             
         task_idx = TASK_NAMES_TO_INDICES[self.cfg.task.name]
         task_name = f"task-{task_idx:04d}"
-        
-        # Try common raw data file patterns
+
+        episode_names = self._get_episode_name_candidates(demo_id)
+
+        # Try common raw data file patterns, including zero-padded episode ids.
         possible_paths = [
-            os.path.join(rawdata_path, task_name, f"episode_{demo_id}.hdf5"),
-            os.path.join(rawdata_path, f"episode_{demo_id}.hdf5"),
+            os.path.join(rawdata_path, task_name, f"{episode_name}.hdf5")
+            for episode_name in episode_names
+        ] + [
+            os.path.join(rawdata_path, f"{episode_name}.hdf5")
+            for episode_name in episode_names
+        ] + [
             os.path.join(rawdata_path, task_name, f"{demo_id}.hdf5"),
         ]
         
@@ -847,12 +853,15 @@ class SubTaskEvaluator(Evaluator):
             mode="rgb",
         )
 
-    def _primitive_state_cache_path(self, demo_id: str) -> Optional[str]:
+    def _primitive_state_cache_paths(self, demo_id: str) -> List[str]:
         if self.primitive_state_cache_dir is None:
-            return None
+            return []
         task_idx = TASK_NAMES_TO_INDICES[self.cfg.task.name]
         task_name = f"task-{task_idx:04d}"
-        return os.path.join(self.primitive_state_cache_dir, task_name, f"episode_{demo_id}.npz")
+        return [
+            os.path.join(self.primitive_state_cache_dir, task_name, f"{episode_name}.npz")
+            for episode_name in self._get_episode_name_candidates(demo_id)
+        ]
 
     def load_primitive_state_cache(self, demo_id: str) -> Optional[dict]:
         """Load per-primitive serialized states extracted from raw data.
@@ -860,8 +869,9 @@ class SubTaskEvaluator(Evaluator):
         Expected file format is the one produced by
         `OmniGibson/scripts/learning/extract_primitive_world_states.py`.
         """
-        cache_path = self._primitive_state_cache_path(demo_id)
-        if cache_path is None or not os.path.exists(cache_path):
+        cache_candidates = self._primitive_state_cache_paths(demo_id)
+        cache_path = next((p for p in cache_candidates if os.path.exists(p)), None)
+        if cache_path is None:
             return None
         try:
             data = np.load(cache_path, allow_pickle=False)
@@ -962,18 +972,22 @@ class SubTaskEvaluator(Evaluator):
             
         task_idx = TASK_NAMES_TO_INDICES[self.cfg.task.name]
         task_name = f"task-{task_idx:04d}"
-        episode_name = f"episode_{demo_id}"
-        
+
         base = getattr(self, "demo_data_root", self.demo_data_path)
-        annotation_path = os.path.join(
-            base,
-            "annotations", 
-            task_name, 
-            f"{episode_name}.json"
-        )
-        
-        if not os.path.exists(annotation_path):
-            logger.warning(f"Annotation file not found: {annotation_path}")
+
+        episode_names = self._get_episode_name_candidates(demo_id)
+
+        annotation_candidates = [
+            os.path.join(base, "annotations", task_name, f"{episode_name}.json")
+            for episode_name in episode_names
+        ]
+
+        annotation_path = next((p for p in annotation_candidates if os.path.exists(p)), None)
+        if annotation_path is None:
+            logger.warning(
+                "Annotation file not found. Tried: %s",
+                annotation_candidates,
+            )
             return None
             
         with open(annotation_path, "r") as f:
@@ -984,6 +998,21 @@ class SubTaskEvaluator(Evaluator):
         logger.info(f"  - {len(annotations.get('primitive_annotation', []))} primitives")
         
         return annotations
+
+    @staticmethod
+    def _get_episode_name_candidates(demo_id: str) -> List[str]:
+        demo_id_int = None
+        try:
+            demo_id_int = int(demo_id)
+        except (TypeError, ValueError):
+            pass
+
+        episode_names = [f"episode_{demo_id}"]
+        if demo_id_int is not None:
+            padded_episode_name = f"episode_{demo_id_int:08d}"
+            if padded_episode_name not in episode_names:
+                episode_names.append(padded_episode_name)
+        return episode_names
 
     def load_demo_lowdim_data(self, demo_id: str) -> Optional[pd.DataFrame]:
         """
@@ -1003,15 +1032,14 @@ class SubTaskEvaluator(Evaluator):
         task_name = f"task-{task_idx:04d}"
         
         base = getattr(self, "demo_data_root", self.demo_data_path)
-        parquet_path = os.path.join(
-            base,
-            "data",
-            task_name,
-            f"episode_{demo_id}.parquet"
-        )
-        
-        if not os.path.exists(parquet_path):
-            logger.warning(f"Parquet file not found: {parquet_path}")
+        parquet_candidates = [
+            os.path.join(base, "data", task_name, f"{episode_name}.parquet")
+            for episode_name in self._get_episode_name_candidates(demo_id)
+        ]
+        parquet_path = next((p for p in parquet_candidates if os.path.exists(p)), None)
+
+        if parquet_path is None:
+            logger.warning("Parquet file not found. Tried: %s", parquet_candidates)
             return None
             
         df = pd.read_parquet(parquet_path)
@@ -1470,11 +1498,18 @@ if __name__ == "__main__":
         logger.error("demo_data_path must be specified for subtask evaluation")
         sys.exit(1)
         
-    demo_ids = get_demo_ids_for_task(
-        demo_data_path=demo_data_path,
-        task_name=config.task.name,
-        limit=config.get("num_demos", None)
-    )
+    explicit_demo_ids = config.get("demo_ids", None)
+    if explicit_demo_ids is not None:
+        if isinstance(explicit_demo_ids, (str, int)):
+            demo_ids = [explicit_demo_ids]
+        else:
+            demo_ids = [str(demo_id) for demo_id in explicit_demo_ids]
+    else:
+        demo_ids = get_demo_ids_for_task(
+            demo_data_path=demo_data_path,
+            task_name=config.task.name,
+            limit=config.get("num_demos", None)
+        )
     
     if not demo_ids:
         logger.error(f"No demos found for task {config.task.name}")

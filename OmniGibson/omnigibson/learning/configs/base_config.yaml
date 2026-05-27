@@ -19,7 +19,6 @@ max_steps: null  # max steps per rollout episode, setting to null will use the d
 skip_intermediate_obs_in_chunk: false  # skip observation collection on interior cached-action steps only
 log_path: ???
 test_hidden: false  # [Internal use only] whether to eval on hidden test instances
-
 save_rollout: false
 perturb_pose: false
 perturb_pose_seed: 42

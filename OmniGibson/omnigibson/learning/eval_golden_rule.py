@@ -38,7 +38,23 @@ from inspect import getsourcefile
 from omegaconf import DictConfig, OmegaConf
 from omnigibson.controllers import IsGraspingState
 from omnigibson.learning.eval_subtask_reset import SubTaskEvaluator
-from omnigibson.learning.gt_plan_loader import GTPlanLoader
+
+# Dynamic import to work around NAS filesystem caching issues where
+# newly-created modules may not be visible to Python's import machinery.
+try:
+    from omnigibson.learning.gt_plan_loader import GTPlanLoader
+except ModuleNotFoundError:
+    import importlib.util
+    import os
+    _gt_plan_loader_path = os.path.join(
+        os.path.dirname(__file__), "gt_plan_loader.py"
+    )
+    _spec = importlib.util.spec_from_file_location(
+        "omnigibson.learning.gt_plan_loader", _gt_plan_loader_path
+    )
+    _gt_plan_loader_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_gt_plan_loader_mod)
+    GTPlanLoader = _gt_plan_loader_mod.GTPlanLoader
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.eval_utils import (
     ROBOT_CAMERA_NAMES,
@@ -83,6 +99,10 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
     """
 
     def __init__(self, cfg: DictConfig) -> None:
+        # Set this BEFORE super().__init__ because the parent's __init__ calls
+        # self.load_policy() which needs this attribute.
+        self._wrap_policy_locally: bool = cfg.get("wrap_policy_locally", False)
+
         super().__init__(cfg)
 
         # Golden-rule specific attributes
@@ -92,7 +112,6 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
         self.control_mode: str = str(cfg.get("control_mode", "receeding_horizon"))
         self.max_len: int = int(cfg.get("max_len", 32))
         self.fine_grained_level: int = int(cfg.get("fine_grained_level", 2))
-        self._wrap_policy_locally: bool = cfg.get("wrap_policy_locally", False)
 
         # Skill-level tracking
         self.n_skill_trials = 0
@@ -200,6 +219,25 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
             logger.error(f"No skill plan available for demo {demo_id}")
             return False
 
+        diagnostic_skill_idx = self.cfg.get("diagnostic_skill_idx", None)
+        if diagnostic_skill_idx is not None:
+            diagnostic_skill_idx = int(diagnostic_skill_idx)
+            if diagnostic_skill_idx < 0 or diagnostic_skill_idx >= len(self.current_skill_plan):
+                logger.error(
+                    "Invalid diagnostic_skill_idx=%s for %d-skill plan",
+                    diagnostic_skill_idx,
+                    len(self.current_skill_plan),
+                )
+                return False
+            selected_skill = self.current_skill_plan[diagnostic_skill_idx]
+            logger.info(
+                "Diagnostic mode: evaluating only skill %d/%d: %s",
+                diagnostic_skill_idx + 1,
+                len(self.current_skill_plan),
+                self._get_skill_description(selected_skill),
+            )
+            self.current_skill_plan = [selected_skill]
+
         # Inject the plan loader into the policy wrapper so that it can
         # resolve per-skill prompts and detect skill completion.
         if self._golden_rule_policy is not None:
@@ -229,6 +267,18 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
     # ------------------------------------------------------------------
     # Skill-level success check
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_skill_description(skill: Dict[str, Any]) -> str:
+        """Return a human-readable skill description from annotation variants."""
+        desc = skill.get("description", None)
+        if desc is None:
+            desc = skill.get("skill_description", None)
+        if isinstance(desc, list):
+            desc = desc[0] if desc else "unknown"
+        if desc is None:
+            return "unknown"
+        return str(desc)
 
     def get_skill_timeout(self, skill: Dict[str, Any]) -> int:
         """Compute timeout for a skill based on its demo duration and config."""
@@ -343,7 +393,7 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
 
         if active_skill is not None:
             skill_done, skill_result = self.check_skill_success(
-                primitive=active_skill,
+                skill=active_skill,
                 current_step=self.current_skill_step,
                 terminated=terminated,
             )
@@ -351,7 +401,8 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
             info["skill_result"] = skill_result
 
             if skill_done:
-                skill_desc = active_skill.get("description", "unknown")
+                info["skill_step"] = int(self.current_skill_step)
+                skill_desc = self._get_skill_description(active_skill)
                 if str(skill_result).startswith("success"):
                     logger.info(
                         f"Skill {self.current_skill_idx + 1}/{len(self.current_skill_plan)} "
@@ -372,6 +423,9 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
                     and self._golden_rule_policy.plan_loader is not None
                 ):
                     self._golden_rule_policy._advance_plan()
+                    notify_remote_policy = False
+                else:
+                    notify_remote_policy = True
 
                 self.current_skill_idx += 1
                 self.current_skill_step = 0
@@ -394,8 +448,13 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
                                         f"Restored state to next skill start frame {start_frame}: "
                                         f"restored={restored} method={method}"
                                     )
+                                    if restored:
+                                        self.obs = self._preprocess_obs(self._get_obs_for_policy())
                                 except Exception as exc:
                                     logger.warning(f"State restore to next skill failed: {exc}")
+
+                if notify_remote_policy and self.current_skill_idx < len(self.current_skill_plan):
+                    self.obs["golden_rule_advance_plan"] = True
 
         return terminated, truncated, info
 
@@ -422,12 +481,26 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
             return {"error": "setup_failed", "demo_id": demo_id}
 
         skill_results: List[Tuple[str, bool, str]] = []
+        skill_diagnostics: List[Dict[str, Any]] = []
         total_steps = 0
         terminated = False
         truncated = False
 
         logger.info(f"Starting golden-rule episode for demo {demo_id}")
         logger.info(f"  Skills: {len(self.current_skill_plan)}")
+
+        diagnostic_skill_idx = self.cfg.get("diagnostic_skill_idx", None)
+        if diagnostic_skill_idx is not None and self.current_skill_plan:
+            fd = self.current_skill_plan[0].get("frame_duration")
+            if fd is not None:
+                start_frame = int(fd[0])
+                restored, method = self._try_restore_to_frame(start_frame)
+                logger.info(
+                    "Diagnostic mode restored to skill start frame %d: restored=%s method=%s",
+                    start_frame,
+                    restored,
+                    method,
+                )
 
         # Reset policy at episode start
         self.policy.reset()
@@ -451,9 +524,30 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
                 skill_idx = info.get("skill_idx", 0)
                 if 0 <= skill_idx < len(self.current_skill_plan):
                     skill = self.current_skill_plan[skill_idx]
-                    skill_desc = skill.get("description", "unknown")
+                    skill_desc = self._get_skill_description(skill)
                     success = str(info.get("skill_result", "")).startswith("success")
                     skill_results.append((skill_desc, success, info["skill_result"]))
+                    state_errors = getattr(self, "_last_primitive_state_errors", None)
+                    if isinstance(state_errors, dict):
+                        state_errors = {
+                            str(k): float(v) if np.isscalar(v) and np.isfinite(v) else str(v)
+                            for k, v in state_errors.items()
+                        }
+                    skill_diagnostics.append(
+                        {
+                            "skill_idx": int(skill_idx),
+                            "skill_desc": skill_desc,
+                            "success": bool(success),
+                            "result": str(info.get("skill_result", "")),
+                            "steps": int(info.get("skill_step", self.current_skill_step)),
+                            "success_reason": getattr(self, "_last_primitive_success_reason", None),
+                            "state_errors": state_errors,
+                        }
+                    )
+
+                if self.current_skill_idx >= len(self.current_skill_plan):
+                    logger.info("Skill plan exhausted; ending episode")
+                    break
 
             if terminated or truncated:
                 break
@@ -476,6 +570,7 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
         results: Dict[str, Any] = {
             "demo_id": demo_id,
             "skill_results": skill_results,
+            "skill_diagnostics": skill_diagnostics,
             "n_skills": len(self.current_skill_plan),
             "n_skill_successes": n_successes,
             "endtoend_success": endtoend_success,
@@ -498,6 +593,143 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
     # ------------------------------------------------------------------
     # Context manager exit
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Video overlay
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _draw_text_with_background(
+        img,
+        text: str,
+        position,
+        font_scale: float = 0.7,
+        thickness: int = 2,
+        text_color=(255, 255, 255),
+        bg_color=(0, 0, 0),
+    ):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        x, y = position
+        cv2.rectangle(img, (x, y - text_height - baseline), (x + text_width, y + baseline), bg_color, -1)
+        cv2.putText(img, text, (x, y), font, font_scale, text_color, thickness)
+
+    @staticmethod
+    def _draw_progress_bar(
+        img,
+        progress: float,
+        position,
+        width: int,
+        height: int,
+        color=(0, 255, 0),
+        bg_color=(50, 50, 50),
+    ):
+        x, y = position
+        progress = float(np.clip(progress, 0.0, 1.0))
+        cv2.rectangle(img, (x, y), (x + width, y + height), bg_color, -1)
+        fill_width = int(width * progress)
+        cv2.rectangle(img, (x, y), (x + fill_width, y + height), color, -1)
+
+    def _write_video(self) -> None:
+        """Write the current robot observations to video, with skill plan overlay."""
+        if getattr(self, "_video_writer", None) is None:
+            return
+        if ROBOT_CAMERA_NAMES["R1Pro"]["head"] + "::rgb" not in self.obs:
+            return
+
+        left_wrist_rgb = cv2.resize(
+            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["left_wrist"] + "::rgb"].numpy(),
+            (224, 224),
+        )
+        right_wrist_rgb = cv2.resize(
+            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["right_wrist"] + "::rgb"].numpy(),
+            (224, 224),
+        )
+        head_rgb = cv2.resize(
+            self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["head"] + "::rgb"].numpy(),
+            (448, 448),
+        )
+
+        composite = np.hstack([np.vstack([left_wrist_rgb, right_wrist_rgb]), head_rgb]).copy()
+
+        # Overlay skill plan info
+        active_skill = None
+        if 0 <= self.current_skill_idx < len(self.current_skill_plan):
+            active_skill = self.current_skill_plan[self.current_skill_idx]
+
+        # Header: task name and overall progress
+        n_skills = len(self.current_skill_plan)
+        self._draw_text_with_background(
+            composite,
+            f"Task: {self.cfg.task.name}",
+            (20, 40),
+            bg_color=(0, 0, 100),
+        )
+
+        if n_skills > 0:
+            skill_progress = self.current_skill_idx / n_skills
+            self._draw_text_with_background(
+                composite,
+                f"Skills: {min(self.current_skill_idx + 1, n_skills)}/{n_skills}",
+                (20, 70),
+                bg_color=(0, 0, 0),
+            )
+            self._draw_progress_bar(
+                composite,
+                skill_progress,
+                (20, 80),
+                300,
+                8,
+                color=(50, 205, 50),
+            )
+
+        if active_skill is not None:
+            skill_desc = self._get_skill_description(active_skill)
+            skill_desc_short = skill_desc[:60] + "..." if len(skill_desc) > 60 else skill_desc
+            self._draw_text_with_background(
+                composite,
+                f"Current: {skill_desc_short}",
+                (20, 110),
+                bg_color=(0, 100, 0),
+            )
+
+            # Skill step counter / timeout
+            timeout = self.get_skill_timeout(active_skill)
+            step_progress = min(1.0, self.current_skill_step / max(1, timeout))
+            self._draw_text_with_background(
+                composite,
+                f"Step: {self.current_skill_step}/{timeout}",
+                (20, 140),
+                bg_color=(0, 0, 0),
+            )
+            bar_color = (50, 205, 50) if step_progress < 0.8 else (0, 165, 255) if step_progress < 1.0 else (0, 0, 255)
+            self._draw_progress_bar(
+                composite,
+                step_progress,
+                (20, 150),
+                200,
+                6,
+                color=bar_color,
+            )
+
+            # Show next skill (if any)
+            if self.current_skill_idx + 1 < n_skills:
+                next_desc = self._get_skill_description(self.current_skill_plan[self.current_skill_idx + 1])
+                next_short = next_desc[:50] + "..." if len(next_desc) > 50 else next_desc
+                self._draw_text_with_background(
+                    composite,
+                    f"Next: {next_short}",
+                    (20, 175),
+                    bg_color=(50, 50, 50),
+                    font_scale=0.55,
+                )
+
+        write_video(
+            np.expand_dims(composite, 0),
+            video_writer=self.video_writer,
+            batch_size=1,
+            mode="rgb",
+        )
 
     def __exit__(self, exc_type, exc_value, exc_tb):
         logger.info("")
