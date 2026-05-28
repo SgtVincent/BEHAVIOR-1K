@@ -138,6 +138,44 @@ class SubTaskEvaluator(Evaluator):
         
         logger.info("SubTaskEvaluator initialized with primitive evaluation support")
 
+    def _record_rollout_trace(self, step_idx: int) -> None:
+        """Record robot state for segment-level replay diagnostics."""
+        if not hasattr(self, "rollout_trace"):
+            self.rollout_trace = []
+        base_pos, base_quat = self.robot.get_position_orientation()
+        joint_qpos = self.robot.get_joint_positions()
+        proprio = self.obs.get("robot_r1::proprio") if isinstance(self.obs, dict) else None
+        if proprio is None:
+            proprio = th.empty(0, dtype=th.float32)
+        self.rollout_trace.append(
+            {
+                "step": int(step_idx),
+                "base_pos": th.as_tensor(base_pos, dtype=th.float32).detach().cpu().numpy(),
+                "base_quat": th.as_tensor(base_quat, dtype=th.float32).detach().cpu().numpy(),
+                "joint_qpos": th.as_tensor(joint_qpos, dtype=th.float32).detach().cpu().numpy(),
+                "proprio": th.as_tensor(proprio, dtype=th.float32).detach().cpu().numpy(),
+            }
+        )
+
+    def save_rollout_trace(self, path: str) -> None:
+        """Persist collected segment rollout robot-state trace as an npz file."""
+        if not self.cfg.get("save_rollout", False):
+            return
+        if not getattr(self, "rollout_trace", None):
+            logger.warning("No rollout trace was collected; skip saving rollout npz.")
+            return
+        path = Path(path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            path,
+            step=np.asarray([x["step"] for x in self.rollout_trace], dtype=np.int64),
+            base_pos=np.asarray([x["base_pos"] for x in self.rollout_trace], dtype=np.float32),
+            base_quat=np.asarray([x["base_quat"] for x in self.rollout_trace], dtype=np.float32),
+            joint_qpos=np.asarray([x["joint_qpos"] for x in self.rollout_trace], dtype=np.float32),
+            proprio=np.asarray([x["proprio"] for x in self.rollout_trace], dtype=np.float32),
+        )
+        logger.info(f"Saved rollout trace to {path}")
+
     @staticmethod
     def _parse_restore_exception_details(exc: Exception) -> Dict[str, Any]:
         details: Dict[str, Any] = {

@@ -645,6 +645,11 @@ def run_single_segment(
 
         evaluator.policy.reset()
         evaluator.obs = evaluator._preprocess_obs(evaluator._get_obs_for_policy())
+        if bool(evaluator.cfg.get("save_rollout", False)):
+            # Keep segment-level rollout traces aligned to the restored segment
+            # start, not to the evaluator reset that happened before scene load.
+            evaluator.rollout_trace = []
+            evaluator._record_rollout_trace(step_idx=0)
 
         meta = {
             f"{segment_level}_idx": int(segment_idx),
@@ -716,9 +721,17 @@ def run_single_segment(
             else all(item.get("satisfied", False) for item in start_trace)
         ) if len(start_trace) > 0 else False
         require_unsatisfied_at_start = bool(metric_debug.get("require_unsatisfied_at_start", True))
-        invalid_start_state = require_unsatisfied_at_start and start_all_satisfied
+        force_rollout_even_if_pre_satisfied = bool(
+            evaluator.cfg.get("force_rollout_even_if_pre_satisfied", False)
+        )
+        invalid_start_state = (
+            require_unsatisfied_at_start
+            and start_all_satisfied
+            and not force_rollout_even_if_pre_satisfied
+        )
         result["predicate_debug"]["start_all_satisfied"] = start_all_satisfied
         result["predicate_debug"]["require_unsatisfied_at_start"] = require_unsatisfied_at_start
+        result["predicate_debug"]["force_rollout_even_if_pre_satisfied"] = force_rollout_even_if_pre_satisfied
 
         if invalid_start_state:
             result["rollout"], result_type = build_pre_satisfied_start_result(
@@ -1280,14 +1293,21 @@ def run_segment_on_env(
                 }
             )
 
+        if bool(cfg.get("save_rollout", False)):
+            rollout_path = (
+                Path(ctx["log_path"]) / "rollouts" / f"{ctx['task_name']}_{ctx['demo_id']}_{ctx['segment_level']}{ctx['segment_idx']:03d}.npz"
+            )
+            evaluator.save_rollout_trace(str(rollout_path))
+            result["rollout_trace_path"] = str(rollout_path)
+
         if write_metrics:
             out_path = (
                 ctx["metrics_path"]
                 / f"segment_eval_{ctx['task_name']}_{ctx['demo_id']}_{ctx['segment_level']}{ctx['segment_idx']:03d}.json"
             )
+            result["_metrics_path"] = str(out_path)
             with open(out_path, "w") as f:
                 json.dump(result, f, indent=2)
-            result["_metrics_path"] = str(out_path)
             logger.info(f"Saved metrics to {out_path}")
 
         if ctx["write_video"] and video_name is not None:

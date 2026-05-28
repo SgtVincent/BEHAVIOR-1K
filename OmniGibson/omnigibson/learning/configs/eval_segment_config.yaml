@@ -71,6 +71,10 @@ segment_predicate_dump_trace: true
 # Keep false so a task-level success (e.g. attached relation) does not cut off a still-unsatisfied final skill
 # predicate such as release / not-grasped.
 segment_predicate_env_termination_is_terminal: false
+# Diagnostic override: when segment predicates are already satisfied at the
+# restored start frame, still roll out the skill instead of returning early.
+# This is useful for measuring action-replay drift after restore-at-skill-start.
+force_rollout_even_if_pre_satisfied: false
 
 # Review-video safeguard: pad very short clips with duplicate final-state frames up to this estimate.
 review_video_min_meaningful_frames: 30
