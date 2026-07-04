@@ -191,6 +191,31 @@ def test_predicate_window_satisfied_allows_witness_at_min_index() -> None:
     assert predicate_window_satisfied([unsat, sat], mode="anytime", min_history_index=1) is True
 
 
+def test_generated_product_name_alias_resolves_source_object() -> None:
+    env = _FakeEnv(
+        objects={
+            "zucchini_208": _FakeObject("zucchini_208"),
+            "knife_1": _FakeObject("knife_1", nextto=True),
+        }
+    )
+
+    specs, debug = build_template_predicates(
+        "skill",
+        {
+            "skill_description": "chop",
+            "manipulating_object_id": "knife_1",
+            "object_id": [["knife_1", "half_zucchini_208_1"]],
+        },
+        env,
+    )
+    _, trace = eval_segment_predicates(env, specs)
+
+    assert debug["metric_family"] == "contact_effect_proxy"
+    assert len(specs) == 1
+    assert trace[0]["predicate"] == "touching(knife_1,half_zucchini_208_1)"
+    assert "missing_object" not in trace[0].get("diagnostics", {})
+
+
 def test_predicate_window_satisfied_consecutive_does_not_cross_min_index() -> None:
     sat = [{"predicate": "open(drawer)", "desired": True, "value": True, "satisfied": True, "diagnostics": {}}]
     unsat = [{"predicate": "open(drawer)", "desired": True, "value": False, "satisfied": False, "diagnostics": {}}]

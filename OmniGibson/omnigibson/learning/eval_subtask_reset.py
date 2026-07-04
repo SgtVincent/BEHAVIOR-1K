@@ -121,10 +121,18 @@ class SubTaskEvaluator(Evaluator):
         # Current episode tracking
         self.current_primitive_annotations = []
         self.current_primitive_idx = 0
+        self.current_segment_metadata: Optional[Dict[str, Any]] = None
         self.current_demo_data = None
         self.current_demo_id = None
         self._last_rawdata_restore_result: Dict[str, Any] = {"attempted": False}
         self._last_restore_debug: Dict[str, Any] = {"selected_method": "none"}
+
+        # If a standalone segment starts while the demo is already holding a manipulating
+        # object (e.g. a `place in` segment immediately after `pick up`), avoid calling
+        # robot.keep_still() on gripper joints during segment-load stabilization. In
+        # physical grasping mode, keep_still() clears joint effort and can drop the
+        # restored object before replay starts.
+        self.preserve_gripper_on_segment_start_grasp = cfg.get("preserve_gripper_on_segment_start_grasp", True)
 
         # Video annotation state
         self._video_primitive_desc = None
@@ -244,7 +252,68 @@ class SubTaskEvaluator(Evaluator):
             logger.info("[debug][%s] failed to inspect grasp state: %s", tag, e)
     #endregion debug-point restore-grasp-state
 
-    def _stabilize_robot_post_restore(self) -> None:
+    @staticmethod
+    def _flatten_annotation_strings(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, (list, tuple)):
+            out: List[str] = []
+            for item in value:
+                out.extend(SubTaskEvaluator._flatten_annotation_strings(item))
+            return out
+        text = str(value).strip()
+        return [text] if text else []
+
+    def _segment_start_grasp_metadata(self, frame_idx: Optional[int]) -> Tuple[bool, List[str], str]:
+        """Return whether current segment metadata implies a held object at segment start.
+
+        The BEHAVIOR skill metadata does not store arm-level physical contacts, but it
+        does identify the object being manipulated by each segment. For release-style
+        segments (place / put / pour / insert), a non-empty manipulating_object_id means
+        the segment starts after the object has already been picked up, so segment-load
+        stabilization should preserve gripper commands even if physical is_grasping()
+        is briefly UNKNOWN/FALSE immediately after deserializing raw state.
+        """
+        if not bool(getattr(self, "preserve_gripper_on_segment_start_grasp", True)):
+            return False, [], "disabled"
+
+        segment = getattr(self, "current_segment_metadata", None)
+        if not isinstance(segment, dict):
+            return False, [], "no_current_segment_metadata"
+
+        frame_duration = segment.get("frame_duration") or []
+        if frame_idx is not None:
+            try:
+                start_frame = int(frame_duration[0])
+            except Exception:
+                return False, [], "invalid_frame_duration"
+            if int(frame_idx) != start_frame:
+                return False, [], "not_segment_start"
+
+        manipulating_objects = self._flatten_annotation_strings(segment.get("manipulating_object_id"))
+        if not manipulating_objects:
+            return False, [], "no_manipulating_object_id"
+
+        desc_values: List[str] = []
+        for key in ("skill_description", "primitive_description", "segment_description", "description"):
+            desc_values.extend(self._flatten_annotation_strings(segment.get(key)))
+        desc = " ".join(desc_values).strip().lower()
+        if desc.startswith(("pick", "pick up", "grasp", "grab")):
+            return False, manipulating_objects, f"pickup_segment:{desc}"
+        if desc.startswith(("place", "put", "pour", "insert", "drop", "release")):
+            return True, manipulating_objects, f"release_segment:{desc}"
+
+        # Conservative fallback: only trust manipulating_object_id as a start-grasp
+        # signal for non-navigation / non-pickup segments.
+        skill_types = {x.lower() for x in self._flatten_annotation_strings(segment.get("skill_type"))}
+        if "navigation" not in skill_types:
+            return True, manipulating_objects, f"manipulating_non_navigation:{desc or sorted(skill_types)}"
+        return False, manipulating_objects, f"navigation_segment:{desc}"
+
+    def _stabilize_robot_post_restore(self, frame_idx: Optional[int] = None) -> None:
         """
         Stabilize the robot after rawdata restore without clearing gripper holding force.
 
@@ -258,25 +327,43 @@ class SubTaskEvaluator(Evaluator):
             grasping_arms = [
                 arm for arm in getattr(robot, "arm_names", []) if robot.is_grasping(arm=arm) == IsGraspingState.TRUE
             ]
+            segment_start_grasp, segment_objects, segment_reason = self._segment_start_grasp_metadata(frame_idx)
         except Exception:
             grasping_mode = None
             grasping_arms = []
+            segment_start_grasp = False
+            segment_objects = []
+            segment_reason = "exception"
 
-        if grasping_mode == "physical" and grasping_arms:
+        if grasping_mode == "physical" and (grasping_arms or segment_start_grasp):
             try:
                 robot.set_linear_velocity(th.zeros(3))
                 robot.set_angular_velocity(th.zeros(3))
                 joint_vel = robot.get_joint_velocities().clone()
+                all_qpos = robot.get_joint_positions()
+                protected_arms = list(grasping_arms)
+                if not protected_arms and segment_start_grasp:
+                    for arm in getattr(robot, "arm_names", []):
+                        try:
+                            qpos = all_qpos[robot.gripper_control_idx[arm]]
+                            if bool(float(th.min(qpos).item()) < 0.04):
+                                protected_arms.append(arm)
+                        except Exception:
+                            continue
+                if not protected_arms and segment_start_grasp:
+                    protected_arms = list(getattr(robot, "arm_names", []))
                 protected_idx = set()
-                for arm in grasping_arms:
+                for arm in protected_arms:
                     protected_idx.update(robot.gripper_control_idx[arm].tolist())
                 non_gripper_idx = [i for i in range(joint_vel.shape[0]) if i not in protected_idx]
                 if len(non_gripper_idx) > 0:
                     joint_vel[non_gripper_idx] = 0.0
                     robot.set_joint_velocities(joint_vel, drive=False)
                 logger.info(
-                    "[debug][post_restore_stabilize] preserving physical grasp on arms=%s by skipping keep_still on gripper joints",
-                    grasping_arms,
+                    "[debug][post_restore_stabilize] preserving physical grasp on arms=%s objects=%s reason=%s by skipping keep_still on gripper joints",
+                    protected_arms,
+                    segment_objects,
+                    segment_reason if segment_start_grasp else "runtime_is_grasping",
                 )
                 return
             except Exception as e:
@@ -692,7 +779,7 @@ class SubTaskEvaluator(Evaluator):
             for _ in range(5):
                 og.sim.step_physics()
                 try:
-                    self._stabilize_robot_post_restore()
+                    self._stabilize_robot_post_restore(frame_idx=frame_idx)
                 except Exception:
                     pass
             self._maybe_recover_assisted_grasp_post_restore(f"rawdata_restore_frame_{frame_idx}_after_keep_still")
@@ -978,7 +1065,7 @@ class SubTaskEvaluator(Evaluator):
             for _ in range(5):
                 og.sim.step_physics()
                 try:
-                    self.robot.keep_still()
+                    self._stabilize_robot_post_restore(frame_idx=frame_idx)
                 except Exception:
                     pass
 
@@ -1146,12 +1233,12 @@ class SubTaskEvaluator(Evaluator):
             self.robot.set_joint_positions(joint_qpos, drive=False)
             
             # Keep robot still to avoid drifting
-            self.robot.keep_still()
+            self._stabilize_robot_post_restore(frame_idx=frame_idx)
             
             # Step physics a few times to stabilize
             for _ in range(10):
                 og.sim.step_physics()
-                self.robot.keep_still()
+                self._stabilize_robot_post_restore(frame_idx=frame_idx)
                 
             # Render to update visual state
             for _ in range(3):
@@ -1381,6 +1468,7 @@ class SubTaskEvaluator(Evaluator):
         for i, primitive in enumerate(primitives):
             start_frame, end_frame = primitive["frame_duration"]
             primitive_desc = primitive.get("primitive_description", ["unknown"])[0]
+            self.current_segment_metadata = dict(primitive)
 
             self._video_primitive_idx = i + 1
             
@@ -1453,6 +1541,7 @@ class SubTaskEvaluator(Evaluator):
             self.current_rawdata_hdf5 = None
 
         self.current_primitive_state_cache = None
+        self.current_segment_metadata = None
             
         return results
 

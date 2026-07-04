@@ -131,6 +131,13 @@ class DemoActionReplayPolicy:
         self.action_dim = action_dim
         self._step = 0
 
+        self._load_demo_data(self.demo_id, self.task_id)
+
+    def _load_demo_data(self, demo_id: str, task_id: int) -> None:
+        """Load / reload the backing parquet for demo action replay."""
+
+        self.demo_id = str(demo_id).zfill(8)
+        self.task_id = int(task_id)
         parquet_path = self.demo_data_path / "data" / f"task-{self.task_id:04d}" / f"episode_{self.demo_id}.parquet"
         if not parquet_path.exists():
             raise FileNotFoundError(f"Demo parquet not found: {parquet_path}")
@@ -152,6 +159,16 @@ class DemoActionReplayPolicy:
             self.end_frame,
             self.action_dim,
         )
+
+    def load_demo(self, demo_id: str, task_id: Optional[int] = None) -> None:
+        """Reload action data when a persistent evaluator switches demos."""
+
+        task_id = int(task_id) if task_id is not None else int(str(demo_id).zfill(8)) // 100000
+        demo_id = str(demo_id).zfill(8)
+        if demo_id != self.demo_id or int(task_id) != int(self.task_id):
+            self._load_demo_data(demo_id, int(task_id))
+        else:
+            self._step = 0
 
     def reset(self) -> None:
         self._step = 0

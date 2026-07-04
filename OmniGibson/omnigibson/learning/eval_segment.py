@@ -417,6 +417,13 @@ def run_single_segment(
 
     start_frame, end_frame = segment["frame_duration"]
     segment_desc = segment.get(f"{segment_level}_description", ["unknown"])[0]
+    evaluator.current_segment_metadata = dict(segment)
+
+    # Keep demo-replay policies aligned with the restored segment start.
+    if hasattr(evaluator.policy, "start_frame"):
+        evaluator.policy.start_frame = int(start_frame)
+    if hasattr(evaluator.policy, "end_frame"):
+        evaluator.policy.end_frame = int(end_frame)
 
     evaluator.current_demo_data = evaluator.load_demo_lowdim_data(demo_id)
     if evaluator.current_demo_data is None:
@@ -888,6 +895,15 @@ def run_single_segment(
             min_rollout_steps_for_success=min_success_steps,
         )
         result["predicate_debug"].update(short_video_diagnostics)
+        final_rollout_trace = trace_history[-1] if trace_history else []
+        result["predicate_debug"]["final_rollout_trace"] = final_rollout_trace
+        result["predicate_debug"]["final_rollout_metric_completed"] = predicate_window_satisfied(
+            [final_rollout_trace],
+            mode="anytime",
+            last_k=1,
+            min_consecutive=1,
+            combine_mode=combine_mode,
+        )
         result["predicate_debug"].update(
             {
                 "min_success_steps": min_success_steps,
@@ -1143,6 +1159,7 @@ def _reconfigure_for_segment(
         )
 
     demo_id = _as_demo_id(sample["demo_id"])
+    task_id = sample.get("task_id", None)
     segment_level = str(sample.get("segment_level", cfg.get("segment_level", "skill")))
     if "segment_idx" in sample:
         segment_idx = int(sample["segment_idx"])
@@ -1161,9 +1178,14 @@ def _reconfigure_for_segment(
     test_hidden = bool(sample.get("test_hidden", cfg.get("test_hidden", False)))
     expected_skill = sample.get("expected_skill", sample.get("skill"))
     log_path = Path(str(sample["log_path"])).expanduser()
+    model_start_frame = sample.get("start_frame", sample.get("model.start_frame", None))
+    model_end_frame = sample.get("end_frame", sample.get("model.end_frame", None))
 
     # Mutate cfg in place so existing helpers (e.g. run_single_segment) see the new values.
     cfg.demo_id = demo_id
+    if task_id is not None:
+        cfg.model.task_id = int(task_id)
+    cfg.model.demo_id = demo_id
     cfg.segment_level = segment_level
     cfg.segment_idx = segment_idx
     if segment_max_steps is not None:
@@ -1175,6 +1197,20 @@ def _reconfigure_for_segment(
     cfg.log_path = str(log_path)
     if expected_skill is not None:
         cfg.expected_skill = str(expected_skill)
+    if model_start_frame is not None:
+        cfg.model.start_frame = int(model_start_frame)
+    if model_end_frame is not None:
+        cfg.model.end_frame = None if str(model_end_frame).lower() == "none" else int(model_end_frame)
+
+    # DemoActionReplayPolicy loads its parquet at construction time. When a
+    # long-lived evaluator is reused across demos, reload policy data so actions
+    # and frame offsets match this sample.
+    if hasattr(evaluator.policy, "load_demo"):
+        if model_start_frame is not None and hasattr(evaluator.policy, "start_frame"):
+            evaluator.policy.start_frame = int(model_start_frame)
+        if model_end_frame is not None and hasattr(evaluator.policy, "end_frame"):
+            evaluator.policy.end_frame = None if str(model_end_frame).lower() == "none" else int(model_end_frame)
+        evaluator.policy.load_demo(demo_id=demo_id, task_id=task_id)
 
     # Release any rawdata caches lingering from a previous segment to avoid
     # reusing a stale HDF5 handle for a different demo_id.
@@ -1356,6 +1392,7 @@ def _build_sample_from_cli_config(config: DictConfig) -> Dict[str, Any]:
     return {
         "task_name": str(config.task.name),
         "demo_id": demo_id,
+        "task_id": int(config.model.task_id) if config.get("model", None) is not None and config.model.get("task_id", None) is not None else None,
         "segment_level": segment_level,
         "segment_idx": segment_idx,
         "segment_max_steps": config.get("segment_max_steps", None),
@@ -1365,6 +1402,8 @@ def _build_sample_from_cli_config(config: DictConfig) -> Dict[str, Any]:
         "test_hidden": bool(config.get("test_hidden", False)),
         "log_path": str(Path(str(config.log_path)).expanduser()),
         "expected_skill": config.get("expected_skill", None),
+        "model.start_frame": config.model.get("start_frame", None) if config.get("model", None) is not None else None,
+        "model.end_frame": config.model.get("end_frame", None) if config.get("model", None) is not None else None,
     }
 
 

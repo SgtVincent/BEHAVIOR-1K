@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -127,6 +128,10 @@ def _object_from_name(env, name: Optional[str]):
     obj = env.scene.object_registry("name", name)
     if obj is not None:
         return obj
+    for alias in _generated_object_name_aliases(name):
+        obj = env.scene.object_registry("name", alias)
+        if obj is not None:
+            return obj
     inst_to_name = env.scene.get_task_metadata("inst_to_name")
     if isinstance(inst_to_name, dict):
         for inst, obj_name in inst_to_name.items():
@@ -138,7 +143,52 @@ def _object_from_name(env, name: Optional[str]):
                 maybe = env.scene.object_registry("name", obj_name)
                 if maybe is not None:
                     return maybe
+            if inst in _generated_object_name_aliases(name) or obj_name in _generated_object_name_aliases(name):
+                maybe = env.scene.object_registry("name", obj_name)
+                if maybe is not None:
+                    return maybe
     return None
+
+
+def _generated_object_name_aliases(name: Optional[str]) -> List[str]:
+    """Return scene-object aliases for generated slice / portion names."""
+
+    if name is None:
+        return []
+    s = str(name).strip()
+    if not s:
+        return []
+    aliases: List[str] = []
+    prefixes = (
+        "half_",
+        "quarter_",
+        "slice_",
+        "sliced_",
+        "piece_",
+        "pieces_",
+        "diced_",
+        "chopped_",
+        "cut_",
+    )
+    without_prefix = s
+    for prefix in prefixes:
+        if without_prefix.startswith(prefix):
+            without_prefix = without_prefix[len(prefix) :]
+            aliases.append(without_prefix)
+            break
+    # Generated products often append an extra product index after the source
+    # object instance id, e.g. bell_pepper_213_0 -> bell_pepper_213.
+    for base in [s, without_prefix]:
+        stripped = re.sub(r"_(\d+)$", "", base)
+        if stripped != base:
+            aliases.append(stripped)
+    out: List[str] = []
+    seen = {s}
+    for alias in aliases:
+        if alias and alias not in seen:
+            out.append(alias)
+            seen.add(alias)
+    return out
 
 
 def _task_activity_name(env) -> str:
