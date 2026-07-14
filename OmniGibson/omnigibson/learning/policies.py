@@ -125,7 +125,10 @@ class DemoActionReplayPolicy:
     ) -> None:
         self.demo_data_path = Path(demo_data_path).expanduser()
         self.demo_id = str(demo_id).zfill(8)
-        self.task_id = int(task_id) if task_id is not None else int(self.demo_id) // 100000
+        # BEHAVIOR demo ids are encoded as task_id * 10000 + episode_id
+        # (e.g. 00070010 -> task-0007).  Keep explicit task_id overrides
+        # supported, but infer the correct task folder when omitted.
+        self.task_id = int(task_id) if task_id is not None else int(self.demo_id) // 10000
         self.start_frame = int(start_frame)
         self.end_frame = int(end_frame) if end_frame is not None else None
         self.action_dim = action_dim
@@ -163,7 +166,7 @@ class DemoActionReplayPolicy:
     def load_demo(self, demo_id: str, task_id: Optional[int] = None) -> None:
         """Reload action data when a persistent evaluator switches demos."""
 
-        task_id = int(task_id) if task_id is not None else int(str(demo_id).zfill(8)) // 100000
+        task_id = int(task_id) if task_id is not None else int(str(demo_id).zfill(8)) // 10000
         demo_id = str(demo_id).zfill(8)
         if demo_id != self.demo_id or int(task_id) != int(self.task_id):
             self._load_demo_data(demo_id, int(task_id))
