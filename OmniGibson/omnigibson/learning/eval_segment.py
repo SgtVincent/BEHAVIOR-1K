@@ -46,6 +46,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from omnigibson.learning.eval_subtask_reset import SubTaskEvaluator, get_demo_ids_for_task
+from omnigibson.learning.pose_perturbator import PosePerturbator
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.eval_diagnostics import (
     ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS,
@@ -175,6 +176,105 @@ def _normalize_frame_duration(raw: Any) -> Tuple[int, int]:
     if len(vals) < 2:
         raise ValueError(f"Invalid frame_duration: {raw}")
     return int(vals[0]), int(vals[-1])
+
+
+# Pose perturbation level presets (matched to eval_custom.py PosePerturbator defaults as "medium").
+_PERTURB_LEVEL_PRESETS: Dict[str, Dict[str, Tuple[float, float]]] = {
+    "small": {
+        "x_range": (-0.05, +0.05),
+        "y_range": (-0.05, +0.05),
+        "theta_range": (-np.pi / 24, +np.pi / 24),
+    },
+    "medium": {
+        "x_range": (-0.15, +0.15),
+        "y_range": (-0.15, +0.15),
+        "theta_range": (-np.pi / 12, +np.pi / 12),
+    },
+    "large": {
+        "x_range": (-0.30, +0.30),
+        "y_range": (-0.30, +0.30),
+        "theta_range": (-np.pi / 6, +np.pi / 6),
+    },
+}
+
+
+def _build_pose_perturbator(cfg: DictConfig, log: logging.Logger) -> Optional[PosePerturbator]:
+    """Build a PosePerturbator from config, or return None if disabled.
+
+    Reads:
+      - perturb_pose (bool): master switch, default False
+      - perturb_level (str): "small" | "medium" | "large", default "medium"
+      - perturb_pose_seed (int): numpy RNG seed for reproducible perturbations
+      - perturb_x_range / perturb_y_range / perturb_theta_range (optional 2-element):
+        explicit per-axis overrides that take precedence over perturb_level
+    """
+    if not bool(cfg.get("perturb_pose", False)):
+        return None
+
+    level = str(cfg.get("perturb_level", "medium")).lower()
+    if level not in _PERTURB_LEVEL_PRESETS:
+        log.warning("Unknown perturb_level=%r, falling back to 'medium'", level)
+        level = "medium"
+    preset = _PERTURB_LEVEL_PRESETS[level]
+
+    x_range = tuple(cfg.get("perturb_x_range", preset["x_range"]))
+    y_range = tuple(cfg.get("perturb_y_range", preset["y_range"]))
+    theta_range = tuple(cfg.get("perturb_theta_range", preset["theta_range"]))
+
+    seed = cfg.get("perturb_pose_seed", None)
+    if seed is not None:
+        np.random.seed(int(seed))
+
+    return PosePerturbator(
+        log,
+        x_range=tuple(float(v) for v in x_range),
+        y_range=tuple(float(v) for v in y_range),
+        theta_range=tuple(float(v) for v in theta_range),
+    )
+
+
+def _apply_pose_perturbation(evaluator: SubTaskEvaluator, perturbator: PosePerturbator) -> Dict[str, Any]:
+    """Apply base-pose perturbation to the robot after a restore.
+
+    Returns a dict with the original and perturbed pose for logging / diagnostics.
+    """
+    robot = evaluator.robot
+    orig_pos, orig_quat = robot.get_position_orientation()
+    perturbed_pos, perturbed_quat = perturbator.perturb_robot_root_pose(
+        list(orig_pos), list(orig_quat)
+    )
+    robot.set_position_orientation(perturbed_pos, perturbed_quat)
+    # Re-stabilize after pose change so physics settles before rollout.
+    evaluator._stabilize_robot_post_restore(frame_idx=None)
+    return {
+        "original_position": [float(v) for v in orig_pos],
+        "original_orientation": [float(v) for v in orig_quat],
+        "perturbed_position": [float(v) for v in perturbed_pos],
+        "perturbed_orientation": [float(v) for v in perturbed_quat],
+    }
+
+
+def _resolve_rollout_start_frame(
+    cfg: DictConfig,
+    segment_start_frame: int,
+    log: logging.Logger,
+) -> int:
+    """Resolve the actual frame to restore from for rollout start.
+
+    If ``restore_frame_override`` is set (int), use that instead of the segment's
+    natural start frame. The subgoal predicates still come from the original
+    segment boundaries — only the rollout starting state changes.
+    """
+    override = cfg.get("restore_frame_override", None)
+    if override is None or str(override).lower() in ("none", "null", ""):
+        return int(segment_start_frame)
+    override_frame = int(override)
+    log.info(
+        "restore_frame_override: rollout will start at frame %d (original segment start: %d)",
+        override_frame,
+        segment_start_frame,
+    )
+    return override_frame
 
 
 def _to_numpy_image(x: Any) -> Optional[np.ndarray]:
@@ -410,6 +510,8 @@ def run_single_segment(
     dry_run: bool = False,
     segment_max_steps: Optional[int] = None,
     review_dir: Optional[Path] = None,
+    restore_frame_override: Optional[int] = None,
+    pose_perturbator: Optional[PosePerturbator] = None,
 ) -> Dict[str, Any]:
     segment, annotations = get_segment(evaluator, demo_id, segment_level, segment_idx)
     if segment is None:
@@ -418,6 +520,14 @@ def run_single_segment(
     start_frame, end_frame = segment["frame_duration"]
     segment_desc = segment.get(f"{segment_level}_description", ["unknown"])[0]
     evaluator.current_segment_metadata = dict(segment)
+
+    # Resolve the actual rollout start frame. Subgoal predicates are always
+    # defined by the original segment boundaries; restore_frame_override only
+    # changes the state from which the rollout begins.
+    rollout_start_frame = _resolve_rollout_start_frame(
+        evaluator.cfg, int(start_frame), logger
+    ) if restore_frame_override is None else int(restore_frame_override)
+    rollout_start_override_applied = rollout_start_frame != int(start_frame)
 
     # Keep demo-replay policies aligned with the restored segment start.
     if hasattr(evaluator.policy, "start_frame"):
@@ -438,7 +548,10 @@ def run_single_segment(
     logger.info(f"Evaluating segment level={segment_level} idx={segment_idx} / {segment_desc}")
     logger.info(f"Demo: {demo_id}")
     logger.info(f"Frames: {start_frame} - {end_frame}")
+    if rollout_start_override_applied:
+        logger.info(f"Rollout start (override): {rollout_start_frame}")
     logger.info(f"Success mode: {success_mode}")
+    logger.info(f"Pose perturbation: {'enabled' if pose_perturbator is not None else 'disabled'}")
     logger.info("=" * 60)
 
     ground_options = getattr(evaluator.env.task, "ground_goal_state_options", None)
@@ -591,9 +704,37 @@ def run_single_segment(
                 "review_artifacts": review_artifacts,
             }
 
-        # Segment rollout must start from the segment start frame, not the end frame used for target metric capture.
-        restored_rollout_start, _, _ = restore_and_eval_predicates(evaluator, start_frame)
+        # Rollout start frame: segment's natural start, or restore_frame_override.
+        # Subgoal predicates are always defined by the original segment boundaries.
+        restored_rollout_start, method_rollout_start, _ = restore_and_eval_predicates(
+            evaluator, rollout_start_frame
+        )
         restore_debug_rollout_start = _snapshot_restore_debug(evaluator)
+        pose_perturbation_info: Optional[Dict[str, Any]] = None
+        if restored_rollout_start and pose_perturbator is not None:
+            try:
+                pose_perturbation_info = _apply_pose_perturbation(evaluator, pose_perturbator)
+            except Exception as exc:
+                logger.error("Pose perturbation failed after restore: %s", exc)
+                return {
+                    "demo_id": demo_id,
+                    "segment_level": segment_level,
+                    "segment_idx": segment_idx,
+                    "segment_desc": segment_desc,
+                    "frame_duration": [int(start_frame), int(end_frame)],
+                    "rollout_start_frame": int(rollout_start_frame),
+                    "restore": {
+                        "start": _restore_entry(True, method_start, restore_debug_start_for_compare),
+                        "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
+                        "rollout_start": _restore_entry(True, method_rollout_start, restore_debug_rollout_start),
+                    },
+                    "pose_perturbation": {"error": str(exc)},
+                    "success_mode": str(success_mode),
+                    "effective_success_mode": "segment_predicates",
+                    "success": False,
+                    "result_type": "pose_perturbation_failed",
+                    "review_artifacts": review_artifacts,
+                }
         if not restored_rollout_start:
             return {
                 "demo_id": demo_id,
@@ -601,10 +742,11 @@ def run_single_segment(
                 "segment_idx": segment_idx,
                 "segment_desc": segment_desc,
                 "frame_duration": [int(start_frame), int(end_frame)],
+                "rollout_start_frame": int(rollout_start_frame),
                 "restore": {
                     "start": _restore_entry(False, method_start, restore_debug_rollout_start),
                     "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
-                    "rollout_start": _restore_entry(False, method_start, restore_debug_rollout_start),
+                    "rollout_start": _restore_entry(False, method_rollout_start, restore_debug_rollout_start),
                 },
                 "success_mode": str(success_mode),
                 "effective_success_mode": "segment_predicates",
@@ -619,11 +761,14 @@ def run_single_segment(
             "segment_idx": segment_idx,
             "segment_desc": segment_desc,
             "frame_duration": [int(start_frame), int(end_frame)],
+            "rollout_start_frame": int(rollout_start_frame),
+            "rollout_start_was_overridden": rollout_start_override_applied,
             "restore": {
                 "start": _restore_entry(True, method_start, restore_debug_start_for_compare),
                 "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
-                "rollout_start": _restore_entry(True, method_start, restore_debug_rollout_start),
+                "rollout_start": _restore_entry(True, method_rollout_start, restore_debug_rollout_start),
             },
+            "pose_perturbation": pose_perturbation_info,
             "success_mode": str(success_mode),
             "effective_success_mode": "segment_predicates",
             "predicate_spec": [
@@ -1051,6 +1196,34 @@ def run_single_segment(
         logger.info("Dry run mode - skipping rollout")
         return result
 
+    # Restore to the rollout start frame (segment start or restore_frame_override).
+    # Subgoal predicates were already computed from original start/end above.
+    restored_rollout_start, method_rollout_start, _ = restore_and_eval_predicates(
+        evaluator, rollout_start_frame
+    )
+    pose_perturbation_info: Optional[Dict[str, Any]] = None
+    if restored_rollout_start and pose_perturbator is not None:
+        try:
+            pose_perturbation_info = _apply_pose_perturbation(evaluator, pose_perturbator)
+        except Exception as exc:
+            logger.error("Pose perturbation failed after restore: %s", exc)
+            result["pose_perturbation"] = {"error": str(exc)}
+            result["success"] = False
+            result["result_type"] = "pose_perturbation_failed"
+            return result
+    if not restored_rollout_start:
+        result["rollout_start_frame"] = int(rollout_start_frame)
+        result["rollout_start_was_overridden"] = rollout_start_override_applied
+        result["restore"]["rollout_start"] = {"restored": False, "method": method_rollout_start}
+        result["success"] = False
+        result["result_type"] = "restore_failed_before_rollout"
+        return result
+
+    result["rollout_start_frame"] = int(rollout_start_frame)
+    result["rollout_start_was_overridden"] = rollout_start_override_applied
+    result["restore"]["rollout_start"] = {"restored": True, "method": method_rollout_start}
+    result["pose_perturbation"] = pose_perturbation_info
+
     evaluator.policy.reset()
     evaluator.obs = evaluator._preprocess_obs(evaluator._get_obs_for_policy())
 
@@ -1181,6 +1354,17 @@ def _reconfigure_for_segment(
     model_start_frame = sample.get("start_frame", sample.get("model.start_frame", None))
     model_end_frame = sample.get("end_frame", sample.get("model.end_frame", None))
 
+    # --- New Gate2 fields: restore frame override + pose perturbation ---
+    restore_frame_override = sample.get("restore_frame_override", cfg.get("restore_frame_override", None))
+    if restore_frame_override is not None and str(restore_frame_override).lower() in ("none", "null", ""):
+        restore_frame_override = None
+    elif restore_frame_override is not None:
+        restore_frame_override = int(restore_frame_override)
+    perturb_pose = bool(sample.get("perturb_pose", cfg.get("perturb_pose", False)))
+    perturb_level = sample.get("perturb_level", cfg.get("perturb_level", "medium"))
+    perturb_pose_seed = sample.get("perturb_pose_seed", cfg.get("perturb_pose_seed", None))
+    # ---------------------------------------------------------------------
+
     # Mutate cfg in place so existing helpers (e.g. run_single_segment) see the new values.
     cfg.demo_id = demo_id
     if task_id is not None:
@@ -1201,6 +1385,13 @@ def _reconfigure_for_segment(
         cfg.model.start_frame = int(model_start_frame)
     if model_end_frame is not None:
         cfg.model.end_frame = None if str(model_end_frame).lower() == "none" else int(model_end_frame)
+
+    # Propagate Gate2 fields onto cfg (idempotent for defaults).
+    cfg.restore_frame_override = restore_frame_override
+    cfg.perturb_pose = perturb_pose
+    cfg.perturb_level = str(perturb_level)
+    if perturb_pose_seed is not None:
+        cfg.perturb_pose_seed = int(perturb_pose_seed)
 
     # DemoActionReplayPolicy loads its parquet at construction time. When a
     # long-lived evaluator is reused across demos, reload policy data so actions
@@ -1270,6 +1461,10 @@ def _reconfigure_for_segment(
         "metrics_path": metrics_path,
         "review_dir": review_dir,
         "video_name": video_name,
+        "restore_frame_override": restore_frame_override,
+        "perturb_pose": perturb_pose,
+        "perturb_level": str(perturb_level),
+        "perturb_pose_seed": int(perturb_pose_seed) if perturb_pose_seed is not None else None,
     }
 
 
@@ -1288,6 +1483,10 @@ def run_segment_on_env(
     """
     ctx = _reconfigure_for_segment(evaluator, sample)
     cfg = evaluator.cfg
+
+    # Build pose perturbator from config (only when perturb_pose is True).
+    pose_perturbator = _build_pose_perturbator(cfg, logger)
+
     try:
         result = run_single_segment(
             evaluator=evaluator,
@@ -1298,6 +1497,8 @@ def run_segment_on_env(
             dry_run=ctx["dry_run"],
             segment_max_steps=ctx["segment_max_steps"],
             review_dir=ctx["review_dir"],
+            restore_frame_override=ctx["restore_frame_override"],
+            pose_perturbator=pose_perturbator,
         )
 
         result["task_name"] = ctx["task_name"]
@@ -1404,6 +1605,10 @@ def _build_sample_from_cli_config(config: DictConfig) -> Dict[str, Any]:
         "expected_skill": config.get("expected_skill", None),
         "model.start_frame": config.model.get("start_frame", None) if config.get("model", None) is not None else None,
         "model.end_frame": config.model.get("end_frame", None) if config.get("model", None) is not None else None,
+        "restore_frame_override": config.get("restore_frame_override", None),
+        "perturb_pose": bool(config.get("perturb_pose", False)),
+        "perturb_level": config.get("perturb_level", "medium"),
+        "perturb_pose_seed": config.get("perturb_pose_seed", None),
     }
 
 

@@ -78,3 +78,31 @@ force_rollout_even_if_pre_satisfied: false
 
 # Review-video safeguard: pad very short clips with duplicate final-state frames up to this estimate.
 review_video_min_meaningful_frames: 30
+
+# ---- Gate2: semantic handoff causal restore/replay options ----
+# Override the frame to restore from for rollout start.
+# When null (default), rollout starts at the segment's original start_frame.
+# When set to an integer, subgoal predicates are still defined by the original
+# segment boundaries, but the policy rollout begins from the overridden frame.
+# Use this to test whether an operation skill succeeds from a "wrong-mode"
+# move_to terminal state (e.g. a push-mode approach vs pick-mode approach).
+restore_frame_override: null
+
+# Whether to apply controlled base-pose perturbation after restore,
+# before rollout begins. Uses PosePerturbator (same pattern as eval_custom.py).
+perturb_pose: false
+
+# Perturbation magnitude preset. One of: small, medium, large.
+#   small:  ±0.05m xy, ±7.5° yaw
+#   medium: ±0.15m xy, ±15° yaw  (PosePerturbator default)
+#   large:  ±0.30m xy, ±30° yaw
+perturb_level: medium
+
+# Seed for reproducible pose perturbation. Null = non-deterministic.
+perturb_pose_seed: null
+
+# Explicit per-axis overrides (2-element lists). When set, these take
+# precedence over perturb_level.
+# perturb_x_range: [-0.15, 0.15]
+# perturb_y_range: [-0.15, 0.15]
+# perturb_theta_range: [-0.2618, 0.2618]  # ±15° in radians
