@@ -117,4 +117,18 @@ perturb_pose_seed: null
 #
 # Output is added to metrics JSON under the "handoff_outcome" key.
 # No impact on success / result_type — purely additive telemetry.
+#
+# Key sub-fields:
+#   - objects.<name>.rollout_start_live_* : live simulator pose right after
+#       restore (+ perturbation if enabled), before policy rollout begins
+#   - objects.<name>.rollout_start_vs_demo_start_pos_distance_m : drift
+#       between live restore and demo at the start frame
+#   - objects.<name>.rollout_start_vs_demo_end_pos_distance_m : how far
+#       the object is from its final demo pose at rollout start
+#   - pair_distances.<a>__to__<b>.rollout_start_live_distance_m : live
+#       object-object distance at rollout start
+#   - readiness.hang.* : hang-specific readiness signals including
+#       poster-in-gripper and poster-to-nail distance at rollout start
+#   - annotation_to_bddl_mapping : mapping from annotation object names
+#       (e.g. "poster_73") to BDDL instance names (e.g. "poster.n.01_1")
 compute_object_metrics: false

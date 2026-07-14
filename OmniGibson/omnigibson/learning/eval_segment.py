@@ -500,6 +500,109 @@ def _reconstruct_demo_task_info_object_poses(
     return None
 
 
+def _build_annotation_to_bddl_mapping(
+    evaluator: SubTaskEvaluator,
+    annotation_obj_names: List[str],
+    all_bddl_names: List[str],
+) -> Dict[str, str]:
+    """Build a best-effort mapping from annotation object names to BDDL instance names.
+
+    Strategy (in order of preference):
+      1. Exact match on name (e.g. ``"poster_73"`` == ``"poster_73"``)
+      2. Match via live object ``.name`` attribute of the wrapped USD object
+         (annotation often uses the raw USD name like ``"poster_73"`` while
+         BDDL uses ``"poster.n.01_1"``)
+      3. Match via entity ``.name`` / ``.bddl_name`` / ``.category`` attributes
+      4. Prefix match (BDDL name starts with annotation name + ``"."``)
+      5. Substring match (annotation name appears in BDDL name or vice versa)
+
+    Returns a dict ``{annotation_name: bddl_name}`` for every annotation name
+    that could be matched.
+    """
+    mapping: Dict[str, str] = {}
+    remaining = list(annotation_obj_names)
+
+    # --- Step 1: exact match ---
+    for a in list(remaining):
+        if a in all_bddl_names:
+            mapping[a] = a
+            remaining.remove(a)
+
+    if not remaining:
+        return mapping
+
+    # --- Step 2: match via live object .name ---
+    task = getattr(evaluator.env, "task", None)
+    obj_scope = getattr(task, "object_scope", None) if task is not None else None
+    if obj_scope is not None:
+        # Build reverse map: raw_object_name -> bddl_name
+        raw_to_bddl: Dict[str, str] = {}
+        for bddl_name, entity in obj_scope.items():
+            if entity is None:
+                continue
+            # Try wrapped_obj.name first (USD scene name like "poster_73")
+            obj = getattr(entity, "wrapped_obj", None)
+            if obj is not None:
+                raw_name = getattr(obj, "name", None)
+                if raw_name:
+                    raw_to_bddl[raw_name] = bddl_name
+                # Also try _name / prim path segments
+                prim = getattr(obj, "prim", None)
+                if prim is not None:
+                    prim_path = getattr(prim, "GetPrimPath", lambda: None)()
+                    if prim_path is not None:
+                        path_str = str(prim_path)
+                        last_seg = path_str.split("/")[-1]
+                        if last_seg and last_seg not in raw_to_bddl:
+                            raw_to_bddl[last_seg] = bddl_name
+            # Try entity-level name attributes
+            for attr in ("name", "bddl_name", "category"):
+                val = getattr(entity, attr, None)
+                if val and isinstance(val, str):
+                    if val not in raw_to_bddl:
+                        raw_to_bddl[val] = bddl_name
+
+        for a in list(remaining):
+            if a in raw_to_bddl:
+                mapping[a] = raw_to_bddl[a]
+                remaining.remove(a)
+
+    if not remaining:
+        return mapping
+
+    # --- Step 3: prefix match (annotation_name.bddl_suffix) ---
+    for a in list(remaining):
+        match = next(
+            (n for n in all_bddl_names if n.startswith(a + ".")),
+            None,
+        )
+        if match is not None:
+            mapping[a] = match
+            remaining.remove(a)
+
+    if not remaining:
+        return mapping
+
+    # --- Step 4: substring match (loosest) ---
+    for a in list(remaining):
+        # annotation substring of bddl
+        match = next(
+            (n for n in all_bddl_names if a.lower() in n.lower()),
+            None,
+        )
+        if match is None:
+            # bddl substring of annotation
+            match = next(
+                (n for n in all_bddl_names if n.lower().split(".")[0] in a.lower()),
+                None,
+            )
+        if match is not None:
+            mapping[a] = match
+            remaining.remove(a)
+
+    return mapping
+
+
 def _pos_distance(a: Dict[str, Any], b: Dict[str, Any]) -> Optional[float]:
     """Euclidean xyz distance between two object pose dicts."""
     try:
@@ -517,19 +620,24 @@ def _compute_handoff_object_metrics(
     rollout_start_frame: int,
     segment_end_frame: int,
     segment_start_frame: int,
+    rollout_start_live_poses: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Compute handoff-relevant object outcome metrics for the current segment.
 
     Extracts:
       * Per-segment annotation objects (from ``object_id``,
         ``manipulating_object_id``, ``target_object_id`` fields)
-      * Start-of-rollout and end-of-rollout live poses for those objects
-      * Demo-end reference poses (from parquet task_info when available)
-      * Pose distances: rollout_end vs demo_end, start vs end (displacement)
+      * Start-of-rollout LIVE poses (captured right after restore +
+        perturbation, before policy rollout) for those objects
+      * End-of-rollout live poses for those objects
+      * Demo-start / demo-end reference poses (from parquet task_info)
+      * Pose distances: rollout_start_live vs demo_start, rollout_start_live
+        vs demo_end, end vs demo_end, start vs end (displacement)
       * In-gripper flag changes
-      * Robot base pose at rollout start and end
+      * Robot base pose at rollout start (live) and end
       * Special pair distances (e.g. poster <-> wall_nail for hang) when
-        both objects are resolvable
+        both objects are resolvable, at start_live / end / demo_end
+      * Skill-specific readiness metrics (e.g. hang: poster held? poster near nail?)
 
     Returns a dict under ``handoff_outcome`` key, or ``None`` if disabled or
     the evaluator doesn't have the required data.
@@ -542,6 +650,7 @@ def _compute_handoff_object_metrics(
         "objects": {},
         "robot_base": {},
         "pair_distances": {},
+        "readiness": {},
         "notes": [],
     }
 
@@ -565,7 +674,7 @@ def _compute_handoff_object_metrics(
     if demo_end_poses is None:
         outcome["notes"].append("could not reconstruct demo_end_poses from task_info")
 
-    # --- Rollout-start reference poses from parquet ---
+    # --- Rollout-start reference poses from parquet (demo data at start frame) ---
     demo_start_poses = _reconstruct_demo_task_info_object_poses(evaluator, int(rollout_start_frame))
     if demo_start_poses is None:
         outcome["notes"].append("could not reconstruct rollout_start_poses from task_info")
@@ -587,17 +696,33 @@ def _compute_handoff_object_metrics(
     except Exception as exc:
         outcome["notes"].append(f"robot_base_end_pose_error: {exc}")
 
-    # Robot base at rollout start (from demo parquet task_info if available)
-    if demo_start_poses is not None:
+    # Robot base at rollout start (from LIVE rollout_start poses if available, else demo)
+    agent_key = None
+    if rollout_start_live_poses is not None:
+        agent_key = next(
+            (k for k in rollout_start_live_poses if k.startswith("agent")),
+            None,
+        )
+        if agent_key:
+            try:
+                outcome["robot_base"]["rollout_start_live_pos"] = rollout_start_live_poses[agent_key]["pos"]
+                cos_y = rollout_start_live_poses[agent_key]["ori_cos"][2]
+                sin_y = rollout_start_live_poses[agent_key]["ori_sin"][2]
+                outcome["robot_base"]["rollout_start_live_yaw"] = float(np.arctan2(sin_y, cos_y))
+            except Exception as exc:
+                outcome["notes"].append(f"robot_base_rollout_start_live_pose_error: {exc}")
+
+    # Fallback: robot base at rollout start from demo parquet task_info
+    if "rollout_start_live_pos" not in outcome["robot_base"] and demo_start_poses is not None:
         try:
-            agent_key = next(
+            agent_key_demo = next(
                 (k for k in demo_start_poses if k.startswith("agent")),
                 None,
             )
-            if agent_key:
-                outcome["robot_base"]["start_pos"] = demo_start_poses[agent_key]["pos"]
-                cos_y = demo_start_poses[agent_key]["ori_cos"][2]
-                sin_y = demo_start_poses[agent_key]["ori_sin"][2]
+            if agent_key_demo:
+                outcome["robot_base"]["start_pos"] = demo_start_poses[agent_key_demo]["pos"]
+                cos_y = demo_start_poses[agent_key_demo]["ori_cos"][2]
+                sin_y = demo_start_poses[agent_key_demo]["ori_sin"][2]
                 outcome["robot_base"]["start_yaw"] = float(np.arctan2(sin_y, cos_y))
         except Exception as exc:
             outcome["notes"].append(f"robot_base_start_pose_error: {exc}")
@@ -605,6 +730,8 @@ def _compute_handoff_object_metrics(
     # --- Per-object detailed metrics ---
     # Build the full set of object names from live poses AND demo data.
     all_obj_names_set = set(end_poses.keys()) if end_poses else set()
+    if rollout_start_live_poses:
+        all_obj_names_set.update(rollout_start_live_poses.keys())
     if demo_end_poses:
         all_obj_names_set.update(demo_end_poses.keys())
     if demo_start_poses:
@@ -617,17 +744,25 @@ def _compute_handoff_object_metrics(
             all_obj_names_set.update(k for k, v in obj_scope.items() if v is not None)
     all_obj_names: List[str] = sorted(all_obj_names_set)
 
-    annotation_obj_names = set()
+    # Build annotation -> bddl name mapping using improved multi-strategy approach
+    all_annotation_names: List[str] = []
     for vals in outcome["segment_object_ids"].values():
-        for v in vals:
-            # Try exact match first, then substring match.
-            matches = [n for n in all_obj_names if n == v or n.startswith(v + ".") or v in n]
-            annotation_obj_names.update(matches)
+        all_annotation_names.extend(vals)
+    all_annotation_names = list(dict.fromkeys(all_annotation_names))  # dedupe
+
+    annotation_to_bddl = _build_annotation_to_bddl_mapping(
+        evaluator, all_annotation_names, all_obj_names
+    )
+
+    annotation_obj_names = set(annotation_to_bddl.values())
 
     # Always include agent for context.
     agent_key = next((k for k in all_obj_names if k.startswith("agent")), None)
     if agent_key:
         annotation_obj_names.add(agent_key)
+
+    # Store the annotation->bddl mapping for traceability
+    outcome["annotation_to_bddl_mapping"] = annotation_to_bddl
 
     # Keep all annotation-matched objects, plus fill out with others for context.
     keep_names = sorted(annotation_obj_names)
@@ -637,7 +772,29 @@ def _compute_handoff_object_metrics(
     for obj_name in keep_names:
         obj_entry: Dict[str, Any] = {"from_annotation": obj_name in annotation_obj_names}
 
-        # End-of-rollout live pose
+        # --- Rollout-start LIVE pose (captured after restore + perturbation) ---
+        if rollout_start_live_poses and obj_name in rollout_start_live_poses:
+            rsp = rollout_start_live_poses[obj_name]
+            obj_entry["rollout_start_live_pos"] = rsp["pos"]
+            obj_entry["rollout_start_live_ori_cos"] = rsp["ori_cos"]
+            obj_entry["rollout_start_live_ori_sin"] = rsp["ori_sin"]
+            obj_entry["rollout_start_live_in_gripper_left"] = rsp["in_gripper_left"]
+            obj_entry["rollout_start_live_in_gripper_right"] = rsp["in_gripper_right"]
+            obj_entry["rollout_start_live_exists"] = rsp["exists"]
+
+            # Distance: rollout_start_live vs demo_start
+            if demo_start_poses and obj_name in demo_start_poses:
+                d = _pos_distance(rsp, demo_start_poses[obj_name])
+                if d is not None:
+                    obj_entry["rollout_start_vs_demo_start_pos_distance_m"] = d
+
+            # Distance: rollout_start_live vs demo_end
+            if demo_end_poses and obj_name in demo_end_poses:
+                d = _pos_distance(rsp, demo_end_poses[obj_name])
+                if d is not None:
+                    obj_entry["rollout_start_vs_demo_end_pos_distance_m"] = d
+
+        # --- End-of-rollout live pose ---
         if end_poses and obj_name in end_poses:
             ep = end_poses[obj_name]
             obj_entry["end_pos"] = ep["pos"]
@@ -647,7 +804,7 @@ def _compute_handoff_object_metrics(
             obj_entry["end_in_gripper_right"] = ep["in_gripper_right"]
             obj_entry["end_exists"] = ep["exists"]
 
-        # Demo-end pose
+        # --- Demo-end pose ---
         if demo_end_poses and obj_name in demo_end_poses:
             dp = demo_end_poses[obj_name]
             obj_entry["demo_end_pos"] = dp["pos"]
@@ -660,7 +817,7 @@ def _compute_handoff_object_metrics(
                 if d is not None:
                     obj_entry["end_vs_demo_end_pos_distance_m"] = d
 
-        # Rollout-start pose
+        # --- Rollout-start pose from demo (legacy field, from parquet task_info) ---
         if demo_start_poses and obj_name in demo_start_poses:
             sp = demo_start_poses[obj_name]
             obj_entry["start_pos"] = sp["pos"]
@@ -684,19 +841,23 @@ def _compute_handoff_object_metrics(
     objs = outcome["segment_object_ids"].get("object_id", [])
 
     for m in manip:
-        m_match = next(
-            (n for n in keep_names if n == m or n.startswith(m + ".") or m in n),
-            None,
-        )
+        m_match = annotation_to_bddl.get(m)
+        if m_match is None or m_match not in keep_names:
+            m_match = next(
+                (n for n in keep_names if n == m or n.startswith(m + ".") or m in n),
+                None,
+            )
         if m_match is None:
             continue
         for t in targets + objs:
             if t == m:
                 continue
-            t_match = next(
-                (n for n in keep_names if n == t or n.startswith(t + ".") or t in n),
-                None,
-            )
+            t_match = annotation_to_bddl.get(t)
+            if t_match is None or t_match not in keep_names:
+                t_match = next(
+                    (n for n in keep_names if n == t or n.startswith(t + ".") or t in n),
+                    None,
+                )
             if t_match is not None and (m_match, t_match) not in pair_specs:
                 pair_specs.append((m_match, t_match))
 
@@ -711,6 +872,12 @@ def _compute_handoff_object_metrics(
         pair_key = f"{a_name}__to__{b_name}"
         pair_entry: Dict[str, Any] = {"object_a": a_name, "object_b": b_name}
 
+        # Rollout-start LIVE distance
+        if rollout_start_live_poses and a_name in rollout_start_live_poses and b_name in rollout_start_live_poses:
+            d = _pos_distance(rollout_start_live_poses[a_name], rollout_start_live_poses[b_name])
+            if d is not None:
+                pair_entry["rollout_start_live_distance_m"] = d
+
         # End-of-rollout distance
         if end_poses and a_name in end_poses and b_name in end_poses:
             d = _pos_distance(end_poses[a_name], end_poses[b_name])
@@ -723,7 +890,7 @@ def _compute_handoff_object_metrics(
             if d is not None:
                 pair_entry["demo_end_distance_m"] = d
 
-        # Start-of-rollout distance
+        # Start-of-rollout distance (from demo)
         if demo_start_poses and a_name in demo_start_poses and b_name in demo_start_poses:
             d = _pos_distance(demo_start_poses[a_name], demo_start_poses[b_name])
             if d is not None:
@@ -731,7 +898,223 @@ def _compute_handoff_object_metrics(
 
         outcome["pair_distances"][pair_key] = pair_entry
 
+    # --- Skill-specific readiness metrics ---
+    _compute_readiness_metrics(
+        outcome=outcome,
+        rollout_start_live_poses=rollout_start_live_poses,
+        end_poses=end_poses,
+        demo_end_poses=demo_end_poses,
+        demo_start_poses=demo_start_poses,
+        segment_desc=seg_meta.get("desc", seg_meta.get("skill_desc", "")),
+        keep_names=keep_names,
+        picture_obj=picture_obj,
+        nail_obj=nail_obj,
+        pair_specs=pair_specs,
+        annotation_to_bddl=annotation_to_bddl,
+    )
+
     return outcome
+
+
+def _compute_readiness_metrics(
+    outcome: Dict[str, Any],
+    rollout_start_live_poses: Optional[Dict[str, Dict[str, Any]]],
+    end_poses: Optional[Dict[str, Dict[str, Any]]],
+    demo_end_poses: Optional[Dict[str, Dict[str, Any]]],
+    demo_start_poses: Optional[Dict[str, Dict[str, Any]]],
+    segment_desc: str,
+    keep_names: List[str],
+    picture_obj: Optional[str],
+    nail_obj: Optional[str],
+    pair_specs: List[Tuple[str, str]],
+    annotation_to_bddl: Dict[str, str],
+) -> None:
+    """Compute skill-specific readiness metrics and add them to outcome["readiness"].
+
+    Readiness metrics answer: at rollout_start, is the state ready for the
+    next skill to succeed?  This is the key signal for testing the semantic
+    handoff hypothesis — wrong-mode rollout starts should show low readiness
+    while clean starts should show high readiness.
+
+    Currently supported skills:
+      * **hang** (picture/poster + nail/wall):
+          - poster held in any gripper at rollout_start_live
+          - poster-to-nail distance at rollout_start_live
+          - comparison to demo_end reference distances
+
+    The function is fully defensive — any missing data produces partial
+    results with notes, never crashes.
+    """
+    readiness: Dict[str, Any] = {
+        "skill": str(segment_desc) if segment_desc else "unknown",
+        "available": False,
+        "notes": [],
+    }
+
+    desc_lower = str(segment_desc).lower()
+
+    # --- Hang readiness: poster held + poster near nail ---
+    is_hang = "hang" in desc_lower or (picture_obj is not None and nail_obj is not None)
+
+    if is_hang:
+        hang_readiness: Dict[str, Any] = {}
+        has_any = False
+
+        # Find poster/picture object and nail/wall object
+        poster = picture_obj
+        nail = nail_obj
+
+        if poster is None:
+            readiness["notes"].append("hang_readiness: no poster/picture object found")
+        if nail is None:
+            readiness["notes"].append("hang_readiness: no nail/wall object found")
+
+        if poster is not None:
+            # --- Gripper check: is the poster held at rollout start? ---
+            if rollout_start_live_poses and poster in rollout_start_live_poses:
+                rsp = rollout_start_live_poses[poster]
+                in_left = float(rsp.get("in_gripper_left", 0.0))
+                in_right = float(rsp.get("in_gripper_right", 0.0))
+                hang_readiness["rollout_start_live_poster_in_gripper_left"] = in_left
+                hang_readiness["rollout_start_live_poster_in_gripper_right"] = in_right
+                hang_readiness["rollout_start_live_poster_in_any_gripper"] = bool(
+                    in_left > 0.5 or in_right > 0.5
+                )
+                has_any = True
+
+            # End-of-rollout gripper check
+            if end_poses and poster in end_poses:
+                ep = end_poses[poster]
+                in_left = float(ep.get("in_gripper_left", 0.0))
+                in_right = float(ep.get("in_gripper_right", 0.0))
+                hang_readiness["end_poster_in_gripper_left"] = in_left
+                hang_readiness["end_poster_in_gripper_right"] = in_right
+                hang_readiness["end_poster_in_any_gripper"] = bool(
+                    in_left > 0.5 or in_right > 0.5
+                )
+                has_any = True
+
+            # Demo-end gripper check (reference: poster should be on wall, not in gripper)
+            if demo_end_poses and poster in demo_end_poses:
+                dp = demo_end_poses[poster]
+                in_left = float(dp.get("in_gripper_left", 0.0))
+                in_right = float(dp.get("in_gripper_right", 0.0))
+                hang_readiness["demo_end_poster_in_gripper_left"] = in_left
+                hang_readiness["demo_end_poster_in_gripper_right"] = in_right
+                has_any = True
+
+        if poster is not None and nail is not None:
+            # --- Poster-to-nail distance at rollout start (live) ---
+            pair_key = f"{poster}__to__{nail}"
+            if pair_key in outcome.get("pair_distances", {}):
+                pd = outcome["pair_distances"][pair_key]
+                if "rollout_start_live_distance_m" in pd:
+                    hang_readiness["rollout_start_live_poster_to_nail_distance_m"] = pd["rollout_start_live_distance_m"]
+                    has_any = True
+                if "end_distance_m" in pd:
+                    hang_readiness["end_poster_to_nail_distance_m"] = pd["end_distance_m"]
+                    has_any = True
+                if "demo_end_distance_m" in pd:
+                    hang_readiness["demo_end_poster_to_nail_distance_m"] = pd["demo_end_distance_m"]
+                    has_any = True
+
+            # --- Readiness score (hang) ---
+            # A state is "hang-ready" if:
+            #   1. poster is held in any gripper
+            #   2. poster is reasonably close to the nail (< ~0.5m)
+            # Both conditions must be true for a clean hang start.
+            poster_held = hang_readiness.get("rollout_start_live_poster_in_any_gripper")
+            poster_nail_dist = hang_readiness.get("rollout_start_live_poster_to_nail_distance_m")
+
+            if poster_held is not None and poster_nail_dist is not None:
+                hang_readiness["rollout_start_live_is_hang_ready"] = bool(
+                    poster_held and poster_nail_dist < 0.5
+                )
+                hang_readiness["rollout_start_live_hang_readiness_reason"] = (
+                    f"poster_held={poster_held}, poster_nail_dist={poster_nail_dist:.3f}m"
+                )
+                has_any = True
+
+        if has_any:
+            readiness["hang"] = hang_readiness
+            readiness["available"] = True
+        else:
+            readiness["notes"].append("hang_readiness: insufficient data to compute any hang metrics")
+
+    # --- Generic pick/place readiness: manipulated object held? target within reach? ---
+    is_pick = "pick" in desc_lower
+    is_place = "place" in desc_lower or "put" in desc_lower
+
+    if is_pick or is_place:
+        pick_readiness: Dict[str, Any] = {}
+        has_any = False
+
+        # Find manipulating object from annotation
+        manip_objs = outcome.get("segment_object_ids", {}).get("manipulating_object_id", [])
+        target_objs = outcome.get("segment_object_ids", {}).get("target_object_id", [])
+        if not manip_objs:
+            manip_objs = outcome.get("segment_object_ids", {}).get("object_id", [])[:1]
+
+        manip_bddl = None
+        if manip_objs:
+            manip_bddl = annotation_to_bddl.get(manip_objs[0])
+            if manip_bddl is None or manip_bddl not in keep_names:
+                # Fallback: search
+                manip_bddl = next(
+                    (n for n in keep_names if n == manip_objs[0] or n.startswith(manip_objs[0] + ".")),
+                    None,
+                )
+
+        if manip_bddl is not None:
+            # Is the manipulated object in gripper at rollout start?
+            if rollout_start_live_poses and manip_bddl in rollout_start_live_poses:
+                rsp = rollout_start_live_poses[manip_bddl]
+                in_left = float(rsp.get("in_gripper_left", 0.0))
+                in_right = float(rsp.get("in_gripper_right", 0.0))
+                pick_readiness["rollout_start_live_obj_in_gripper_left"] = in_left
+                pick_readiness["rollout_start_live_obj_in_gripper_right"] = in_right
+                pick_readiness["rollout_start_live_obj_in_any_gripper"] = bool(
+                    in_left > 0.5 or in_right > 0.5
+                )
+                pick_readiness["manipulated_object"] = manip_bddl
+                has_any = True
+
+            if end_poses and manip_bddl in end_poses:
+                ep = end_poses[manip_bddl]
+                pick_readiness["end_obj_in_any_gripper"] = bool(
+                    float(ep.get("in_gripper_left", 0.0)) > 0.5
+                    or float(ep.get("in_gripper_right", 0.0)) > 0.5
+                )
+                has_any = True
+
+        # Target distance (if target object is known)
+        if manip_bddl and target_objs:
+            target_bddl = annotation_to_bddl.get(target_objs[0])
+            if target_bddl is None or target_bddl not in keep_names:
+                target_bddl = next(
+                    (n for n in keep_names if n == target_objs[0] or n.startswith(target_objs[0] + ".")),
+                    None,
+                )
+            if target_bddl is not None:
+                pick_readiness["target_object"] = target_bddl
+                if rollout_start_live_poses and manip_bddl in rollout_start_live_poses and target_bddl in rollout_start_live_poses:
+                    d = _pos_distance(
+                        rollout_start_live_poses[manip_bddl],
+                        rollout_start_live_poses[target_bddl],
+                    )
+                    if d is not None:
+                        pick_readiness["rollout_start_live_obj_to_target_distance_m"] = d
+                        has_any = True
+
+        if has_any:
+            readiness[f"{segment_desc if segment_desc else 'pick_place'}"] = pick_readiness
+            if not readiness["available"]:
+                readiness["available"] = True
+        else:
+            readiness["notes"].append(f"{desc_lower}_readiness: insufficient data")
+
+    # Always attach readiness dict even if empty (for schema stability)
+    outcome["readiness"] = readiness
 
 
 def _attach_handoff_outcome(
@@ -742,11 +1125,17 @@ def _attach_handoff_outcome(
     rollout_start_frame: int,
     segment_end_frame: int,
     segment_start_frame: int,
+    rollout_start_live_poses: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Attach handoff_outcome to a result dict, handling errors gracefully.
 
     Safe wrapper intended to be called right before return statements.
     On any exception, the result dict is returned unchanged with a note.
+
+    Args:
+        rollout_start_live_poses: Live object poses captured right after
+            restore + perturbation, before policy rollout begins.
+            If None, falls back to demo-derived start poses only.
     """
     if not bool(evaluator.cfg.get("compute_object_metrics", False)):
         return result
@@ -758,6 +1147,7 @@ def _attach_handoff_outcome(
             rollout_start_frame=rollout_start_frame,
             segment_end_frame=segment_end_frame,
             segment_start_frame=segment_start_frame,
+            rollout_start_live_poses=rollout_start_live_poses,
         )
         if outcome is not None:
             result["handoff_outcome"] = outcome
@@ -1245,6 +1635,14 @@ def run_single_segment(
                 "review_artifacts": review_artifacts,
             }
 
+        # --- Capture live object poses at rollout start (after restore + perturb) ---
+        rollout_start_live_poses: Optional[Dict[str, Dict[str, Any]]] = None
+        if bool(evaluator.cfg.get("compute_object_metrics", False)):
+            try:
+                rollout_start_live_poses = _get_object_scope_pose_map(evaluator)
+            except Exception as exc:
+                logger.warning("Failed to capture rollout_start_live_poses: %s", exc)
+
         result = {
             "demo_id": demo_id,
             "segment_level": segment_level,
@@ -1593,6 +1991,7 @@ def run_single_segment(
         _attach_handoff_outcome(
             result, evaluator, segment, segment_level,
             rollout_start_frame, end_frame, start_frame,
+            rollout_start_live_poses=rollout_start_live_poses,
         )
         return result
 
@@ -1719,6 +2118,14 @@ def run_single_segment(
     result["restore"]["rollout_start"] = {"restored": True, "method": method_rollout_start}
     result["pose_perturbation"] = pose_perturbation_info
 
+    # --- Capture live object poses at rollout start (after restore + perturb) ---
+    rollout_start_live_poses: Optional[Dict[str, Dict[str, Any]]] = None
+    if bool(evaluator.cfg.get("compute_object_metrics", False)):
+        try:
+            rollout_start_live_poses = _get_object_scope_pose_map(evaluator)
+        except Exception as exc:
+            logger.warning("Failed to capture rollout_start_live_poses: %s", exc)
+
     evaluator.policy.reset()
     evaluator.obs = evaluator._preprocess_obs(evaluator._get_obs_for_policy())
 
@@ -1807,6 +2214,7 @@ def run_single_segment(
     _attach_handoff_outcome(
         result, evaluator, segment, segment_level,
         rollout_start_frame, end_frame, start_frame,
+        rollout_start_live_poses=rollout_start_live_poses,
     )
 
     return result
