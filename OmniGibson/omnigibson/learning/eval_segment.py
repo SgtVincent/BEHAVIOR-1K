@@ -345,7 +345,7 @@ def _get_object_scope_pose_map(evaluator: SubTaskEvaluator) -> Optional[Dict[str
         except Exception:
             agent = None
 
-    from omnigibson.states import Pose
+    from omnigibson.object_states import Pose
     import omnigibson.utils.transform_utils as T
 
     poses: Dict[str, Dict[str, Any]] = {}
