@@ -277,6 +277,496 @@ def _resolve_rollout_start_frame(
     return override_frame
 
 
+# ---------------------------------------------------------------------------
+# Gate2: handoff object-level outcome metrics
+# ---------------------------------------------------------------------------
+#
+# These helpers extract per-object metrics at rollout start / end and compare
+# against the demo segment's end frame.  This is primarily useful when
+# ``success_mode`` falls back to ``state_match`` (e.g. for ``hang`` / ``pick``
+# where BDDL predicate_subgoal is empty), because state_match only checks
+# robot trajectory and cannot distinguish "wrong-mode" starts from genuine
+# skill success.
+#
+# Design notes:
+#   * Metrics are opt-in via ``compute_object_metrics`` config (default false).
+#   * We read live object poses from ``evaluator.env.task.object_scope``
+#     (BDDLEntity objects wrapping USD scene objects) — no parsing of the
+#     flattened task_info vector needed at runtime.
+#   * Demo-end poses are reconstructed from the demo parquet's
+#     ``observation.task_info`` column when available; the object order matches
+#     ``object_scope`` iteration order (see ``BehaviorTask._get_obs``).
+#   * All helpers are defensive: on any error they return ``None`` or a
+#     partial dict with an ``error`` field rather than aborting the eval.
+# ---------------------------------------------------------------------------
+
+def _flatten_annotation_strings(raw: Any) -> List[str]:
+    """Flatten nested list/tuple/str annotation fields into a clean list of strings."""
+    out: List[str] = []
+    if raw is None:
+        return out
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            out.extend(_flatten_annotation_strings(item))
+    else:
+        s = str(raw).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _get_object_scope_pose_map(evaluator: SubTaskEvaluator) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Read current pose + in-gripper for every object in the task's object_scope.
+
+    Returns a dict keyed by bddl instance name (e.g. ``"picture.n.01_1"``):
+        {
+            "pos": [x, y, z],
+            "ori_cos": [roll_cos, pitch_cos, yaw_cos],
+            "ori_sin": [roll_sin, pitch_sin, yaw_sin],
+            "in_gripper_left": float,
+            "in_gripper_right": float,
+            "exists": bool,
+        }
+    Returns ``None`` if object_scope is unavailable.
+    """
+    import torch as th
+
+    task = getattr(evaluator.env, "task", None)
+    if task is None:
+        return None
+    obj_scope = getattr(task, "object_scope", None)
+    if obj_scope is None or not obj_scope:
+        return None
+
+    agent = getattr(task, "agent", None)
+    if agent is None:
+        try:
+            agent = task.get_agent(env=evaluator.env)
+        except Exception:
+            agent = None
+
+    from omnigibson.states import Pose
+    import omnigibson.utils.transform_utils as T
+
+    poses: Dict[str, Dict[str, Any]] = {}
+    for bddl_name, entity in obj_scope.items():
+        if entity is None:
+            continue
+        # BDDLEntity wraps a USD object via .wrapped_obj or similar attribute.
+        obj = getattr(entity, "wrapped_obj", None)
+        if obj is None:
+            # Some scopes may directly hold USD objects.
+            obj = entity if hasattr(entity, "states") else None
+        if obj is None:
+            continue
+
+        try:
+            exists = bool(getattr(obj, "exists", True))
+        except Exception:
+            exists = True
+
+        entry: Dict[str, Any] = {
+            "pos": [0.0, 0.0, 0.0],
+            "ori_cos": [0.0, 0.0, 0.0],
+            "ori_sin": [0.0, 0.0, 0.0],
+            "in_gripper_left": 0.0,
+            "in_gripper_right": 0.0,
+            "exists": exists,
+        }
+
+        if not exists or not hasattr(obj, "states") or Pose not in obj.states:
+            poses[bddl_name] = entry
+            continue
+
+        try:
+            pos, quat = obj.states[Pose].get_value()
+            if hasattr(pos, "detach"):
+                pos = pos.detach().cpu()
+            if hasattr(quat, "detach"):
+                quat = quat.detach().cpu()
+            pos_arr = np.asarray(pos, dtype=np.float32).reshape(-1)
+            quat_arr = np.asarray(quat, dtype=np.float32).reshape(-1)
+            rpy = T.quat2euler(th.as_tensor(quat_arr))
+            rpy = rpy.numpy() if hasattr(rpy, "numpy") else np.asarray(rpy)
+            entry["pos"] = [float(v) for v in pos_arr[:3]]
+            entry["ori_cos"] = [float(v) for v in np.cos(rpy)]
+            entry["ori_sin"] = [float(v) for v in np.sin(rpy)]
+        except Exception:
+            pass
+
+        # In-gripper detection (only for non-agent objects)
+        if agent is not None and obj is not agent:
+            try:
+                for arm in ("left", "right"):
+                    try:
+                        grasping = float(agent.is_grasping(arm=arm, candidate_obj=obj))
+                    except Exception:
+                        grasping = 0.0
+                    entry[f"in_gripper_{arm}"] = grasping
+            except Exception:
+                pass
+
+        poses[bddl_name] = entry
+
+    return poses if poses else None
+
+
+def _reconstruct_demo_task_info_object_poses(
+    evaluator: SubTaskEvaluator,
+    frame_idx: int,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Reconstruct per-object pose info from a demo parquet's task_info vector.
+
+    The ``observation.task_info`` column in the parquet is the flattened output
+    of ``BehaviorTask._get_obs``, which iterates over ``object_scope`` in a
+    fixed order and writes (for each object):
+        - ``_real``: 1 float
+        - ``_pos``: 3 floats
+        - ``_ori_cos``: 3 floats
+        - ``_ori_sin``: 3 floats
+        - ``_in_gripper_left``: 1 float  (non-agent objects only)
+        - ``_in_gripper_right``: 1 float (non-agent objects only)
+
+    We use the *live* object_scope ordering to parse the flat vector.
+    """
+    if evaluator.current_demo_data is None:
+        return None
+
+    frame_idx = int(max(0, min(frame_idx, len(evaluator.current_demo_data) - 1)))
+    try:
+        task_info_raw = evaluator.current_demo_data.iloc[frame_idx].get("observation.task_info")
+    except Exception:
+        task_info_raw = None
+
+    if task_info_raw is None:
+        return None
+
+    try:
+        task_info = np.asarray(task_info_raw, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+
+    # Get the ordered list of object names from live object_scope.
+    task = getattr(evaluator.env, "task", None)
+    obj_scope = getattr(task, "object_scope", None) if task is not None else None
+    if obj_scope is None or not obj_scope:
+        return None
+
+    obj_names = [name for name, ent in obj_scope.items() if ent is not None]
+    if not obj_names:
+        return None
+
+    base_per_obj = 1 + 3 + 3 + 3  # real + pos + ori_cos + ori_sin = 10
+    n_objs = len(obj_names)
+
+    def _parse(task_info_vec: np.ndarray, has_gripper: bool) -> Optional[Dict[str, Dict[str, Any]]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        offset = 0
+        for i, name in enumerate(obj_names):
+            size = base_per_obj
+            if i > 0 and has_gripper:
+                size += 2  # in_gripper_left + in_gripper_right
+            if offset + size > len(task_info_vec):
+                return None
+            real_v = float(task_info_vec[offset])
+            pos = [float(task_info_vec[offset + 1 + j]) for j in range(3)]
+            ori_cos = [float(task_info_vec[offset + 4 + j]) for j in range(3)]
+            ori_sin = [float(task_info_vec[offset + 7 + j]) for j in range(3)]
+            entry: Dict[str, Any] = {
+                "pos": pos,
+                "ori_cos": ori_cos,
+                "ori_sin": ori_sin,
+                "exists": real_v > 0.5,
+                "in_gripper_left": 0.0,
+                "in_gripper_right": 0.0,
+            }
+            if i > 0 and has_gripper:
+                entry["in_gripper_left"] = float(task_info_vec[offset + base_per_obj])
+                entry["in_gripper_right"] = float(task_info_vec[offset + base_per_obj + 1])
+            out[name] = entry
+            offset += size
+        return out
+
+    # Try both layouts; prefer the one that uses the full vector.
+    result_with_gripper = _parse(task_info, has_gripper=True)
+    used_with_gripper = base_per_obj + (n_objs - 1) * (base_per_obj + 2) if n_objs > 0 else 0
+    result_without_gripper = _parse(task_info, has_gripper=False)
+    used_without_gripper = n_objs * base_per_obj
+
+    if result_with_gripper is not None and used_with_gripper <= len(task_info):
+        return result_with_gripper
+    if result_without_gripper is not None and used_without_gripper <= len(task_info):
+        return result_without_gripper
+    return None
+
+
+def _pos_distance(a: Dict[str, Any], b: Dict[str, Any]) -> Optional[float]:
+    """Euclidean xyz distance between two object pose dicts."""
+    try:
+        pa = np.asarray(a["pos"], dtype=np.float32)
+        pb = np.asarray(b["pos"], dtype=np.float32)
+        return float(np.linalg.norm(pa - pb))
+    except Exception:
+        return None
+
+
+def _compute_handoff_object_metrics(
+    evaluator: SubTaskEvaluator,
+    segment: Dict[str, Any],
+    segment_level: str,
+    rollout_start_frame: int,
+    segment_end_frame: int,
+    segment_start_frame: int,
+) -> Optional[Dict[str, Any]]:
+    """Compute handoff-relevant object outcome metrics for the current segment.
+
+    Extracts:
+      * Per-segment annotation objects (from ``object_id``,
+        ``manipulating_object_id``, ``target_object_id`` fields)
+      * Start-of-rollout and end-of-rollout live poses for those objects
+      * Demo-end reference poses (from parquet task_info when available)
+      * Pose distances: rollout_end vs demo_end, start vs end (displacement)
+      * In-gripper flag changes
+      * Robot base pose at rollout start and end
+      * Special pair distances (e.g. poster <-> wall_nail for hang) when
+        both objects are resolvable
+
+    Returns a dict under ``handoff_outcome`` key, or ``None`` if disabled or
+    the evaluator doesn't have the required data.
+    """
+    if not bool(evaluator.cfg.get("compute_object_metrics", False)):
+        return None
+
+    outcome: Dict[str, Any] = {
+        "segment_object_ids": {},
+        "objects": {},
+        "robot_base": {},
+        "pair_distances": {},
+        "notes": [],
+    }
+
+    # --- Collect object ids from annotation ---
+    seg_meta: Dict[str, Any] = dict(segment)
+    for key in ("object_id", "manipulating_object_id", "target_object_id"):
+        vals = _flatten_annotation_strings(seg_meta.get(key))
+        outcome["segment_object_ids"][key] = vals
+
+    # --- Read live poses at end of rollout (current state) ---
+    end_poses = None
+    try:
+        end_poses = _get_object_scope_pose_map(evaluator)
+    except Exception as exc:
+        outcome["notes"].append(f"error reading live end_poses: {exc}")
+    if end_poses is None:
+        outcome["notes"].append("could not read live end_poses from object_scope")
+
+    # --- Demo-end reference poses from parquet ---
+    demo_end_poses = _reconstruct_demo_task_info_object_poses(evaluator, int(segment_end_frame))
+    if demo_end_poses is None:
+        outcome["notes"].append("could not reconstruct demo_end_poses from task_info")
+
+    # --- Rollout-start reference poses from parquet ---
+    demo_start_poses = _reconstruct_demo_task_info_object_poses(evaluator, int(rollout_start_frame))
+    if demo_start_poses is None:
+        outcome["notes"].append("could not reconstruct rollout_start_poses from task_info")
+
+    # --- Robot base pose at end of rollout (from proprio) ---
+    try:
+        from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
+
+        proprio = evaluator._get_current_proprio_state()
+        if proprio is not None:
+            robot_pos_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("robot_pos", None)
+            robot_yaw_slice = PROPRIOCEPTION_INDICES["R1Pro"].get("robot_2d_ori", None)
+            if robot_pos_slice is not None:
+                outcome["robot_base"]["end_pos"] = [
+                    float(v) for v in proprio[robot_pos_slice]
+                ]
+            if robot_yaw_slice is not None:
+                outcome["robot_base"]["end_yaw"] = float(proprio[robot_yaw_slice][0])
+    except Exception as exc:
+        outcome["notes"].append(f"robot_base_end_pose_error: {exc}")
+
+    # Robot base at rollout start (from demo parquet task_info if available)
+    if demo_start_poses is not None:
+        try:
+            agent_key = next(
+                (k for k in demo_start_poses if k.startswith("agent")),
+                None,
+            )
+            if agent_key:
+                outcome["robot_base"]["start_pos"] = demo_start_poses[agent_key]["pos"]
+                cos_y = demo_start_poses[agent_key]["ori_cos"][2]
+                sin_y = demo_start_poses[agent_key]["ori_sin"][2]
+                outcome["robot_base"]["start_yaw"] = float(np.arctan2(sin_y, cos_y))
+        except Exception as exc:
+            outcome["notes"].append(f"robot_base_start_pose_error: {exc}")
+
+    # --- Per-object detailed metrics ---
+    # Build the full set of object names from live poses AND demo data.
+    all_obj_names_set = set(end_poses.keys()) if end_poses else set()
+    if demo_end_poses:
+        all_obj_names_set.update(demo_end_poses.keys())
+    if demo_start_poses:
+        all_obj_names_set.update(demo_start_poses.keys())
+    # Also pull from object_scope directly as a fallback.
+    task = getattr(evaluator.env, "task", None)
+    if task is not None:
+        obj_scope = getattr(task, "object_scope", None)
+        if obj_scope:
+            all_obj_names_set.update(k for k, v in obj_scope.items() if v is not None)
+    all_obj_names: List[str] = sorted(all_obj_names_set)
+
+    annotation_obj_names = set()
+    for vals in outcome["segment_object_ids"].values():
+        for v in vals:
+            # Try exact match first, then substring match.
+            matches = [n for n in all_obj_names if n == v or n.startswith(v + ".") or v in n]
+            annotation_obj_names.update(matches)
+
+    # Always include agent for context.
+    agent_key = next((k for k in all_obj_names if k.startswith("agent")), None)
+    if agent_key:
+        annotation_obj_names.add(agent_key)
+
+    # Keep all annotation-matched objects, plus fill out with others for context.
+    keep_names = sorted(annotation_obj_names)
+    other_names = [n for n in sorted(all_obj_names) if n not in keep_names]
+    keep_names += other_names[: min(5, len(other_names))]
+
+    for obj_name in keep_names:
+        obj_entry: Dict[str, Any] = {"from_annotation": obj_name in annotation_obj_names}
+
+        # End-of-rollout live pose
+        if end_poses and obj_name in end_poses:
+            ep = end_poses[obj_name]
+            obj_entry["end_pos"] = ep["pos"]
+            obj_entry["end_ori_cos"] = ep["ori_cos"]
+            obj_entry["end_ori_sin"] = ep["ori_sin"]
+            obj_entry["end_in_gripper_left"] = ep["in_gripper_left"]
+            obj_entry["end_in_gripper_right"] = ep["in_gripper_right"]
+            obj_entry["end_exists"] = ep["exists"]
+
+        # Demo-end pose
+        if demo_end_poses and obj_name in demo_end_poses:
+            dp = demo_end_poses[obj_name]
+            obj_entry["demo_end_pos"] = dp["pos"]
+            obj_entry["demo_end_in_gripper_left"] = dp["in_gripper_left"]
+            obj_entry["demo_end_in_gripper_right"] = dp["in_gripper_right"]
+
+            # Pose distance (rollout end vs demo end)
+            if end_poses and obj_name in end_poses:
+                d = _pos_distance(end_poses[obj_name], dp)
+                if d is not None:
+                    obj_entry["end_vs_demo_end_pos_distance_m"] = d
+
+        # Rollout-start pose
+        if demo_start_poses and obj_name in demo_start_poses:
+            sp = demo_start_poses[obj_name]
+            obj_entry["start_pos"] = sp["pos"]
+            obj_entry["start_in_gripper_left"] = sp["in_gripper_left"]
+            obj_entry["start_in_gripper_right"] = sp["in_gripper_right"]
+
+            # Displacement during rollout (start -> end)
+            if end_poses and obj_name in end_poses:
+                d = _pos_distance(end_poses[obj_name], sp)
+                if d is not None:
+                    obj_entry["rollout_displacement_m"] = d
+
+        outcome["objects"][obj_name] = obj_entry
+
+    # --- Useful pair distances ---
+    pair_specs: List[Tuple[str, str]] = []
+
+    # Infer pairs from annotation objects.
+    manip = outcome["segment_object_ids"].get("manipulating_object_id", [])
+    targets = outcome["segment_object_ids"].get("target_object_id", [])
+    objs = outcome["segment_object_ids"].get("object_id", [])
+
+    for m in manip:
+        m_match = next(
+            (n for n in keep_names if n == m or n.startswith(m + ".") or m in n),
+            None,
+        )
+        if m_match is None:
+            continue
+        for t in targets + objs:
+            if t == m:
+                continue
+            t_match = next(
+                (n for n in keep_names if n == t or n.startswith(t + ".") or t in n),
+                None,
+            )
+            if t_match is not None and (m_match, t_match) not in pair_specs:
+                pair_specs.append((m_match, t_match))
+
+    # Heuristic pair for hang: any "picture"/"poster" + any "nail"/"hook"/"wall".
+    picture_obj = next((n for n in keep_names if "picture" in n.lower() or "poster" in n.lower()), None)
+    nail_obj = next((n for n in keep_names if "nail" in n.lower() or "hook" in n.lower() or "wall" in n.lower()), None)
+    if picture_obj and nail_obj and (picture_obj, nail_obj) not in pair_specs:
+        pair_specs.append((picture_obj, nail_obj))
+        outcome["notes"].append("added hang-style pair: picture_obj + wall/nail_obj")
+
+    for a_name, b_name in pair_specs:
+        pair_key = f"{a_name}__to__{b_name}"
+        pair_entry: Dict[str, Any] = {"object_a": a_name, "object_b": b_name}
+
+        # End-of-rollout distance
+        if end_poses and a_name in end_poses and b_name in end_poses:
+            d = _pos_distance(end_poses[a_name], end_poses[b_name])
+            if d is not None:
+                pair_entry["end_distance_m"] = d
+
+        # Demo-end distance
+        if demo_end_poses and a_name in demo_end_poses and b_name in demo_end_poses:
+            d = _pos_distance(demo_end_poses[a_name], demo_end_poses[b_name])
+            if d is not None:
+                pair_entry["demo_end_distance_m"] = d
+
+        # Start-of-rollout distance
+        if demo_start_poses and a_name in demo_start_poses and b_name in demo_start_poses:
+            d = _pos_distance(demo_start_poses[a_name], demo_start_poses[b_name])
+            if d is not None:
+                pair_entry["start_distance_m"] = d
+
+        outcome["pair_distances"][pair_key] = pair_entry
+
+    return outcome
+
+
+def _attach_handoff_outcome(
+    result: Dict[str, Any],
+    evaluator: SubTaskEvaluator,
+    segment: Dict[str, Any],
+    segment_level: str,
+    rollout_start_frame: int,
+    segment_end_frame: int,
+    segment_start_frame: int,
+) -> Dict[str, Any]:
+    """Attach handoff_outcome to a result dict, handling errors gracefully.
+
+    Safe wrapper intended to be called right before return statements.
+    On any exception, the result dict is returned unchanged with a note.
+    """
+    if not bool(evaluator.cfg.get("compute_object_metrics", False)):
+        return result
+    try:
+        outcome = _compute_handoff_object_metrics(
+            evaluator=evaluator,
+            segment=segment,
+            segment_level=segment_level,
+            rollout_start_frame=rollout_start_frame,
+            segment_end_frame=segment_end_frame,
+            segment_start_frame=segment_start_frame,
+        )
+        if outcome is not None:
+            result["handoff_outcome"] = outcome
+    except Exception as exc:
+        logger.warning("Failed to compute handoff object metrics: %s", exc)
+        result["handoff_outcome"] = {"error": str(exc), "objects": {}}
+    return result
+
+
 def _to_numpy_image(x: Any) -> Optional[np.ndarray]:
     if x is None:
         return None
@@ -1099,6 +1589,11 @@ def run_single_segment(
             result["predicate_trace"] = trace_history
         result["success"] = success
         result["result_type"] = result_type
+        # Gate2: attach object-level outcome metrics (opt-in, no-op when disabled).
+        _attach_handoff_outcome(
+            result, evaluator, segment, segment_level,
+            rollout_start_frame, end_frame, start_frame,
+        )
         return result
 
     restored_start, method_start, s_start = restore_and_eval_predicates(evaluator, start_frame)
@@ -1308,6 +1803,12 @@ def run_single_segment(
     result["success"] = success
     result["result_type"] = result_type
 
+    # Gate2: attach object-level outcome metrics (opt-in, no-op when disabled).
+    _attach_handoff_outcome(
+        result, evaluator, segment, segment_level,
+        rollout_start_frame, end_frame, start_frame,
+    )
+
     return result
 
 
@@ -1363,6 +1864,8 @@ def _reconfigure_for_segment(
     perturb_pose = bool(sample.get("perturb_pose", cfg.get("perturb_pose", False)))
     perturb_level = sample.get("perturb_level", cfg.get("perturb_level", "medium"))
     perturb_pose_seed = sample.get("perturb_pose_seed", cfg.get("perturb_pose_seed", None))
+    # --- Gate2 object metrics ---
+    compute_object_metrics = bool(sample.get("compute_object_metrics", cfg.get("compute_object_metrics", False)))
     # ---------------------------------------------------------------------
 
     # Mutate cfg in place so existing helpers (e.g. run_single_segment) see the new values.
@@ -1392,6 +1895,7 @@ def _reconfigure_for_segment(
     cfg.perturb_level = str(perturb_level)
     if perturb_pose_seed is not None:
         cfg.perturb_pose_seed = int(perturb_pose_seed)
+    cfg.compute_object_metrics = compute_object_metrics
 
     # DemoActionReplayPolicy loads its parquet at construction time. When a
     # long-lived evaluator is reused across demos, reload policy data so actions
@@ -1465,6 +1969,7 @@ def _reconfigure_for_segment(
         "perturb_pose": perturb_pose,
         "perturb_level": str(perturb_level),
         "perturb_pose_seed": int(perturb_pose_seed) if perturb_pose_seed is not None else None,
+        "compute_object_metrics": compute_object_metrics,
     }
 
 
@@ -1609,6 +2114,7 @@ def _build_sample_from_cli_config(config: DictConfig) -> Dict[str, Any]:
         "perturb_pose": bool(config.get("perturb_pose", False)),
         "perturb_level": config.get("perturb_level", "medium"),
         "perturb_pose_seed": config.get("perturb_pose_seed", None),
+        "compute_object_metrics": bool(config.get("compute_object_metrics", False)),
     }
 
 

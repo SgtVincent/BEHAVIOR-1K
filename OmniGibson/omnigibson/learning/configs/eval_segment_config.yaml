@@ -106,3 +106,15 @@ perturb_pose_seed: null
 # perturb_x_range: [-0.15, 0.15]
 # perturb_y_range: [-0.15, 0.15]
 # perturb_theta_range: [-0.2618, 0.2618]  # ±15° in radians
+
+# ---- Gate2: object-level outcome metrics ----
+# When true, compute per-object pose / in-gripper / pair-distance metrics
+# at rollout start/end and compare against the demo segment end.
+# This is useful for skills where predicate_subgoal is empty and the
+# evaluator falls back to state_match (e.g. hang, pick), because
+# state_match only checks robot trajectory and cannot distinguish
+# wrong-mode starts from genuine skill success.
+#
+# Output is added to metrics JSON under the "handoff_outcome" key.
+# No impact on success / result_type — purely additive telemetry.
+compute_object_metrics: false
