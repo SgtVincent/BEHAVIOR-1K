@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
@@ -9,10 +10,7 @@ import numpy as np
 
 # Ensure the repo root is on the path so imports resolve when running tests
 # standalone (e.g.  python -m pytest ...)
-sys.path.insert(
-    0,
-    "/mnt/bn/behavior-data-hl/chenjunting/repo/BEHAVIOR-1K/OmniGibson",
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from omnigibson.learning.utils.skill_completion import (
     check_skill_completed,
@@ -21,7 +19,11 @@ from omnigibson.learning.utils.skill_completion import (
     check_skill_completed_rollout,
     _apply_object_bindings,
 )
-from omnigibson.learning.utils.segment_predicate_eval import SegmentPredicate
+from omnigibson.learning.utils.segment_predicate_eval import (
+    SegmentPredicate,
+    build_template_predicates,
+)
+from omnigibson.learning.utils.segment_skill_metric_registry import get_skill_metric_entry
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +155,57 @@ class TestGetSkillObjectBindings(unittest.TestCase):
         self.assertEqual(bindings["unary_target"], "microwave_001")
 
 
+class TestPlaceMetricRegistry(unittest.TestCase):
+    PLACE_SKILLS = (
+        "place in",
+        "place on",
+        "insert",
+        "place under",
+        "place on next to",
+        "place in next to",
+    )
+
+    def test_place_release_is_diagnostic_not_primary(self):
+        for skill in self.PLACE_SKILLS:
+            with self.subTest(skill=skill):
+                entry = get_skill_metric_entry(skill)
+                self.assertIsNotNone(entry)
+                self.assertNotIn("grasped", [metric.get("name") for metric in entry["metrics"]])
+                self.assertEqual(
+                    [metric.get("name") for metric in entry.get("diagnostic_metrics", [])],
+                    ["grasped"],
+                )
+
+    def test_compound_roles_are_distinct_and_labeled(self):
+        env = _make_mock_env()
+        segment = {
+            "skill_description": ["place on next to"],
+            "object_id": [["apple", "table", "vase"]],
+            "manipulating_object_id": "apple",
+        }
+        specs, debug = build_template_predicates("skill", segment, env)
+        self.assertEqual([spec.args for spec in specs], [["apple", "table"], ["apple", "vase"]])
+        self.assertEqual(
+            [spec.params["semantic_role"] for spec in specs],
+            ["support_ontop", "neighbor_nextto"],
+        )
+        self.assertEqual(debug["resolved_object_roles"]["support_target"], "table")
+        self.assertEqual(debug["resolved_object_roles"]["neighbor_target"], "vase")
+        self.assertEqual(specs[0].diagnostic_specs[0].params["semantic_role"], "release_state")
+
+    def test_compound_missing_neighbor_does_not_degrade_to_support_only(self):
+        env = _make_mock_env()
+        segment = {
+            "skill_description": ["place on next to"],
+            "object_id": [["apple", "table"]],
+            "manipulating_object_id": "apple",
+        }
+        specs, debug = build_template_predicates("skill", segment, env)
+        self.assertEqual(specs, [])
+        self.assertIsNone(debug["resolved_object_roles"]["neighbor_target"])
+        self.assertEqual(debug["missing_template_roles"][0]["role"], "neighbor_target")
+
+
 class TestCheckSkillCompleted(unittest.TestCase):
     def test_unknown_skill(self):
         env = _make_mock_env()
@@ -197,8 +250,29 @@ class TestCheckSkillCompleted(unittest.TestCase):
         self.assertFalse(result["completed"])
         self.assertEqual(result["result_type"], "predicate_unsatisfied")
 
-    def test_place_in_satisfied(self):
+    def test_place_in_satisfied_while_grasped_is_diagnostic(self):
         apple = _make_mock_object("apple", state_values={"Inside": lambda other: True})
+        env = _make_mock_env(
+            objects={"apple": apple, "bowl": MagicMock()},
+            robot_grasping={"right": True},
+        )
+        result = check_skill_completed(
+            env,
+            "place in",
+            object_bindings={"obj": "apple", "dst_or_target": "bowl"},
+        )
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["result_type"], "predicate_satisfied")
+        trace = result["metrics"]["trace"]
+        self.assertEqual([item["predicate"] for item in trace], ["inside(apple,bowl)"])
+        auxiliary = result["metrics"]["trace_summary"]["auxiliary_diagnostics"]
+        self.assertEqual(len(auxiliary), 1)
+        self.assertEqual(auxiliary[0]["predicate"], "grasped(agent,apple)")
+        self.assertFalse(auxiliary[0]["contributes_to_success"])
+        self.assertFalse(auxiliary[0]["satisfied"])
+
+    def test_place_in_fails_on_primary_relation_even_when_released(self):
+        apple = _make_mock_object("apple", state_values={"Inside": lambda other: False})
         env = _make_mock_env(
             objects={"apple": apple, "bowl": MagicMock()},
             robot_grasping={"right": False},
@@ -208,8 +282,68 @@ class TestCheckSkillCompleted(unittest.TestCase):
             "place in",
             object_bindings={"obj": "apple", "dst_or_target": "bowl"},
         )
-        self.assertTrue(result["completed"])
-        self.assertEqual(result["result_type"], "predicate_satisfied")
+        self.assertFalse(result["completed"])
+        summary = result["metrics"]["trace_summary"]
+        self.assertEqual(summary["failed_primary_predicates"], ["inside(apple,bowl)"])
+        self.assertEqual(summary["unsatisfied_auxiliary_predicates"], [])
+
+    def test_compound_place_separates_support_neighbor_and_release(self):
+        apple = _make_mock_object(
+            "apple",
+            state_values={
+                "OnTop": lambda other: True,
+                "NextTo": lambda other: False,
+            },
+        )
+        env = _make_mock_env(
+            objects={"apple": apple, "table": MagicMock(), "vase": MagicMock()},
+            robot_grasping={"right": True},
+        )
+        result = check_skill_completed(
+            env,
+            "place on next to",
+            object_bindings={
+                "obj": "apple",
+                "support_target": "table",
+                "neighbor_target": "vase",
+            },
+        )
+        self.assertFalse(result["completed"])
+        trace = result["metrics"]["trace"]
+        self.assertEqual(
+            [(item["semantic_role"], item["satisfied"]) for item in trace],
+            [("support_ontop", True), ("neighbor_nextto", False)],
+        )
+        summary = result["metrics"]["trace_summary"]
+        self.assertEqual(summary["failed_primary_predicates"], ["nextto(apple,vase)"])
+        self.assertEqual(summary["unsatisfied_auxiliary_predicates"], ["grasped(agent,apple)"])
+
+    def test_compound_place_rejects_support_neighbor_collision(self):
+        env = _make_mock_env()
+        result = check_skill_completed(
+            env,
+            "place on next to",
+            object_bindings={
+                "obj": "apple",
+                "support_target": "table",
+                "neighbor_target": "table",
+            },
+        )
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["result_type"], "invalid_object_bindings")
+        self.assertEqual(len(result["metrics"]["invalid_role_bindings"]), 1)
+
+    def test_compound_place_rejects_missing_neighbor_binding(self):
+        env = _make_mock_env()
+        result = check_skill_completed(
+            env,
+            "place on next to",
+            object_bindings={"obj": "apple", "support_target": "table"},
+        )
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["result_type"], "invalid_object_bindings")
+        invalid = result["metrics"]["invalid_role_bindings"]
+        self.assertEqual(invalid[0]["reason"], "required_role_missing")
 
     def test_missing_object(self):
         env = _make_mock_env(objects={})

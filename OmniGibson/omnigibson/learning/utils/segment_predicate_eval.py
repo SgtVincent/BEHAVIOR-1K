@@ -321,6 +321,9 @@ class SegmentPredicate:
     desired: Optional[bool]
     source: str
     params: Dict[str, Any] = field(default_factory=dict)
+    # Auxiliary predicates are evaluated and emitted as nested diagnostics, but
+    # never participate in the primary success reduction.
+    diagnostic_specs: List["SegmentPredicate"] = field(default_factory=list)
 
 
 def _resolve_role_name(info: Dict[str, Optional[str]], role: str) -> Optional[str]:
@@ -331,6 +334,11 @@ def _resolve_role_name(info: Dict[str, Optional[str]], role: str) -> Optional[st
     src = info.get("src") if _is_object_like_name(info.get("src")) else None
     obj = info.get("obj") if _is_object_like_name(info.get("obj")) else None
     parsed_obj = info.get("parsed_obj") if _is_object_like_name(info.get("parsed_obj")) else None
+    support_target = parsed_a or dst or target
+    # A two-slot compound annotation does not identify a distinct neighbor. Do
+    # not silently reuse the support as the nextto target; surface the missing
+    # role instead so the metric is invalid rather than semantically wrong.
+    neighbor_target = parsed_b or (target if target != support_target else None)
     mapping = {
         "obj": obj,
         "src": src,
@@ -343,8 +351,8 @@ def _resolve_role_name(info: Dict[str, Optional[str]], role: str) -> Optional[st
         "target_or_dst": target or dst or obj,
         "src_or_target": src or target,
         "dst_or_target": dst or target,
-        "support_target": parsed_a or dst or target,
-        "neighbor_target": parsed_b or target,
+        "support_target": support_target,
+        "neighbor_target": neighbor_target,
         "payload_or_obj": parsed_obj,
         "target_obj": parsed_a or target,
         "target_obj_or_surface": parsed_a or target,
@@ -390,8 +398,25 @@ def build_template_predicates(
     if entry is None:
         return [], {"registry_missing": True}
 
+    resolved_object_roles = {
+        role: _resolve_role_name(info, role) for role in entry.get("object_roles", [])
+    }
+    invalid_role_bindings: List[Dict[str, Any]] = []
+    for role_group in entry.get("required_distinct_roles", []):
+        bindings = {role: resolved_object_roles.get(role) for role in role_group}
+        bound_values = [value for value in bindings.values() if value is not None]
+        if len(bound_values) == len(role_group) and len(set(bound_values)) != len(bound_values):
+            invalid_role_bindings.append(
+                {
+                    "reason": "required_roles_resolve_to_same_object",
+                    "roles": list(role_group),
+                    "bindings": bindings,
+                }
+            )
+
     specs: List[SegmentPredicate] = []
     missing_template_roles: List[Dict[str, Any]] = []
+    missing_diagnostic_roles: List[Dict[str, Any]] = []
     for metric in entry.get("metrics", []):
         metric_type = metric.get("type")
         if metric_type == "predicate":
@@ -416,7 +441,12 @@ def build_template_predicates(
                 args.append(resolved)
             if not valid:
                 continue
-            params = {"metric_family": entry["metric_family"], "success_rule": entry["success_rule"]}
+            params = {
+                "metric_family": entry["metric_family"],
+                "success_rule": entry["success_rule"],
+                "semantic_role": metric.get("semantic_role", metric["name"]),
+                "contributes_to_success": True,
+            }
             if bool(metric.get("optional", False)):
                 params["optional"] = True
             specs.append(
@@ -443,6 +473,8 @@ def build_template_predicates(
                 continue
             params = dict(metric)
             params["resolved_role_name"] = resolved
+            params["semantic_role"] = metric.get("semantic_role", metric_type)
+            params["contributes_to_success"] = True
             if metric_type in {"object_pose_match", "object_orientation_match"}:
                 captured = _capture_object_pose(env, resolved)
                 if captured is None:
@@ -477,6 +509,71 @@ def build_template_predicates(
                 )
             )
 
+    diagnostic_specs: List[SegmentPredicate] = []
+    for metric in entry.get("diagnostic_metrics", []):
+        metric_type = metric.get("type")
+        if metric_type != "predicate":
+            missing_diagnostic_roles.append(
+                {
+                    "metric_type": metric_type,
+                    "metric_name": metric.get("name", metric_type),
+                    "reason": "unsupported_diagnostic_metric_type",
+                }
+            )
+            continue
+        args = []
+        valid = True
+        for role in metric.get("args", []):
+            if role == "agent":
+                args.append("agent")
+                continue
+            resolved = _resolve_role_name(info, role)
+            if resolved is None:
+                valid = False
+                missing_diagnostic_roles.append(
+                    {
+                        "metric_type": metric_type,
+                        "metric_name": metric.get("name"),
+                        "role": role,
+                    }
+                )
+                break
+            args.append(resolved)
+        if not valid:
+            continue
+        diagnostic_specs.append(
+            SegmentPredicate(
+                metric_type="predicate",
+                name=metric["name"],
+                args=args,
+                desired=bool(metric["desired"]),
+                source="registry_diagnostic",
+                params={
+                    "metric_family": entry["metric_family"],
+                    "semantic_role": metric.get("semantic_role", metric["name"]),
+                    "contributes_to_success": False,
+                },
+            )
+        )
+
+    if invalid_role_bindings:
+        for invalid in invalid_role_bindings:
+            missing_template_roles.append(
+                {
+                    "metric_type": "binding",
+                    "metric_name": "required_distinct_roles",
+                    "role": "|".join(invalid["roles"]),
+                    **invalid,
+                }
+            )
+    if invalid_role_bindings or (entry.get("required_distinct_roles") and missing_template_roles):
+        # A partial compound relation must not degrade into a simpler metric.
+        specs = []
+    elif specs and diagnostic_specs:
+        # Keep auxiliary state nested under the first primary trace item. This
+        # preserves compatibility with callers that reduce the top-level trace.
+        specs[0].diagnostic_specs.extend(diagnostic_specs)
+
     task_prefixes = entry.get("task_aware_final_relation_task_prefixes") or []
     relation_predicate_names = entry.get("task_aware_final_relation_predicates") or []
     if relation_predicate_names and any(_task_activity_name(env).startswith(str(prefix)) for prefix in task_prefixes):
@@ -492,9 +589,35 @@ def build_template_predicates(
         "success_rule": entry["success_rule"],
         "combine_mode": entry.get("combine_mode", "all_of"),
         "require_unsatisfied_at_start": bool(entry.get("require_unsatisfied_at_start", True)),
+        "resolved_object_roles": resolved_object_roles,
+        "primary_metric_specs": [
+            {
+                "metric_type": spec.metric_type,
+                "name": spec.name,
+                "args": list(spec.args),
+                "desired": spec.desired,
+                "semantic_role": spec.params.get("semantic_role", spec.name),
+            }
+            for spec in specs
+        ],
+        "diagnostic_metric_specs": [
+            {
+                "metric_type": spec.metric_type,
+                "name": spec.name,
+                "args": list(spec.args),
+                "desired": spec.desired,
+                "semantic_role": spec.params.get("semantic_role", spec.name),
+                "contributes_to_success": False,
+            }
+            for spec in diagnostic_specs
+        ],
     }
     if missing_template_roles:
         debug["missing_template_roles"] = missing_template_roles
+    if missing_diagnostic_roles:
+        debug["missing_diagnostic_roles"] = missing_diagnostic_roles
+    if invalid_role_bindings:
+        debug["invalid_role_bindings"] = invalid_role_bindings
     debug.update(
         {
             key: value
@@ -506,6 +629,7 @@ def build_template_predicates(
                 "combine_mode",
                 "require_unsatisfied_at_start",
                 "metrics",
+                "diagnostic_metrics",
                 "object_roles",
             }
         }
@@ -649,9 +773,9 @@ def eval_segment_predicates(
 ) -> Tuple[Dict[str, bool], List[Dict[str, Any]]]:
     if not predicate_specs:
         return {}, []
-    trace: List[Dict[str, Any]] = []
-    truth: Dict[str, bool] = {}
-    for spec in predicate_specs:
+
+    def evaluate_spec(spec: SegmentPredicate, *, contributes_to_success: bool) -> Tuple[str, bool, Dict[str, Any]]:
+        semantic_role = spec.params.get("semantic_role", spec.name)
         try:
             if spec.metric_type == "predicate":
                 value, diagnostics = _og_eval_predicate_detailed(env, spec.name, spec.args)
@@ -661,23 +785,51 @@ def eval_segment_predicates(
                 value, diagnostics = _eval_geometry_metric_detailed(env, spec)
                 value = bool(value)
                 key = f"{spec.metric_type}({','.join(spec.args)})"
-            truth[key] = value
-            trace.append(
-                {
-                    "predicate": key,
-                    "metric_type": spec.metric_type,
-                    "desired": spec.desired,
-                    "value": value,
-                    "satisfied": value == bool(spec.desired),
-                    "source": spec.source,
-                    "params": spec.params,
-                    "diagnostics": diagnostics,
-                }
-            )
-        except Exception as e:
+            item = {
+                "predicate": key,
+                "metric_type": spec.metric_type,
+                "semantic_role": semantic_role,
+                "contributes_to_success": contributes_to_success,
+                "desired": spec.desired,
+                "value": value,
+                "satisfied": value == bool(spec.desired),
+                "source": spec.source,
+                "params": spec.params,
+                "diagnostics": diagnostics,
+            }
+        except Exception as error:
             key = f"{spec.name}({','.join(spec.args)})"
-            truth[key] = False
-            trace.append({"predicate": key, "metric_type": spec.metric_type, "desired": spec.desired, "value": False, "source": spec.source, "error": str(e)})
+            value = False
+            item = {
+                "predicate": key,
+                "metric_type": spec.metric_type,
+                "semantic_role": semantic_role,
+                "contributes_to_success": contributes_to_success,
+                "desired": spec.desired,
+                "value": False,
+                "satisfied": False,
+                "source": spec.source,
+                "params": spec.params,
+                "error": str(error),
+            }
+        return key, value, item
+
+    trace: List[Dict[str, Any]] = []
+    truth: Dict[str, bool] = {}
+    for spec in predicate_specs:
+        key, value, item = evaluate_spec(spec, contributes_to_success=True)
+        truth[key] = value
+        auxiliary_diagnostics: List[Dict[str, Any]] = []
+        for diagnostic_spec in spec.diagnostic_specs:
+            diagnostic_key, diagnostic_value, diagnostic_item = evaluate_spec(
+                diagnostic_spec,
+                contributes_to_success=False,
+            )
+            truth[diagnostic_key] = diagnostic_value
+            auxiliary_diagnostics.append(diagnostic_item)
+        if auxiliary_diagnostics:
+            item["auxiliary_diagnostics"] = auxiliary_diagnostics
+        trace.append(item)
     return truth, trace
 
 
@@ -705,6 +857,46 @@ def trace_has_missing_object(trace: Sequence[Dict[str, Any]]) -> bool:
     return bool(trace_missing_objects(trace))
 
 
+def trace_auxiliary_diagnostics(trace: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten non-gating predicate diagnostics nested in a primary trace."""
+
+    return [
+        diagnostic
+        for item in trace or []
+        for diagnostic in item.get("auxiliary_diagnostics", []) or []
+    ]
+
+
+def predicate_trace_satisfied(trace: Sequence[Dict[str, Any]], combine_mode: str = "all_of") -> bool:
+    """Reduce primary trace items only; nested diagnostics never gate success."""
+
+    if not trace or trace_has_missing_object(trace):
+        return False
+    if combine_mode == "any_of":
+        return any(item.get("satisfied", False) for item in trace)
+    return all(item.get("satisfied", False) for item in trace)
+
+
+def summarize_predicate_trace(
+    trace: Sequence[Dict[str, Any]],
+    combine_mode: str = "all_of",
+) -> Dict[str, Any]:
+    """Separate BDDL-aligned primary failures from auxiliary state telemetry."""
+
+    auxiliary = trace_auxiliary_diagnostics(trace)
+    return {
+        "primary_satisfied": predicate_trace_satisfied(trace, combine_mode),
+        "failed_primary_predicates": [
+            item.get("predicate") for item in trace or [] if not item.get("satisfied", False)
+        ],
+        "primary_semantic_roles": [item.get("semantic_role") for item in trace or []],
+        "auxiliary_diagnostics": auxiliary,
+        "unsatisfied_auxiliary_predicates": [
+            item.get("predicate") for item in auxiliary if not item.get("satisfied", False)
+        ],
+    }
+
+
 def predicate_window_satisfied(
     history: Sequence[List[Dict[str, Any]]],
     mode: str = "anytime",
@@ -721,14 +913,7 @@ def predicate_window_satisfied(
     if not history:
         return False
 
-    def step_trace_satisfied(step_trace: List[Dict[str, Any]]) -> bool:
-        if not step_trace or trace_has_missing_object(step_trace):
-            return False
-        if combine_mode == "any_of":
-            return any(item.get("satisfied", False) for item in step_trace)
-        return all(item.get("satisfied", False) for item in step_trace)
-
-    sat_flags = [step_trace_satisfied(step_trace) for step_trace in history]
+    sat_flags = [predicate_trace_satisfied(step_trace, combine_mode) for step_trace in history]
     if mode == "last_k":
         window = sat_flags[-max(last_k, 1):]
         return any(window)

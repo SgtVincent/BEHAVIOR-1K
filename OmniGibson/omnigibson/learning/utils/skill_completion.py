@@ -16,7 +16,9 @@ from omnigibson.learning.utils.segment_predicate_eval import (
     SegmentPredicate,
     build_template_predicates,
     eval_segment_predicates,
+    predicate_trace_satisfied,
     predicate_window_satisfied,
+    summarize_predicate_trace,
     trace_missing_objects,
 )
 from omnigibson.learning.utils.segment_skill_metric_registry import (
@@ -61,7 +63,8 @@ def check_skill_completed(
         - ``metrics`` (Dict): Detailed metric evaluation results.
         - ``result_type`` (str): One of
           ``predicate_satisfied``, ``predicate_unsatisfied``, ``missing_object``,
-          ``unknown_skill``, ``no_predicates``, ``env_terminated``.
+          ``invalid_object_bindings``, ``unknown_skill``, ``no_predicates``,
+          ``env_terminated``.
     """
     if not skill_desc:
         return {
@@ -100,6 +103,8 @@ def check_skill_completed(
                 "trace": eval_result["trace"],
                 "truth_map": eval_result["truth_map"],
                 "missing_objects": eval_result["missing_objects"],
+                "trace_summary": eval_result.get("trace_summary", {}),
+                "invalid_role_bindings": eval_result.get("invalid_role_bindings", []),
             },
             "result_type": eval_result["result_type"],
         }
@@ -150,23 +155,18 @@ def check_skill_completed(
     # 3. Determine satisfaction
     # ------------------------------------------------------------------
     combine_mode = str(entry.get("combine_mode", "all_of"))
-    if combine_mode == "any_of":
-        satisfied = any(item.get("satisfied", False) for item in trace)
-    else:
-        satisfied = all(item.get("satisfied", False) for item in trace) if trace else False
-
+    trace_summary = summarize_predicate_trace(trace, combine_mode)
+    satisfied = predicate_trace_satisfied(trace, combine_mode)
     result_type = "predicate_satisfied" if satisfied else "predicate_unsatisfied"
 
-    # Build a concise reason string
+    # Build a concise reason string from primary BDDL-aligned predicates only.
     if satisfied:
         reason = f"Skill '{skill_desc}' satisfied ({combine_mode})"
     else:
-        unsatisfied = [
-            item["predicate"]
-            for item in trace
-            if not item.get("satisfied", False)
-        ]
-        reason = f"Skill '{skill_desc}' not satisfied; failed: {unsatisfied}"
+        reason = (
+            f"Skill '{skill_desc}' not satisfied; failed primary predicates: "
+            f"{trace_summary['failed_primary_predicates']}"
+        )
 
     return {
         "completed": satisfied,
@@ -178,6 +178,7 @@ def check_skill_completed(
             "trace": trace,
             "truth_map": truth_map,
             "metric_debug": metric_debug,
+            "trace_summary": trace_summary,
         },
         "result_type": result_type,
     }
@@ -260,9 +261,11 @@ def eval_skill_metric(
         Dict with keys:
         - ``success`` (bool): Whether the metric entry is satisfied.
         - ``result_type`` (str): ``predicate_satisfied`` or ``predicate_unsatisfied``.
-        - ``trace`` (List[Dict]): Per-predicate evaluation trace.
+        - ``trace`` (List[Dict]): Primary per-predicate evaluation trace, with
+          any non-gating state checks nested under ``auxiliary_diagnostics``.
         - ``truth_map`` (Dict[str, bool]): Predicate-key -> bool mapping.
-        - ``missing_objects`` (List[str]): Names of missing objects, if any.
+        - ``missing_objects`` (List[str]): Names of missing primary objects, if any.
+        - ``trace_summary`` (Dict): Separate primary failures and auxiliary telemetry.
     """
     metrics = metric_entry.get("metrics", [])
     if not metrics:
@@ -272,6 +275,38 @@ def eval_skill_metric(
             "trace": [],
             "truth_map": {},
             "missing_objects": [],
+            "trace_summary": summarize_predicate_trace([]),
+        }
+
+    invalid_role_bindings = []
+    for role_group in metric_entry.get("required_distinct_roles", []):
+        bindings = {role: object_bindings.get(role) for role in role_group}
+        bound_values = [value for value in bindings.values() if value is not None]
+        if len(bound_values) != len(role_group):
+            invalid_role_bindings.append(
+                {
+                    "reason": "required_role_missing",
+                    "roles": list(role_group),
+                    "bindings": bindings,
+                }
+            )
+        elif len(set(bound_values)) != len(bound_values):
+            invalid_role_bindings.append(
+                {
+                    "reason": "required_roles_resolve_to_same_object",
+                    "roles": list(role_group),
+                    "bindings": bindings,
+                }
+            )
+    if invalid_role_bindings:
+        return {
+            "success": False,
+            "result_type": "invalid_object_bindings",
+            "trace": [],
+            "truth_map": {},
+            "missing_objects": [],
+            "invalid_role_bindings": invalid_role_bindings,
+            "trace_summary": summarize_predicate_trace([]),
         }
 
     # Import geometry helpers locally to avoid heavy imports at module load time.
@@ -283,82 +318,107 @@ def eval_skill_metric(
     import numpy as np
 
     specs: List[SegmentPredicate] = []
-    for metric in metrics:
-        metric_type = metric.get("type")
-        if metric_type == "predicate":
-            args = []
-            valid = True
-            for role in metric.get("args", []):
-                if role == "agent":
-                    args.append("agent")
+    diagnostic_specs: List[SegmentPredicate] = []
+    metric_groups = (
+        (metrics, specs, True),
+        (metric_entry.get("diagnostic_metrics", []), diagnostic_specs, False),
+    )
+    for metric_group, destination_specs, contributes_to_success in metric_groups:
+        for metric in metric_group:
+            metric_type = metric.get("type")
+            if metric_type == "predicate":
+                args = []
+                valid = True
+                for role in metric.get("args", []):
+                    if role == "agent":
+                        args.append("agent")
+                        continue
+                    resolved = object_bindings.get(role)
+                    if resolved is None:
+                        valid = False
+                        break
+                    args.append(resolved)
+                if not valid:
                     continue
-                resolved = object_bindings.get(role)
+                destination_specs.append(
+                    SegmentPredicate(
+                        metric_type="predicate",
+                        name=metric["name"],
+                        args=args,
+                        desired=bool(metric["desired"]),
+                        source="registry" if contributes_to_success else "registry_diagnostic",
+                        params={
+                            "metric_family": metric_entry.get("metric_family"),
+                            "success_rule": metric_entry.get("success_rule"),
+                            "semantic_role": metric.get("semantic_role", metric["name"]),
+                            "contributes_to_success": contributes_to_success,
+                        },
+                    )
+                )
+            elif contributes_to_success and metric_type in {
+                "base_to_object",
+                "face_object",
+                "object_pose_match",
+                "object_orientation_match",
+            }:
+                resolved = object_bindings.get(metric["role"])
                 if resolved is None:
-                    valid = False
-                    break
-                args.append(resolved)
-            if not valid:
-                continue
-            specs.append(
-                SegmentPredicate(
-                    metric_type="predicate",
-                    name=metric["name"],
-                    args=args,
-                    desired=bool(metric["desired"]),
-                    source="registry",
-                    params={
-                        "metric_family": metric_entry.get("metric_family"),
-                        "success_rule": metric_entry.get("success_rule"),
-                    },
-                )
-            )
-        elif metric_type in {"base_to_object", "face_object", "object_pose_match", "object_orientation_match"}:
-            resolved = object_bindings.get(metric["role"])
-            if resolved is None:
-                continue
-            params = dict(metric)
-            params["resolved_role_name"] = resolved
-            # Replicate the live-capture logic from build_template_predicates
-            # so geometry metrics have correct thresholds / reference poses.
-            if metric_type in {"object_pose_match", "object_orientation_match"}:
-                captured = _capture_object_pose(env, resolved)
-                if captured is None:
                     continue
-                params.update(captured)
-            elif metric_type == "base_to_object":
-                target_obj = _object_from_name(env, resolved)
-                if target_obj is None:
-                    continue
-                robot_base = _capture_robot_base(env)
-                target_pos, _ = target_obj.get_position_orientation()
-                dist = float(np.linalg.norm(np.asarray(robot_base["position"][:2]) - np.asarray(target_pos[:2])))
-                params["threshold"] = max(
-                    float(metric.get("min_threshold", 0.9)),
-                    dist + float(metric.get("margin", 0.35)),
+                params = dict(metric)
+                params["resolved_role_name"] = resolved
+                params["semantic_role"] = metric.get("semantic_role", metric_type)
+                params["contributes_to_success"] = True
+                # Replicate the live-capture logic from build_template_predicates
+                # so geometry metrics have correct thresholds / reference poses.
+                if metric_type in {"object_pose_match", "object_orientation_match"}:
+                    captured = _capture_object_pose(env, resolved)
+                    if captured is None:
+                        continue
+                    params.update(captured)
+                elif metric_type == "base_to_object":
+                    target_obj = _object_from_name(env, resolved)
+                    if target_obj is None:
+                        continue
+                    robot_base = _capture_robot_base(env)
+                    target_pos, _ = target_obj.get_position_orientation()
+                    dist = float(
+                        np.linalg.norm(np.asarray(robot_base["position"][:2]) - np.asarray(target_pos[:2]))
+                    )
+                    params["threshold"] = max(
+                        float(metric.get("min_threshold", 0.9)),
+                        dist + float(metric.get("margin", 0.35)),
+                    )
+                elif metric_type == "face_object":
+                    target_obj = _object_from_name(env, resolved)
+                    if target_obj is None:
+                        continue
+                    robot_base = _capture_robot_base(env)
+                    target_pos, _ = target_obj.get_position_orientation()
+                    vec = np.asarray(target_pos[:2]) - np.asarray(robot_base["position"][:2])
+                    target_yaw = float(np.arctan2(vec[1], vec[0]))
+                    end_err = abs(
+                        np.arctan2(
+                            np.sin(robot_base["yaw"] - target_yaw),
+                            np.cos(robot_base["yaw"] - target_yaw),
+                        )
+                    )
+                    params["threshold"] = max(
+                        float(metric.get("min_threshold", 0.4)),
+                        end_err + float(metric.get("yaw_margin", 0.2)),
+                    )
+                destination_specs.append(
+                    SegmentPredicate(
+                        metric_type=metric_type,
+                        name=metric_type,
+                        args=[resolved],
+                        desired=True,
+                        source="registry",
+                        params=params,
+                    )
                 )
-            elif metric_type == "face_object":
-                target_obj = _object_from_name(env, resolved)
-                if target_obj is None:
-                    continue
-                robot_base = _capture_robot_base(env)
-                target_pos, _ = target_obj.get_position_orientation()
-                vec = np.asarray(target_pos[:2]) - np.asarray(robot_base["position"][:2])
-                target_yaw = float(np.arctan2(vec[1], vec[0]))
-                end_err = abs(np.arctan2(np.sin(robot_base["yaw"] - target_yaw), np.cos(robot_base["yaw"] - target_yaw)))
-                params["threshold"] = max(
-                    float(metric.get("min_threshold", 0.4)),
-                    end_err + float(metric.get("yaw_margin", 0.2)),
-                )
-            specs.append(
-                SegmentPredicate(
-                    metric_type=metric_type,
-                    name=metric_type,
-                    args=[resolved],
-                    desired=True,
-                    source="registry",
-                    params=params,
-                )
-            )
+
+    if specs and diagnostic_specs:
+        specs[0].diagnostic_specs.extend(diagnostic_specs)
 
     if not specs:
         return {
@@ -367,6 +427,7 @@ def eval_skill_metric(
             "trace": [],
             "truth_map": {},
             "missing_objects": [],
+            "trace_summary": summarize_predicate_trace([]),
         }
 
     truth_map, trace = eval_segment_predicates(env, specs)
@@ -374,14 +435,12 @@ def eval_skill_metric(
     missing_names = [m["missing_object"] for m in missing]
 
     combine_mode = str(metric_entry.get("combine_mode", "all_of"))
+    trace_summary = summarize_predicate_trace(trace, combine_mode)
     if missing_names:
         success = False
         result_type = "missing_object"
-    elif combine_mode == "any_of":
-        success = any(item.get("satisfied", False) for item in trace)
-        result_type = "predicate_satisfied" if success else "predicate_unsatisfied"
     else:
-        success = all(item.get("satisfied", False) for item in trace) if trace else False
+        success = predicate_trace_satisfied(trace, combine_mode)
         result_type = "predicate_satisfied" if success else "predicate_unsatisfied"
 
     return {
@@ -390,6 +449,7 @@ def eval_skill_metric(
         "trace": trace,
         "truth_map": truth_map,
         "missing_objects": missing_names,
+        "trace_summary": trace_summary,
     }
 
 
@@ -527,6 +587,10 @@ def check_skill_completed_rollout(
     )
 
     diagnostics = {**proxy_diag, **video_diag}
+    final_trace_summary = summarize_predicate_trace(
+        trace_history[-1] if trace_history else [],
+        combine_mode,
+    )
 
     reason = (
         f"Skill '{skill_desc}' {result_type}"
@@ -546,6 +610,7 @@ def check_skill_completed_rollout(
             "window_satisfied": window_satisfied,
             "final_step": final_step,
             "max_steps": max_steps,
+            "final_trace_summary": final_trace_summary,
             **diagnostics,
         },
         "result_type": result_type,
@@ -589,6 +654,7 @@ def _apply_object_bindings(
                 desired=spec.desired,
                 source=spec.source,
                 params=dict(spec.params),
+                diagnostic_specs=_apply_object_bindings(spec.diagnostic_specs, bindings),
             )
         )
     return new_specs

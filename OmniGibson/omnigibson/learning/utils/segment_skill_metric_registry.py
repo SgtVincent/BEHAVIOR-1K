@@ -37,19 +37,25 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "place in": {
         "metric_family": "relation_place_inside",
         "object_roles": ["obj", "dst_or_target"],
-        "success_rule": "object is inside destination and released",
+        "success_rule": "object satisfies the full-task BDDL inside relation",
         "metrics": [
-            _pred("inside", ["obj", "dst_or_target"], True),
-            _pred("grasped", ["agent", "obj"], False),
+            _pred("inside", ["obj", "dst_or_target"], True, semantic_role="spatial_inside"),
+        ],
+        # Full-task BDDL placement goals encode the spatial relation, not robot release.
+        # Preserve grasp state as boundary / restore telemetry without making it a success gate.
+        "diagnostic_metrics": [
+            _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
         ],
     },
     "place on": {
         "metric_family": "relation_place_ontop",
         "object_roles": ["obj", "dst_or_target"],
-        "success_rule": "object is ontop destination and released",
+        "success_rule": "object satisfies the full-task BDDL ontop relation",
         "metrics": [
-            _pred("ontop", ["obj", "dst_or_target"], True),
-            _pred("grasped", ["agent", "obj"], False),
+            _pred("ontop", ["obj", "dst_or_target"], True, semantic_role="spatial_ontop"),
+        ],
+        "diagnostic_metrics": [
+            _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
         ],
     },
     "push to": {
@@ -78,12 +84,15 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "place on next to": {
         "metric_family": "relation_place_ontop_nextto",
         "object_roles": ["obj", "support_target", "neighbor_target"],
-        "success_rule": "object is ontop support, nextto neighbor, and released",
+        "success_rule": "object satisfies both full-task BDDL ontop and nextto relations",
         "metrics": [
-            _pred("ontop", ["obj", "support_target"], True),
-            _pred("nextto", ["obj", "neighbor_target"], True),
-            _pred("grasped", ["agent", "obj"], False),
+            _pred("ontop", ["obj", "support_target"], True, semantic_role="support_ontop"),
+            _pred("nextto", ["obj", "neighbor_target"], True, semantic_role="neighbor_nextto"),
         ],
+        "diagnostic_metrics": [
+            _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
+        ],
+        "required_distinct_roles": [["support_target", "neighbor_target"]],
     },
     "close door": {
         "metric_family": "articulation_close",
@@ -192,10 +201,12 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "insert": {
         "metric_family": "relation_place_inside",
         "object_roles": ["obj", "dst_or_target"],
-        "success_rule": "object is inside destination and released",
+        "success_rule": "object satisfies the full-task BDDL inside relation",
         "metrics": [
-            _pred("inside", ["obj", "dst_or_target"], True),
-            _pred("grasped", ["agent", "obj"], False),
+            _pred("inside", ["obj", "dst_or_target"], True, semantic_role="spatial_inside"),
+        ],
+        "diagnostic_metrics": [
+            _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
         ],
     },
     "sweep off": {
@@ -220,20 +231,25 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "place in next to": {
         "metric_family": "relation_place_inside_nextto",
         "object_roles": ["obj", "support_target", "neighbor_target"],
-        "success_rule": "object is inside container, nextto neighbor, and released",
+        "success_rule": "object satisfies both full-task BDDL inside and nextto relations",
         "metrics": [
-            _pred("inside", ["obj", "support_target"], True),
-            _pred("nextto", ["obj", "neighbor_target"], True),
-            _pred("grasped", ["agent", "obj"], False),
+            _pred("inside", ["obj", "support_target"], True, semantic_role="container_inside"),
+            _pred("nextto", ["obj", "neighbor_target"], True, semantic_role="neighbor_nextto"),
         ],
+        "diagnostic_metrics": [
+            _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
+        ],
+        "required_distinct_roles": [["support_target", "neighbor_target"]],
     },
     "place under": {
         "metric_family": "relation_under",
         "object_roles": ["obj", "dst_or_target"],
-        "success_rule": "object is under the target and released",
+        "success_rule": "object satisfies the full-task BDDL under relation",
         "metrics": [
-            _pred("under", ["obj", "dst_or_target"], True),
-            _pred("grasped", ["agent", "obj"], False),
+            _pred("under", ["obj", "dst_or_target"], True, semantic_role="spatial_under"),
+        ],
+        "diagnostic_metrics": [
+            _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
         ],
     },
     "pull tray": {
