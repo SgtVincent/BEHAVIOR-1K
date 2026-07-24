@@ -84,15 +84,23 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "place on next to": {
         "metric_family": "relation_place_ontop_nextto",
         "object_roles": ["obj", "support_target", "neighbor_target"],
-        "success_rule": "object satisfies both full-task BDDL ontop and nextto relations",
-        "metrics": [
-            _pred("ontop", ["obj", "support_target"], True, semantic_role="support_ontop"),
-            _pred("nextto", ["obj", "neighbor_target"], True, semantic_role="neighbor_nextto"),
-        ],
+        "success_rule": (
+            "object satisfies the bound full-task BDDL ontop and/or nextto subpredicates; "
+            "conjoin only the relations present for this annotation binding"
+        ),
+        # This label is heterogeneous in the challenge annotations. Some bound goals require
+        # both relations, some only one, and some contain no matching placement goal at all.
+        # Extract only directly matching goal atoms instead of imposing a global conjunction.
+        "metrics": [],
+        "task_goal_predicates": ["ontop", "nextto"],
+        "task_goal_match_roles": {
+            "ontop": {0: ["obj"], 1: ["support_target"]},
+            "nextto": {0: ["obj"], 1: ["neighbor_target"]},
+        },
+        "task_goal_replace_primary": True,
         "diagnostic_metrics": [
             _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
         ],
-        "required_distinct_roles": [["support_target", "neighbor_target"]],
     },
     "close door": {
         "metric_family": "articulation_close",
@@ -102,10 +110,15 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
         "success_min_consecutive": 3,
     },
     "sweep surface": {
-        "metric_family": "contact_effect_proxy",
+        "metric_family": "effect_goal_covered",
         "object_roles": ["obj", "target_obj_or_surface"],
-        "success_rule": "tool maintains contact with target surface during sweep",
-        "metrics": [_pred("touching", ["obj", "target_obj_or_surface"], True)],
+        "success_rule": "target surface satisfies its bound full-task BDDL covered goal subpredicate",
+        "metrics": [],
+        "task_goal_predicates": ["covered"],
+        "task_goal_match_roles": {
+            "covered": {0: ["target_obj_or_surface"]},
+        },
+        "task_goal_replace_primary": True,
         "require_unsatisfied_at_start": True,
     },
     "pour": {
@@ -165,10 +178,15 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
         "likely_false_positive_on_short_success": True,
     },
     "spray": {
-        "metric_family": "contact_effect_proxy",
+        "metric_family": "effect_goal_covered",
         "object_roles": ["obj", "target_obj"],
-        "success_rule": "sprayer must make contact with the target object during the segment",
-        "metrics": [_pred("touching", ["obj", "target_obj"], True)],
+        "success_rule": "spray target satisfies its bound full-task BDDL covered goal subpredicate",
+        "metrics": [],
+        "task_goal_predicates": ["covered"],
+        "task_goal_match_roles": {
+            "covered": {0: ["target_obj"]},
+        },
+        "task_goal_replace_primary": True,
         "require_unsatisfied_at_start": True,
     },
     "open lid": {
@@ -187,10 +205,13 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "release": {
         "metric_family": "grasp_release",
         "object_roles": ["obj"],
-        "success_rule": "object is no longer grasped",
+        "success_rule": "object is no longer grasped, unless a bound attach-task final relation supersedes release state",
         "metrics": [_pred("grasped", ["agent", "obj"], False)],
         "task_aware_final_relation_predicates": ["attached"],
         "task_aware_final_relation_task_prefixes": ["attach_"],
+        # The attach task terminates as soon as its BDDL attached goal is true, before
+        # the trailing release annotation. Do not conjoin a non-goal grasp predicate.
+        "task_goal_replace_primary": True,
     },
     "tip over": {
         "metric_family": "orientation_proxy",
@@ -231,15 +252,18 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "place in next to": {
         "metric_family": "relation_place_inside_nextto",
         "object_roles": ["obj", "support_target", "neighbor_target"],
-        "success_rule": "object satisfies both full-task BDDL inside and nextto relations",
-        "metrics": [
-            _pred("inside", ["obj", "support_target"], True, semantic_role="container_inside"),
-            _pred("nextto", ["obj", "neighbor_target"], True, semantic_role="neighbor_nextto"),
-        ],
+        "success_rule": "object satisfies the directly bound full-task BDDL inside subpredicate",
+        # All audited exact rows bind this annotation label to an inside-only task goal.
+        # The label's trailing "next to" text is not evidence for an extra success gate.
+        "metrics": [],
+        "task_goal_predicates": ["inside"],
+        "task_goal_match_roles": {
+            "inside": {0: ["obj"], 1: ["support_target"]},
+        },
+        "task_goal_replace_primary": True,
         "diagnostic_metrics": [
             _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
         ],
-        "required_distinct_roles": [["support_target", "neighbor_target"]],
     },
     "place under": {
         "metric_family": "relation_under",
@@ -274,26 +298,35 @@ SKILL_METRIC_REGISTRY: Dict[str, Dict[str, Any]] = {
     "hang": {
         "metric_family": "relation_attach",
         "object_roles": ["obj", "dst_or_target"],
-        "success_rule": "object is attached to hanging target and released",
+        "success_rule": "object satisfies the full-task BDDL attached relation",
         "metrics": [
-            _pred("attached", ["obj", "dst_or_target"], True),
-            _pred("grasped", ["agent", "obj"], False),
+            _pred("attached", ["obj", "dst_or_target"], True, semantic_role="attachment_relation"),
+        ],
+        "diagnostic_metrics": [
+            _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
         ],
     },
     "attach": {
         "metric_family": "relation_attach",
         "object_roles": ["obj", "dst_or_target"],
-        "success_rule": "object is attached to target and released",
+        "success_rule": "object satisfies the full-task BDDL attached relation",
         "metrics": [
-            _pred("attached", ["obj", "dst_or_target"], True),
-            _pred("grasped", ["agent", "obj"], False),
+            _pred("attached", ["obj", "dst_or_target"], True, semantic_role="attachment_relation"),
+        ],
+        "diagnostic_metrics": [
+            _pred("grasped", ["agent", "obj"], False, semantic_role="release_state"),
         ],
     },
     "wipe hard": {
-        "metric_family": "contact_effect_proxy",
+        "metric_family": "effect_goal_covered",
         "object_roles": ["obj", "target_obj"],
-        "success_rule": "cleaning tool contacts target object during wiping",
-        "metrics": [_pred("touching", ["obj", "target_obj"], True)],
+        "success_rule": "wipe target satisfies its bound full-task BDDL covered goal subpredicate",
+        "metrics": [],
+        "task_goal_predicates": ["covered"],
+        "task_goal_match_roles": {
+            "covered": {0: ["target_obj"]},
+        },
+        "task_goal_replace_primary": True,
     },
     "push tray": {
         "metric_family": "articulation_close_proxy",

@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from omnigibson.object_states import (
     AttachedTo,
+    Covered,
     Inside,
     NextTo,
     OnFire,
@@ -26,6 +27,13 @@ logger.setLevel(logging.INFO)
 MISSING_OBJECT_RESULT_TYPE = "metric_invalid_missing_object"
 
 _NON_OBJECT_ROLE_TOKENS = {"robot", "right", "left", "face", "low_level", ""}
+_TASK_GOAL_PREDICATE_ARITIES = {
+    "attached": 2,
+    "covered": 2,
+    "inside": 2,
+    "nextto": 2,
+    "ontop": 2,
+}
 
 
 def _flatten(x: Any) -> List[Any]:
@@ -191,27 +199,109 @@ def _generated_object_name_aliases(name: Optional[str]) -> List[str]:
     return out
 
 
+def _task_entity_aliases(env, name: Optional[str]) -> List[str]:
+    if not name:
+        return []
+    aliases = [str(name), *_generated_object_name_aliases(name)]
+    inst_to_name = env.scene.get_task_metadata("inst_to_name")
+    if isinstance(inst_to_name, dict):
+        for inst, scene_name in inst_to_name.items():
+            if str(name) in {str(inst), str(scene_name)}:
+                aliases.extend([str(inst), str(scene_name)])
+    return list(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def _same_task_entity(env, left: Optional[str], right: Optional[str]) -> bool:
+    if not left or not right:
+        return False
+    left_obj = _object_from_name(env, left)
+    right_obj = _object_from_name(env, right)
+    if left_obj is not None and right_obj is not None:
+        return left_obj is right_obj or getattr(left_obj, "name", None) == getattr(right_obj, "name", None)
+    return bool(set(_task_entity_aliases(env, left)) & set(_task_entity_aliases(env, right)))
+
+
+def _system_from_name(env, name: Optional[str]):
+    if not name:
+        return None
+    for candidate in _task_entity_aliases(env, name):
+        try:
+            system = env.scene.get_system(candidate, force_init=False)
+        except (AssertionError, KeyError, TypeError, ValueError):
+            continue
+        if system is not None:
+            return system
+    return None
+
+
 def _task_activity_name(env) -> str:
     return str(getattr(getattr(env, "task", None), "activity_name", "") or "")
 
 
 def _goal_body_arg_to_name(arg: Any) -> Optional[str]:
+    if isinstance(arg, (dict, list, tuple)):
+        return None
     return _safe_name(str(arg).lstrip("?"))
 
 
-def _task_goal_predicates(env, predicate_names: Sequence[str]) -> List[SegmentPredicate]:
+def _goal_atom(head: Any) -> Tuple[Optional[Sequence[Any]], bool]:
+    """Return an atomic goal body and polarity from a grounded BDDL goal node."""
+
+    body = getattr(head, "body", None)
+    if body:
+        # Grounded BDDL options contain HEAD nodes. A negative atom is encoded as
+        # HEAD.body == ["not", [predicate, arg, ...]], not as a Negation node.
+        if str(body[0]).lower() == "not":
+            if len(body) == 2 and isinstance(body[1], (list, tuple)) and body[1]:
+                return body[1], False
+            return None, False
+        return body, True
+    if head.__class__.__name__.lower() == "negation":
+        children = getattr(head, "children", None) or []
+        if len(children) == 1:
+            child = children[0]
+            child_body = getattr(child, "body", None)
+            state_name = getattr(child, "STATE_NAME", None)
+            if child_body and state_name:
+                return [state_name, *child_body], False
+            if child_body:
+                return child_body, False
+    return None, True
+
+
+def _no_direct_task_goal_match(predicate_names: Sequence[str]) -> Dict[str, Any]:
+    return {
+        "metric_type": "task_goal_binding",
+        "metric_name": "|".join(str(name) for name in predicate_names),
+        "role": "task_goal",
+        "reason": "no_direct_task_goal_match",
+        "candidate_predicates": [str(name) for name in predicate_names],
+    }
+
+
+def _task_goal_predicates(
+    env,
+    predicate_names: Sequence[str],
+    *,
+    metric_family: str = "task_goal_relation",
+    success_rule: str = "bound full-task BDDL goal subpredicate is satisfied",
+) -> List[SegmentPredicate]:
     allowed = set(predicate_names)
     specs: List[SegmentPredicate] = []
     seen = set()
     for option in getattr(getattr(env, "task", None), "ground_goal_state_options", []) or []:
         for head in option or []:
-            body = getattr(head, "body", None)
+            body, desired = _goal_atom(head)
             if not body or len(body) < 2 or str(body[0]) not in allowed:
+                continue
+            predicate_name = str(body[0])
+            expected_arity = _TASK_GOAL_PREDICATE_ARITIES.get(predicate_name)
+            if expected_arity is not None and len(body) != expected_arity + 1:
                 continue
             args = [_goal_body_arg_to_name(arg) for arg in body[1:]]
             if any(arg is None for arg in args):
                 continue
-            key = (str(body[0]), tuple(args))
+            key = (str(body[0]), tuple(args), desired)
             if key in seen:
                 continue
             seen.add(key)
@@ -220,11 +310,13 @@ def _task_goal_predicates(env, predicate_names: Sequence[str]) -> List[SegmentPr
                     metric_type="predicate",
                     name=str(body[0]),
                     args=[str(arg) for arg in args],
-                    desired=True,
-                    source="task_goal_final_relation",
+                    desired=desired,
+                    source="task_goal_subpredicate",
                     params={
-                        "metric_family": "task_aware_release_relation",
-                        "success_rule": "task final relation remains satisfied during release",
+                        "metric_family": metric_family,
+                        "success_rule": success_rule,
+                        "semantic_role": f"task_goal_{body[0]}",
+                        "contributes_to_success": True,
                     },
                 )
             )
@@ -271,6 +363,17 @@ def _og_eval_predicate_detailed(env, name: str, args: Sequence[str]) -> Tuple[bo
             diagnostics["missing_object"] = args[0] if obj is None else args[1]
             return False, diagnostics
         return bool(obj.states[Touching].get_value(other)), diagnostics
+    if name == "covered":
+        obj = _object_from_name(env, args[0])
+        system = _system_from_name(env, args[1])
+        if obj is None or system is None:
+            missing = args[0] if obj is None else args[1]
+            diagnostics["missing_object"] = missing
+            if system is None:
+                diagnostics["missing_system"] = args[1]
+            return False, diagnostics
+        diagnostics["system_name"] = getattr(system, "name", args[1])
+        return bool(obj.states[Covered].get_value(system)), diagnostics
     if name == "nextto":
         obj = _object_from_name(env, args[0])
         other = _object_from_name(env, args[1])
@@ -360,6 +463,65 @@ def _resolve_role_name(info: Dict[str, Optional[str]], role: str) -> Optional[st
         "face_target": parsed_a or target or obj,
     }
     return _safe_name(mapping.get(role))
+
+
+def _filter_task_goal_predicates(
+    env,
+    specs: Sequence[SegmentPredicate],
+    info: Dict[str, Optional[str]],
+    match_roles: Dict[str, Dict[int, Sequence[str]]],
+    *,
+    role_bindings: Optional[Dict[str, Optional[str]]] = None,
+) -> Tuple[List[SegmentPredicate], List[Dict[str, Any]]]:
+    """Keep only goal atoms whose configured arguments match annotation roles."""
+
+    matched: List[SegmentPredicate] = []
+    missing_roles: List[Dict[str, Any]] = []
+    for spec in specs:
+        predicate_rules = match_roles.get(spec.name, {})
+        if not predicate_rules:
+            matched.append(spec)
+            continue
+        checks: List[Optional[bool]] = []
+        unresolved: List[Tuple[int, List[str]]] = []
+        for raw_index, raw_roles in predicate_rules.items():
+            arg_index = int(raw_index)
+            roles = [raw_roles] if isinstance(raw_roles, str) else list(raw_roles)
+            resolved_names = []
+            for role in roles:
+                resolved = (role_bindings or {}).get(role)
+                if resolved is None:
+                    resolved = _resolve_role_name(info, role)
+                if resolved is not None:
+                    resolved_names.append(resolved)
+            if not resolved_names:
+                checks.append(None)
+                unresolved.append((arg_index, roles))
+                continue
+            checks.append(
+                arg_index < len(spec.args)
+                and any(_same_task_entity(env, spec.args[arg_index], resolved) for resolved in resolved_names)
+            )
+        concrete_checks = [check for check in checks if check is not None]
+        if unresolved:
+            # Report a missing role only when all other configured arguments (normally
+            # the goal subject) match this annotation. Unrelated task-goal atoms must
+            # not invalidate the segment.
+            if concrete_checks and all(concrete_checks):
+                for arg_index, roles in unresolved:
+                    missing_roles.append(
+                        {
+                            "metric_type": "predicate",
+                            "metric_name": spec.name,
+                            "goal_arg_index": arg_index,
+                            "role": "|".join(roles),
+                            "reason": "task_goal_match_role_missing",
+                        }
+                    )
+            continue
+        if checks and all(checks):
+            matched.append(spec)
+    return matched, missing_roles
 
 
 def _capture_object_pose(env, obj_name: str) -> Optional[Dict[str, Any]]:
@@ -556,6 +718,41 @@ def build_template_predicates(
             )
         )
 
+    task_prefixes = entry.get("task_aware_final_relation_task_prefixes") or []
+    relation_predicate_names = (
+        entry.get("task_goal_predicates") or entry.get("task_aware_final_relation_predicates") or []
+    )
+    task_scope_matches = not task_prefixes or any(
+        _task_activity_name(env).startswith(str(prefix)) for prefix in task_prefixes
+    )
+    task_goal_binding_errors: List[Dict[str, Any]] = []
+    if relation_predicate_names and task_scope_matches:
+        task_goal_specs = _task_goal_predicates(
+            env,
+            relation_predicate_names,
+            metric_family=entry["metric_family"],
+            success_rule=entry["success_rule"],
+        )
+        task_goal_specs, task_goal_binding_errors = _filter_task_goal_predicates(
+            env,
+            task_goal_specs,
+            info,
+            entry.get("task_goal_match_roles") or {},
+            role_bindings=resolved_object_roles,
+        )
+        if entry.get("task_goal_replace_primary", False) and not task_goal_specs and not task_goal_binding_errors:
+            task_goal_binding_errors.append(_no_direct_task_goal_match(relation_predicate_names))
+        missing_template_roles.extend(task_goal_binding_errors)
+        if entry.get("task_goal_replace_primary", False):
+            specs = task_goal_specs
+        else:
+            existing = {(spec.name, tuple(spec.args), spec.desired) for spec in specs if spec.metric_type == "predicate"}
+            for spec in task_goal_specs:
+                key = (spec.name, tuple(spec.args), spec.desired)
+                if key not in existing:
+                    specs.append(spec)
+                    existing.add(key)
+
     if invalid_role_bindings:
         for invalid in invalid_role_bindings:
             missing_template_roles.append(
@@ -566,23 +763,18 @@ def build_template_predicates(
                     **invalid,
                 }
             )
-    if invalid_role_bindings or (entry.get("required_distinct_roles") and missing_template_roles):
-        # A partial compound relation must not degrade into a simpler metric.
+    if (
+        invalid_role_bindings
+        or task_goal_binding_errors
+        or (entry.get("required_distinct_roles") and missing_template_roles)
+    ):
+        # A malformed or unmatched task-goal binding must fail closed instead of
+        # degrading to a partial relation or the auto-mined fallback.
         specs = []
     elif specs and diagnostic_specs:
         # Keep auxiliary state nested under the first primary trace item. This
         # preserves compatibility with callers that reduce the top-level trace.
         specs[0].diagnostic_specs.extend(diagnostic_specs)
-
-    task_prefixes = entry.get("task_aware_final_relation_task_prefixes") or []
-    relation_predicate_names = entry.get("task_aware_final_relation_predicates") or []
-    if relation_predicate_names and any(_task_activity_name(env).startswith(str(prefix)) for prefix in task_prefixes):
-        existing = {(spec.name, tuple(spec.args), spec.desired) for spec in specs if spec.metric_type == "predicate"}
-        for spec in _task_goal_predicates(env, relation_predicate_names):
-            key = (spec.name, tuple(spec.args), spec.desired)
-            if key not in existing:
-                specs.append(spec)
-                existing.add(key)
 
     debug = {
         "metric_family": entry["metric_family"],
@@ -618,6 +810,8 @@ def build_template_predicates(
         debug["missing_diagnostic_roles"] = missing_diagnostic_roles
     if invalid_role_bindings:
         debug["invalid_role_bindings"] = invalid_role_bindings
+    if task_goal_binding_errors:
+        debug["invalid_task_goal_bindings"] = task_goal_binding_errors
     debug.update(
         {
             key: value

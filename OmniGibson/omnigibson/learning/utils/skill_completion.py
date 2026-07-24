@@ -120,14 +120,16 @@ def check_skill_completed(
     template_specs, metric_debug = build_template_predicates(segment_level, segment, env)
 
     if not template_specs:
+        invalid_task_goal_bindings = metric_debug.get("invalid_task_goal_bindings", [])
         return {
             "completed": False,
             "reason": f"No predicates could be built for skill '{skill_desc}'",
             "metrics": {
                 "metric_family": entry.get("metric_family"),
                 "metric_debug": metric_debug,
+                "invalid_role_bindings": invalid_task_goal_bindings,
             },
-            "result_type": "no_predicates",
+            "result_type": "invalid_object_bindings" if invalid_task_goal_bindings else "no_predicates",
         }
 
     # ------------------------------------------------------------------
@@ -268,7 +270,12 @@ def eval_skill_metric(
         - ``trace_summary`` (Dict): Separate primary failures and auxiliary telemetry.
     """
     metrics = metric_entry.get("metrics", [])
-    if not metrics:
+    task_goal_predicate_names = (
+        metric_entry.get("task_goal_predicates")
+        or metric_entry.get("task_aware_final_relation_predicates")
+        or []
+    )
+    if not metrics and not task_goal_predicate_names:
         return {
             "success": False,
             "result_type": "no_predicates",
@@ -313,7 +320,11 @@ def eval_skill_metric(
     from omnigibson.learning.utils.segment_predicate_eval import (
         _capture_object_pose,
         _capture_robot_base,
+        _filter_task_goal_predicates,
+        _no_direct_task_goal_match,
         _object_from_name,
+        _task_activity_name,
+        _task_goal_predicates,
     )
     import numpy as np
 
@@ -416,6 +427,46 @@ def eval_skill_metric(
                         params=params,
                     )
                 )
+
+    task_prefixes = metric_entry.get("task_aware_final_relation_task_prefixes") or []
+    task_scope_matches = not task_prefixes or any(
+        _task_activity_name(env).startswith(str(prefix)) for prefix in task_prefixes
+    )
+    if task_goal_predicate_names and task_scope_matches:
+        task_goal_specs = _task_goal_predicates(
+            env,
+            task_goal_predicate_names,
+            metric_family=metric_entry.get("metric_family", "task_goal_relation"),
+            success_rule=metric_entry.get("success_rule", "bound full-task BDDL goal subpredicate is satisfied"),
+        )
+        task_goal_specs, task_goal_binding_errors = _filter_task_goal_predicates(
+            env,
+            task_goal_specs,
+            {},
+            metric_entry.get("task_goal_match_roles") or {},
+            role_bindings=object_bindings,
+        )
+        if metric_entry.get("task_goal_replace_primary", False) and not task_goal_specs and not task_goal_binding_errors:
+            task_goal_binding_errors.append(_no_direct_task_goal_match(task_goal_predicate_names))
+        if task_goal_binding_errors:
+            return {
+                "success": False,
+                "result_type": "invalid_object_bindings",
+                "trace": [],
+                "truth_map": {},
+                "missing_objects": [],
+                "invalid_role_bindings": task_goal_binding_errors,
+                "trace_summary": summarize_predicate_trace([]),
+            }
+        if metric_entry.get("task_goal_replace_primary", False):
+            specs = task_goal_specs
+        else:
+            existing = {(spec.name, tuple(spec.args), spec.desired) for spec in specs}
+            specs.extend(
+                spec
+                for spec in task_goal_specs
+                if (spec.name, tuple(spec.args), spec.desired) not in existing
+            )
 
     if specs and diagnostic_specs:
         specs[0].diagnostic_specs.extend(diagnostic_specs)
