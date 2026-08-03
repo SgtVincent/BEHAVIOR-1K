@@ -31,6 +31,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import h5py
 import numpy as np
 
+from omnigibson.learning.transition_state_restore import (
+    TRANSITION_STATE_CACHE_SCHEMA_VERSION,
+    normalize_recorded_scene_snapshot,
+    normalize_transition_manifest,
+)
 from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES
 
 
@@ -141,13 +146,38 @@ def extract_demo(
         demo_keys = [k for k in data_grp.keys() if k.startswith("demo_")]
         if not demo_keys:
             raise ValueError(f"No demo groups found in raw file: {raw_hdf5_path}")
-        demo_grp = data_grp[demo_keys[0]]
-
-        if "state" not in demo_grp or "state_size" not in demo_grp:
+        max_requested_frame = max(frames)
+        demo_candidates = []
+        for key in demo_keys:
+            grp = data_grp[key]
+            if "state" not in grp or "state_size" not in grp:
+                continue
+            state_len = len(grp["state"])
+            demo_candidates.append((max_requested_frame >= state_len, -state_len, key, grp))
+        if not demo_candidates:
             raise ValueError(f"Raw file missing 'state'/'state_size': {raw_hdf5_path}")
+        _, _, selected_demo_key, demo_grp = min(demo_candidates)
 
         state = demo_grp["state"]
         state_size = demo_grp["state_size"]
+        if "transitions" not in demo_grp.attrs:
+            raise ValueError(f"Raw file missing transition manifest: {raw_hdf5_path}:{selected_demo_key}")
+        transition_manifest = normalize_transition_manifest(demo_grp.attrs["transitions"])
+        transition_manifest_json = json.dumps(transition_manifest, sort_keys=True, separators=(",", ":"))
+
+        if "scene_file" not in data_grp.attrs:
+            raise ValueError(f"Raw file missing recorded scene_file: {raw_hdf5_path}")
+        recorded_scene_file = normalize_recorded_scene_snapshot(data_grp.attrs["scene_file"])
+        recorded_scene_file_json = json.dumps(recorded_scene_file, separators=(",", ":"))
+
+        if "init_metadata" not in demo_grp:
+            raise ValueError(f"Raw file missing init_metadata: {raw_hdf5_path}:{selected_demo_key}")
+        init_metadata_group = demo_grp["init_metadata"]
+        init_metadata_arrays: Dict[str, np.ndarray] = {}
+        for key, value in init_metadata_group.items():
+            if not isinstance(value, h5py.Dataset):
+                raise ValueError(f"Nested init_metadata is unsupported for exact cache: {key}")
+            init_metadata_arrays[key] = np.asarray(value[()])
 
         vectors: List[np.ndarray] = []
         kept_frames: List[int] = []
@@ -164,18 +194,24 @@ def extract_demo(
 
     sizes, offsets, flat = _pack_variable_length_vectors(vectors)
 
-    np.savez_compressed(
-        out_path,
-        task_name=np.array(task_name),
-        task_idx=np.array(task_idx, dtype=np.int64),
-        demo_id=np.array(demo_id),
-        frame_indices=np.array(kept_frames, dtype=np.int64),
-        state_sizes=sizes,
-        state_offsets=offsets,
-        state_flat=flat,
-        source=np.array(f"rawdata:{raw_hdf5_path}"),
-        include_ends=np.array(bool(include_ends)),
-    )
+    cache_payload = {
+        "schema_version": np.array(TRANSITION_STATE_CACHE_SCHEMA_VERSION, dtype=np.int64),
+        "task_name": np.array(task_name),
+        "task_idx": np.array(task_idx, dtype=np.int64),
+        "demo_id": np.array(demo_id),
+        "frame_indices": np.array(kept_frames, dtype=np.int64),
+        "state_sizes": sizes,
+        "state_offsets": offsets,
+        "state_flat": flat,
+        "source": np.array(f"rawdata:{raw_hdf5_path}:{selected_demo_key}"),
+        "include_ends": np.array(bool(include_ends)),
+        "transition_manifest_json": np.array(transition_manifest_json),
+        "recorded_scene_file_json": np.array(recorded_scene_file_json),
+        "init_metadata_keys_json": np.array(json.dumps(list(init_metadata_arrays.keys()))),
+    }
+    for index, values in enumerate(init_metadata_arrays.values()):
+        cache_payload[f"init_metadata_{index:04d}"] = values
+    np.savez_compressed(out_path, **cache_payload)
 
     return out_path
 
