@@ -375,7 +375,7 @@ def test_pull_tray_registry_requires_trailing_stability() -> None:
     ) is True
 
 
-def test_attach_release_composite_rejects_attached_but_still_grasped() -> None:
+def test_attach_task_release_accepts_bound_goal_while_still_grasped() -> None:
     env = _FakeEnv(attached=True, grasped=True)
     segment = {"skill_description": "release", "object_id": [["camera"]]}
 
@@ -383,16 +383,16 @@ def test_attach_release_composite_rejects_attached_but_still_grasped() -> None:
     _, trace = eval_segment_predicates(env, specs)
 
     assert debug["task_aware_final_relation_predicates"] == ["attached"]
-    assert {item["predicate"] for item in trace} == {"grasped(agent,camera)", "attached(camera,tripod)"}
-    assert predicate_window_satisfied([trace], combine_mode=debug["combine_mode"]) is False
+    assert {item["predicate"] for item in trace} == {"attached(camera,tripod)"}
+    assert predicate_window_satisfied([trace], combine_mode=debug["combine_mode"]) is True
 
 
-def test_attach_release_composite_accepts_attached_and_released() -> None:
-    env = _FakeEnv(attached=True, grasped=False)
+def test_attach_task_release_still_requires_bound_attached_goal() -> None:
+    env = _FakeEnv(attached=False, grasped=False)
     segment = {"skill_description": "release", "object_id": [["camera"]]}
 
     specs, debug = build_template_predicates("skill", segment, env)
     _, trace = eval_segment_predicates(env, specs)
 
-    assert {item["predicate"] for item in trace} == {"grasped(agent,camera)", "attached(camera,tripod)"}
-    assert predicate_window_satisfied([trace], combine_mode=debug["combine_mode"]) is True
+    assert {item["predicate"] for item in trace} == {"attached(camera,tripod)"}
+    assert predicate_window_satisfied([trace], combine_mode=debug["combine_mode"]) is False
