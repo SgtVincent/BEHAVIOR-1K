@@ -46,6 +46,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from omnigibson.learning.eval_subtask_reset import SubTaskEvaluator, get_demo_ids_for_task
+from omnigibson.learning.transition_state_restore import classify_segment_component_evaluability
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.eval_diagnostics import (
     ENV_TASK_SUCCESS_BEFORE_SEGMENT_SUCCESS,
@@ -110,6 +111,87 @@ def _snapshot_restore_debug(evaluator: SubTaskEvaluator) -> Optional[Dict[str, A
         logger.warning("Failed to deepcopy restore telemetry; sanitizing debug payload instead: %s", exc)
         sanitized = _sanitize_restore_debug(debug)
         return sanitized if isinstance(sanitized, dict) else {"value": sanitized}
+
+
+def _boundary_trace_satisfied(trace: List[Dict[str, Any]], combine_mode: str) -> Optional[bool]:
+    if not trace:
+        return None
+    values = [bool(item.get("satisfied", False)) for item in trace]
+    return any(values) if combine_mode == "any_of" else all(values)
+
+
+def _build_boundary_evaluation(
+    *,
+    component_evaluability: Dict[str, Any],
+    start_trace: List[Dict[str, Any]],
+    end_trace: List[Dict[str, Any]],
+    combine_mode: str,
+    require_unsatisfied_at_start: bool,
+) -> Dict[str, Any]:
+    """Keep raw end-state evidence separate from transition activation diagnostics."""
+
+    start_missing = [
+        {"stage": "start", **item} for item in trace_missing_objects(start_trace)
+    ]
+    end_missing = [{"stage": "end", **item} for item in trace_missing_objects(end_trace)]
+    missing = start_missing + end_missing
+    start_satisfied = _boundary_trace_satisfied(start_trace, combine_mode)
+    end_satisfied = _boundary_trace_satisfied(end_trace, combine_mode)
+    component_boundary_evaluable = bool(component_evaluability.get("boundary_evaluable"))
+    end_state_evaluable = bool(
+        component_boundary_evaluable and end_satisfied is not None and not end_missing
+    )
+    activation_evaluable = bool(
+        component_boundary_evaluable
+        and start_satisfied is not None
+        and end_satisfied is not None
+        and not missing
+    )
+    end_state_success = bool(end_satisfied) if end_state_evaluable else None
+    activation_success = (
+        bool(
+            end_satisfied
+            and (not require_unsatisfied_at_start or not start_satisfied)
+        )
+        if activation_evaluable
+        else None
+    )
+    if not component_boundary_evaluable:
+        end_state_result_type = component_evaluability.get("boundary_result_type")
+        activation_result_type = end_state_result_type
+    else:
+        if end_missing:
+            end_state_result_type = MISSING_OBJECT_RESULT_TYPE
+        elif end_satisfied is None:
+            end_state_result_type = "boundary_end_trace_missing"
+        else:
+            end_state_result_type = (
+                "boundary_end_state_success" if end_state_success else "boundary_end_state_failure"
+            )
+        if missing:
+            activation_result_type = MISSING_OBJECT_RESULT_TYPE
+        elif start_satisfied is None or end_satisfied is None:
+            activation_result_type = "boundary_activation_trace_missing"
+        else:
+            activation_result_type = (
+                "boundary_activation_success" if activation_success else "boundary_activation_failure"
+            )
+    return {
+        "end_state_evaluable": end_state_evaluable,
+        "end_state_aggregation_eligible": end_state_evaluable,
+        "end_state_result_type": end_state_result_type,
+        "end_state_success": end_state_success,
+        "activation_evaluable": activation_evaluable,
+        "activation_result_type": activation_result_type,
+        "activation_success": activation_success,
+        "combine_mode": combine_mode,
+        "require_unsatisfied_at_start": require_unsatisfied_at_start,
+        "start_satisfied": start_satisfied,
+        "end_satisfied": end_satisfied,
+        "start_trace": start_trace,
+        "end_trace": end_trace,
+        "missing_object_traces": missing,
+    }
 
 
 def _as_demo_id(x: Any) -> str:
@@ -592,7 +674,7 @@ def run_single_segment(
             }
 
         # Segment rollout must start from the segment start frame, not the end frame used for target metric capture.
-        restored_rollout_start, _, _ = restore_and_eval_predicates(evaluator, start_frame)
+        restored_rollout_start, method_rollout_start, _ = restore_and_eval_predicates(evaluator, start_frame)
         restore_debug_rollout_start = _snapshot_restore_debug(evaluator)
         if not restored_rollout_start:
             return {
@@ -604,12 +686,87 @@ def run_single_segment(
                 "restore": {
                     "start": _restore_entry(False, method_start, restore_debug_rollout_start),
                     "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
-                    "rollout_start": _restore_entry(False, method_start, restore_debug_rollout_start),
+                    "rollout_start": _restore_entry(
+                        False, method_rollout_start, restore_debug_rollout_start
+                    ),
                 },
                 "success_mode": str(success_mode),
                 "effective_success_mode": "segment_predicates",
                 "success": False,
                 "result_type": "restore_failed_before_rollout",
+                "review_artifacts": review_artifacts,
+            }
+
+        serialized_predicate_specs = [
+            {
+                "metric_type": p.metric_type,
+                "name": p.name,
+                "args": p.args,
+                "desired": p.desired,
+                "source": p.source,
+                "params": p.params,
+            }
+            for p in predicate_specs
+        ]
+        component_evaluability = classify_segment_component_evaluability(
+            predicate_specs,
+            {
+                "start": restore_debug_start_for_compare,
+                "end": restore_debug_end_for_compare,
+                "rollout_start": restore_debug_rollout_start,
+            },
+        )
+        restore_telemetry = {
+            "start": _restore_entry(True, method_start, restore_debug_start_for_compare),
+            "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
+            "rollout_start": _restore_entry(
+                True, method_rollout_start, restore_debug_rollout_start
+            ),
+        }
+        combine_mode = str(metric_debug.get("combine_mode", "all_of"))
+        boundary_evaluation = _build_boundary_evaluation(
+            component_evaluability=component_evaluability,
+            start_trace=start_trace,
+            end_trace=end_trace,
+            combine_mode=combine_mode,
+            require_unsatisfied_at_start=bool(
+                metric_debug.get("require_unsatisfied_at_start", True)
+            ),
+        )
+        if not component_evaluability["evaluable"]:
+            return {
+                "demo_id": demo_id,
+                "segment_level": segment_level,
+                "segment_idx": segment_idx,
+                "segment_desc": segment_desc,
+                "frame_duration": [int(start_frame), int(end_frame)],
+                "restore": restore_telemetry,
+                "success_mode": str(success_mode),
+                "effective_success_mode": "segment_predicates",
+                "success": None,
+                "result_type": component_evaluability["result_type"],
+                "boundary_evaluation_eligible": boundary_evaluation["end_state_evaluable"],
+                "boundary_end_state_aggregation_eligible": boundary_evaluation[
+                    "end_state_aggregation_eligible"
+                ],
+                "boundary_evaluation": boundary_evaluation,
+                "rollout_evaluation_eligible": component_evaluability["rollout_evaluable"],
+                "aggregation_eligible": False,
+                "model_evaluated": False,
+                "model_failure_eligible": False,
+                "component_evaluability": component_evaluability,
+                "predicate_spec": serialized_predicate_specs,
+                "predicate_debug": {
+                    **metric_debug,
+                    "template_trace_start": start_trace,
+                    "template_trace_end": end_trace,
+                },
+                "rollout": {
+                    "max_steps": 0,
+                    "final_step": 0,
+                    "rollout_attempted": False,
+                    "termination_reason": component_evaluability["result_type"],
+                },
                 "review_artifacts": review_artifacts,
             }
 
@@ -619,24 +776,20 @@ def run_single_segment(
             "segment_idx": segment_idx,
             "segment_desc": segment_desc,
             "frame_duration": [int(start_frame), int(end_frame)],
-            "restore": {
-                "start": _restore_entry(True, method_start, restore_debug_start_for_compare),
-                "end": _restore_entry(True, method_end, restore_debug_end_for_compare),
-                "rollout_start": _restore_entry(True, method_start, restore_debug_rollout_start),
-            },
+            "restore": restore_telemetry,
             "success_mode": str(success_mode),
             "effective_success_mode": "segment_predicates",
-            "predicate_spec": [
-                {
-                    "metric_type": p.metric_type,
-                    "name": p.name,
-                    "args": p.args,
-                    "desired": p.desired,
-                    "source": p.source,
-                    "params": p.params,
-                }
-                for p in predicate_specs
+            "component_evaluability": component_evaluability,
+            "boundary_evaluation_eligible": boundary_evaluation["end_state_evaluable"],
+            "boundary_end_state_aggregation_eligible": boundary_evaluation[
+                "end_state_aggregation_eligible"
             ],
+            "boundary_evaluation": boundary_evaluation,
+            "rollout_evaluation_eligible": True,
+            "aggregation_eligible": True,
+            "model_evaluated": False,
+            "model_failure_eligible": not dry_run,
+            "predicate_spec": serialized_predicate_specs,
             "predicate_debug": {
                 **metric_debug,
                 "template_trace_start": start_trace,
@@ -804,6 +957,7 @@ def run_single_segment(
 
         for step in range(max_steps):
             evaluator.obs["_meta"] = meta
+            result["model_evaluated"] = True
 
             terminated, truncated = evaluator.step()
 
