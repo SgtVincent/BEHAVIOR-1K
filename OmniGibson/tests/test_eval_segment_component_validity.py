@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 
 import omnigibson.learning.eval_segment as eval_segment
 from omnigibson.learning.transition_state_restore import (
@@ -24,6 +25,19 @@ class _FakeEvaluator:
         self.current_rawdata_hdf5 = None
         self.current_primitive_state_cache = None
         self._last_restore_debug = restore_debug
+        # run_single_segment resolves the Gate2 rollout start frame before it can know
+        # whether the segment is component-evaluable, so even a segment that returns
+        # early must be able to read config. Defaults keep this test on the plain path:
+        # no restore override, no perturbation, no object-metric capture, no rollout.
+        self.cfg = OmegaConf.create(
+            {
+                "restore_frame_override": None,
+                "perturb_pose": False,
+                "compute_object_metrics": False,
+                "write_video": False,
+                "save_rollout": False,
+            }
+        )
 
     def load_demo_lowdim_data(self, demo_id):
         return []
@@ -178,3 +192,8 @@ def test_run_single_segment_separates_end_state_from_activation_and_rollout(
     assert result["model_evaluated"] is False
     assert result["model_failure_eligible"] is False
     assert result["aggregation_eligible"] is False
+    # Gate2 telemetry must survive on this path too: every result produced after the
+    # rollout-start restore records the frame the rollout would have started from.
+    assert result["rollout_start_frame"] == 10
+    assert result["rollout_start_was_overridden"] is False
+    assert result["pose_perturbation"] is None
