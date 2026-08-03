@@ -46,11 +46,27 @@ from omnigibson.learning.utils.eval_utils import (
     flatten_obs_dict,
 )
 from omnigibson.learning.utils.obs_utils import create_video_writer, write_video
+from omnigibson.learning.transition_state_restore import (
+    TransitionManifestError,
+    build_restore_component_validity,
+    materialize_transition_events,
+    normalize_transition_manifest,
+    require_exact_cache_artifacts,
+    restore_method_is_exact,
+    restore_recorded_scene_base,
+    transition_events_before_state_frame,
+    validate_serialized_state_consumption,
+)
 from omnigibson.macros import gm
-from omnigibson.utils.python_utils import recursively_convert_to_torch
+from omnigibson.utils.python_utils import (
+    create_object_from_init_info,
+    get_uuid,
+    h5py_group_to_torch,
+    recursively_convert_to_torch,
+)
 from pathlib import Path
 from signal import signal, SIGINT
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 # create module logger
@@ -58,18 +74,11 @@ logger = logging.getLogger("subtask_evaluator")
 logger.setLevel(20)  # info
 
 
-# Some tasks create transition-generated objects mid-episode (e.g. diced ingredients
-# in make_pizza). Rawdata / primitive-state artifacts for skill eval only provide the
-# static scene snapshot, so serialized full-state restore can reference objects that do
-# not exist in the reconstructed registry. Keep this skill-eval-only guard local here
-# instead of changing the official task-level eval env loading path in eval.py.
-SERIALIZED_FULL_STATE_RESTORE_UNSUPPORTED_TASKS = {
-    "make_pizza",
-}
-
-
-def _task_supports_serialized_full_state_restore(task_name: str) -> bool:
-    return task_name not in SERIALIZED_FULL_STATE_RESTORE_UNSUPPORTED_TASKS
+# Raw HDF5 demonstrations record the source scene snapshot, typed initialization
+# metadata, and exact frame-keyed object/system lifecycle metadata. Serialized state
+# vectors contain UUIDs and values but not this schema contract, so the recorded scene
+# and cumulative transitions must be restored before a mid-episode load. Support is
+# artifact-driven rather than task-name-driven; incomplete metadata fails closed.
 
 
 class SubTaskEvaluator(Evaluator):
@@ -125,7 +134,18 @@ class SubTaskEvaluator(Evaluator):
         self.current_demo_data = None
         self.current_demo_id = None
         self._last_rawdata_restore_result: Dict[str, Any] = {"attempted": False}
-        self._last_restore_debug: Dict[str, Any] = {"selected_method": "none"}
+        self._last_cache_restore_result: Dict[str, Any] = {"attempted": False}
+        self._last_restore_debug: Dict[str, Any] = {
+            "selected_method": "none",
+            "exact_world_state": False,
+            "component_validity": build_restore_component_validity(
+                restored=False,
+                rigid_state_valid=False,
+                assisted_grasp_state_valid=False,
+                particle_state_valid=False,
+                contact_state_valid=False,
+            ),
+        }
 
         # If a standalone segment starts while the demo is already holding a manipulating
         # object (e.g. a `place in` segment immediately after `pick up`), avoid calling
@@ -208,6 +228,7 @@ class SubTaskEvaluator(Evaluator):
         exception: Optional[Exception] = None,
         selected_key: Optional[str] = None,
         available_groups: Optional[List[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         payload: Dict[str, Any] = {
             "attempted": attempted,
@@ -225,6 +246,8 @@ class SubTaskEvaluator(Evaluator):
             payload["available_demo_groups"] = list(available_groups)
         if exception is not None:
             payload.update(self._parse_restore_exception_details(exception))
+        if extra is not None:
+            payload.update(extra)
         self._last_rawdata_restore_result = payload
 
     #region debug-point restore-grasp-state
@@ -658,6 +681,137 @@ class SubTaskEvaluator(Evaluator):
         logger.debug(f"Raw HDF5 data not found for demo {demo_id}")
         return None
 
+    def _restore_serialized_state_with_transition_manifest(
+        self,
+        *,
+        state_tensor: th.Tensor,
+        raw_manifest: Any,
+        recorded_scene_file: Any,
+        init_metadata: Dict[str, th.Tensor],
+        state_frame: int,
+        source: str,
+    ) -> Dict[str, Any]:
+        """Restore the recorded clean scene, reconstruct its lifecycle, then load state.
+
+        Segment evaluation can request frames in non-monotonic order (start, end, then
+        rollout start). Every request therefore starts from the HDF5-recorded scene
+        snapshot and per-object initialization metadata used by official playback,
+        never the evaluator's current ``scene._initial_file``.
+        """
+
+        manifest_present = raw_manifest is not None
+        manifest = normalize_transition_manifest(raw_manifest)
+        events = transition_events_before_state_frame(manifest, state_frame)
+        base_env = self._unwrap_env()
+        scene = base_env.scene
+
+        with gm.unlocked():
+            transition_rules_were_enabled = bool(gm.ENABLE_TRANSITION_RULES)
+            # Official DataPlaybackWrapper requires transition rules to be disabled
+            # because lifecycle events are replayed explicitly. Temporarily do the same
+            # so the initialization step cannot independently fire a duplicate rule.
+            gm.ENABLE_TRANSITION_RULES = False
+
+        operation_succeeded = False
+        summary: Dict[str, Any] = {}
+        try:
+            summary = restore_recorded_scene_base(
+                scene=scene,
+                raw_scene_file=recorded_scene_file,
+                init_metadata=init_metadata,
+                stopped_context=og.sim.stopped,
+            )
+            # Scene.restore's existing object/system callbacks keep BehaviorTask BDDL
+            # entities bound as names are removed and re-added. Same-name entities retain
+            # their live object identity, matching official DataPlaybackWrapper.
+            summary.update(
+                materialize_transition_events(
+                    scene=scene,
+                    events=events,
+                    create_object_from_init_info=create_object_from_init_info,
+                    uuid_from_name=lambda name: get_uuid(name, deterministic=True),
+                    park_object=lambda obj, index: obj.set_position(th.ones(3) * (100.0 + 5.0 * index)),
+                    initialize_event=og.sim.step,
+                )
+            )
+            # Inspect source component presence with the same current-runtime schema used
+            # by official policy evaluation. This is telemetry only; current asset MD5
+            # identity is deliberately not an official-eval compatibility gate.
+            source_state, source_consumed = og.sim.deserialize(state_tensor)
+            source_consumption = validate_serialized_state_consumption(
+                consumed=source_consumed,
+                total=state_tensor.numel(),
+            )
+            source_scene_state = source_state.get(scene.idx)
+            if source_scene_state is None and len(source_state) == 1:
+                source_scene_state = next(iter(source_state.values()))
+            if not isinstance(source_scene_state, Mapping):
+                raise TransitionManifestError("serialized_source_scene_state_missing", scene_idx=scene.idx)
+            source_registry = source_scene_state.get("registry", {})
+            if not isinstance(source_registry, Mapping):
+                raise TransitionManifestError("serialized_source_registry_missing", scene_idx=scene.idx)
+            source_object_registry = source_registry.get("object_registry", {})
+            source_system_registry = source_registry.get("system_registry", {})
+            if not isinstance(source_object_registry, Mapping) or not isinstance(
+                source_system_registry, Mapping
+            ):
+                raise TransitionManifestError("serialized_source_component_registry_missing")
+            source_robot_state = source_object_registry.get(self.robot.name, {})
+            source_has_assisted_grasp = isinstance(source_robot_state, Mapping) and (
+                "ag_obj_constraint_params" in source_robot_state
+            )
+            assisted_grasp_valid = bool(
+                getattr(self.robot, "grasping_mode", None) == "physical" or source_has_assisted_grasp
+            )
+            source_system_count = len(source_system_registry)
+
+            # Serialized deserialization is intentionally last: every UUID referenced
+            # by the vector must already resolve through the reconstructed registries.
+            og.sim.load_state(state_tensor, serialized=True)
+            component_validity = build_restore_component_validity(
+                restored=True,
+                rigid_state_valid=True,
+                assisted_grasp_state_valid=assisted_grasp_valid,
+                # Phase 1 is conservative: serialized system payloads require a future
+                # round-trip GPU gate before particle-dependent segment metrics are valid.
+                particle_state_valid=source_system_count == 0,
+                contact_state_valid=False,
+                historical_asset_identity_verified=False,
+                source_assisted_grasp_state_present=source_has_assisted_grasp,
+                source_system_count=source_system_count,
+            )
+            summary.update(
+                {
+                    "source_deserialize_consumed_length": int(source_consumed),
+                    "source_deserialization": source_consumption,
+                    "component_validity": component_validity,
+                    "official_eval_asset_compatible": True,
+                    "exact_world_state": component_validity["historical_world_state_exact"],
+                }
+            )
+            operation_succeeded = True
+        finally:
+            with gm.unlocked():
+                gm.ENABLE_TRANSITION_RULES = transition_rules_were_enabled
+            if transition_rules_were_enabled and scene.transition_rule_api is not None:
+                try:
+                    scene.transition_rule_api.refresh_all_rules()
+                except Exception:
+                    if operation_succeeded:
+                        raise
+                    logger.exception("Failed to refresh transition rules after failed manifest restore")
+
+        summary.update(
+            {
+                "transition_manifest_present": manifest_present,
+                "transition_manifest_event_count": len(manifest),
+                "transition_manifest_applied_event_count": len(events),
+                "transition_state_frame": int(state_frame),
+                "transition_source": source,
+            }
+        )
+        return summary
+
     def restore_full_state_from_rawdata(self, hdf5_file: h5py.File, frame_idx: int) -> bool:
         """
         Restore full simulation state from raw HDF5 data.
@@ -681,6 +835,8 @@ class SubTaskEvaluator(Evaluator):
             stage="begin",
             reason="started",
         )
+        manifest_present = False
+        transition_summary: Dict[str, Any] = {}
         try:
             # Find the demo group.
             # Most files contain a single demo group, but some rawdata files include
@@ -768,10 +924,31 @@ class SubTaskEvaluator(Evaluator):
                 )
                 return False
                 
-            # Load and restore the simulation state
+            # Reconstruct the exact registry lifecycle before serialized UUID lookup.
             state_data = th.tensor(state[frame_idx, :int(state_size[frame_idx])])
-            logger.info(f"Restoring FULL world state from rawdata frame {frame_idx} (serialized)")
-            og.sim.load_state(state_data, serialized=True)
+            manifest_present = "transitions" in demo_grp.attrs
+            if not manifest_present:
+                raise TransitionManifestError("transition_manifest_missing")
+            raw_manifest = demo_grp.attrs["transitions"]
+            recorded_scene_file = data_grp.attrs.get("scene_file")
+            if "init_metadata" not in demo_grp:
+                raise TransitionManifestError("recorded_init_metadata_missing")
+            init_metadata = h5py_group_to_torch(demo_grp["init_metadata"])
+            logger.info(
+                "Restoring FULL world state from rawdata frame %s "
+                "(serialized, recorded_scene=%s, transition_manifest=%s)",
+                frame_idx,
+                recorded_scene_file is not None,
+                manifest_present,
+            )
+            transition_summary = self._restore_serialized_state_with_transition_manifest(
+                state_tensor=state_data,
+                raw_manifest=raw_manifest,
+                recorded_scene_file=recorded_scene_file,
+                init_metadata=init_metadata,
+                state_frame=frame_idx,
+                source=f"rawdata:{hdf5_path}:{selected_key}",
+            )
             self._debug_log_grasp_state(f"rawdata_restore_frame_{frame_idx}_after_load_state")
             self._maybe_recover_assisted_grasp_post_restore(f"rawdata_restore_frame_{frame_idx}_after_load_state")
             
@@ -801,20 +978,50 @@ class SubTaskEvaluator(Evaluator):
                 reason="ok",
                 selected_key=selected_key,
                 available_groups=demo_keys,
+                extra=transition_summary,
             )
             return True
             
         except Exception as e:
             logger.error(f"Failed to restore full state from rawdata: {e}")
             traceback.print_exc()
+            if isinstance(e, TransitionManifestError):
+                if e.reason.startswith("recorded_"):
+                    stage = "prepare_recorded_scene"
+                elif e.reason.startswith("exact_cache_"):
+                    stage = "precheck"
+                elif e.reason.startswith("serialized_source_"):
+                    stage = "deserialize_precheck"
+                else:
+                    stage = "materialize_transitions"
+                reason = e.reason
+                extra = {
+                    "exact_world_state": False,
+                    "transition_manifest_present": manifest_present,
+                    "transition_manifest_error_details": e.details,
+                }
+            else:
+                stage = "deserialize"
+                missing_entity = "Could not find object" in str(e) or "Could not find" in str(e)
+                reason = (
+                    "transition_manifest_missing_for_serialized_state"
+                    if missing_entity and not manifest_present
+                    else "exception"
+                )
+                extra = {
+                    "exact_world_state": False,
+                    "transition_manifest_present": manifest_present,
+                    **transition_summary,
+                }
             self._set_last_rawdata_restore_result(
                 attempted=True,
                 restored=False,
                 frame_idx=frame_idx,
                 hdf5_path=hdf5_path,
-                stage="deserialize",
-                reason="exception",
+                stage=stage,
+                reason=reason,
                 exception=e,
+                extra=extra,
             )
             return False
 
@@ -829,68 +1036,63 @@ class SubTaskEvaluator(Evaluator):
         Returns:
             (restored, method) where method is one of: rawdata | cache | robot | none
         """
+        unavailable_component_validity = build_restore_component_validity(
+            restored=False,
+            rigid_state_valid=False,
+            assisted_grasp_state_valid=False,
+            particle_state_valid=False,
+            contact_state_valid=False,
+        )
         debug: Dict[str, Any] = {
             "frame_idx": int(frame_idx),
             "selected_method": "none",
             "fallback_used": False,
+            "exact_world_state": False,
+            "component_validity": unavailable_component_validity,
             "rawdata": {"attempted": False, "restored": False},
             "cache": {"attempted": False, "restored": False},
-            "robot": {"attempted": False, "restored": False},
+            "robot": {"attempted": False, "restored": False, "exact_world_state": False},
         }
-        task_name = str(self.cfg.task.name)
-        serialized_full_state_restore_allowed = _task_supports_serialized_full_state_restore(task_name)
 
-        # 1) rawdata
+        # 1) rawdata. Support is determined by the artifact's exact transition
+        # manifest, never by a task-name denylist.
         if getattr(self, "current_rawdata_hdf5", None) is not None:
-            if serialized_full_state_restore_allowed:
-                debug["rawdata"]["attempted"] = True
-                if self.restore_full_state_from_rawdata(self.current_rawdata_hdf5, frame_idx):
-                    debug["rawdata"] = dict(getattr(self, "_last_rawdata_restore_result", {}) or {})
-                    debug["selected_method"] = "rawdata"
-                    self._last_restore_debug = debug
-                    return True, "rawdata"
+            debug["rawdata"]["attempted"] = True
+            if self.restore_full_state_from_rawdata(self.current_rawdata_hdf5, frame_idx):
                 debug["rawdata"] = dict(getattr(self, "_last_rawdata_restore_result", {}) or {})
-                logger.warning("Rawdata state restore failed; falling back")
-            else:
-                rawdata_hdf5 = getattr(self, "current_rawdata_hdf5", None)
-                self._set_last_rawdata_restore_result(
-                    attempted=False,
-                    restored=False,
-                    frame_idx=frame_idx,
-                    hdf5_path=getattr(rawdata_hdf5, "filename", None),
-                    stage="precheck",
-                    reason=f"serialized_full_state_restore_disabled_for_task:{task_name}",
+                debug["selected_method"] = "rawdata"
+                debug["exact_world_state"] = restore_method_is_exact("rawdata", debug["rawdata"])
+                debug["component_validity"] = debug["rawdata"].get(
+                    "component_validity", unavailable_component_validity
                 )
-                debug["rawdata"] = dict(getattr(self, "_last_rawdata_restore_result", {}) or {})
-                logger.warning(
-                    "Skipping rawdata serialized full-state restore for task=%s because current artifacts can omit "
-                    "transition-generated objects; falling back.",
-                    task_name,
-                )
+                self._last_restore_debug = debug
+                return True, "rawdata"
+            debug["rawdata"] = dict(getattr(self, "_last_rawdata_restore_result", {}) or {})
+            logger.warning("Rawdata state restore failed; falling back without exact-world semantics")
 
-        # 2) cache
-        if getattr(self, "current_primitive_state_cache", None) is not None and serialized_full_state_restore_allowed:
+        # 2) cache. Only schema v3 carries the recorded source-scene contract;
+        # legacy caches are diagnostic artifacts and cannot be exact restores.
+        if getattr(self, "current_primitive_state_cache", None) is not None:
             debug["cache"]["attempted"] = True
-        if serialized_full_state_restore_allowed:
             if self.restore_full_state_from_cache(frame_idx):
-                debug["cache"]["restored"] = True
+                debug["cache"] = dict(getattr(self, "_last_cache_restore_result", {}) or {})
                 debug["selected_method"] = "cache"
                 debug["fallback_used"] = bool(debug["rawdata"].get("attempted"))
+                debug["exact_world_state"] = restore_method_is_exact("cache", debug["cache"])
+                debug["component_validity"] = debug["cache"].get(
+                    "component_validity", unavailable_component_validity
+                )
                 self._last_restore_debug = debug
                 return True, "cache"
-        elif getattr(self, "current_primitive_state_cache", None) is not None:
-            logger.warning(
-                "Skipping primitive-cache serialized full-state restore for task=%s because current artifacts can omit "
-                "transition-generated objects; falling back.",
-                task_name,
-            )
+            debug["cache"] = dict(getattr(self, "_last_cache_restore_result", {}) or {})
 
-        # 3) robot-only
+        # 3) robot-only remains a diagnostic fallback and is explicitly non-exact.
         debug["robot"]["attempted"] = True
         if self.restore_robot_state_from_frame(frame_idx):
             debug["robot"]["restored"] = True
             debug["selected_method"] = "robot"
             debug["fallback_used"] = bool(debug["rawdata"].get("attempted") or debug["cache"].get("attempted"))
+            debug["exact_world_state"] = restore_method_is_exact("robot", debug["robot"])
             self._last_restore_debug = debug
             return True, "robot"
 
@@ -999,42 +1201,88 @@ class SubTaskEvaluator(Evaluator):
         if cache_path is None:
             return None
         try:
-            data = np.load(cache_path, allow_pickle=False)
-            source = "primitive_state_cache"
-            if hasattr(data, "files") and "source" in data.files:
-                try:
-                    src_val = data["source"]
-                    source = str(src_val.item() if hasattr(src_val, "item") else src_val)
-                except Exception:
-                    source = "primitive_state_cache"
-            cache = {
-                "frame_indices": data["frame_indices"].astype(np.int64),
-                "state_sizes": data["state_sizes"].astype(np.int64),
-                "state_offsets": data["state_offsets"].astype(np.int64),
-                "state_flat": data["state_flat"],
-                "source": source,
-            }
+            with np.load(cache_path, allow_pickle=False) as data:
+                source = "primitive_state_cache"
+                if "source" in data.files:
+                    try:
+                        src_val = data["source"]
+                        source = str(src_val.item() if hasattr(src_val, "item") else src_val)
+                    except Exception:
+                        source = "primitive_state_cache"
+                schema_version = int(data["schema_version"].item()) if "schema_version" in data.files else 1
+                transition_manifest_present = "transition_manifest_json" in data.files
+                transition_manifest_json = None
+                if transition_manifest_present:
+                    manifest_value = data["transition_manifest_json"]
+                    transition_manifest_json = str(
+                        manifest_value.item() if hasattr(manifest_value, "item") else manifest_value
+                    )
+                recorded_scene_file_json = None
+                if "recorded_scene_file_json" in data.files:
+                    scene_value = data["recorded_scene_file_json"]
+                    recorded_scene_file_json = str(
+                        scene_value.item() if hasattr(scene_value, "item") else scene_value
+                    )
+                init_metadata: Dict[str, th.Tensor] = {}
+                if "init_metadata_keys_json" in data.files:
+                    keys_value = data["init_metadata_keys_json"]
+                    metadata_keys = json.loads(
+                        str(keys_value.item() if hasattr(keys_value, "item") else keys_value)
+                    )
+                    for index, key in enumerate(metadata_keys):
+                        array_key = f"init_metadata_{index:04d}"
+                        if array_key not in data.files:
+                            raise ValueError(f"Cache missing {array_key} for init metadata {key}")
+                        init_metadata[key] = th.from_numpy(np.asarray(data[array_key]).copy())
+                cache = {
+                    "frame_indices": data["frame_indices"].astype(np.int64),
+                    "state_sizes": data["state_sizes"].astype(np.int64),
+                    "state_offsets": data["state_offsets"].astype(np.int64),
+                    "state_flat": np.asarray(data["state_flat"]),
+                    "source": source,
+                    "cache_path": cache_path,
+                    "schema_version": schema_version,
+                    "transition_manifest_present": transition_manifest_present,
+                    "transition_manifest_json": transition_manifest_json,
+                    "recorded_scene_file_json": recorded_scene_file_json,
+                    "init_metadata": init_metadata,
+                }
             logger.info(
-                f"Loaded primitive state cache from {cache_path} ({len(cache['frame_indices'])} snapshots)"
+                "Loaded primitive state cache from %s (%s snapshots, schema=%s, transition_manifest=%s)",
+                cache_path,
+                len(cache["frame_indices"]),
+                cache["schema_version"],
+                cache["transition_manifest_present"],
             )
             return cache
         except Exception as e:
             logger.warning(f"Failed to load primitive state cache at {cache_path}: {e}")
             return None
 
-    def restore_full_state_from_cache(self, frame_idx: int, max_frame_delta: int = 3) -> bool:
-        """Restore full simulation state from the per-primitive cache.
+    def restore_full_state_from_cache(self, frame_idx: int, max_frame_delta: int = 0) -> bool:
+        """Restore a serialized frame from a transition-aware cache.
 
-        We primarily expect exact matches for primitive start frames.
-        As a small robustness measure, if exact is missing, we will use the
-        closest cached frame within `max_frame_delta`.
+        Nearest-frame substitution is disabled by default. Schema-v3 caches carry the
+        recorded scene snapshot, typed initialization metadata, and transition manifest
+        required for component-valid restoration. Strict historical exactness is reported
+        separately and can remain false when AG, particle, or asset provenance is absent.
+        Legacy caches fail closed.
         """
         cache = getattr(self, "current_primitive_state_cache", None)
         if cache is None:
+            self._last_cache_restore_result = {"attempted": False, "restored": False}
             return False
 
+        self._last_cache_restore_result = {
+            "attempted": True,
+            "restored": False,
+            "frame_idx": int(frame_idx),
+            "cache_path": cache.get("cache_path"),
+            "cache_schema_version": int(cache.get("schema_version", 1)),
+            "transition_manifest_present": bool(cache.get("transition_manifest_present", False)),
+            "exact_world_state": False,
+        }
         frame_indices = cache["frame_indices"]
-        # Find exact match or nearest
         pos = int(np.searchsorted(frame_indices, frame_idx))
         candidates = []
         if pos < len(frame_indices):
@@ -1051,34 +1299,86 @@ class SubTaskEvaluator(Evaluator):
                 best_delta = delta
 
         if best is None or best_delta > max_frame_delta:
-            logger.debug(
-                f"Primitive state cache miss for frame {frame_idx} (nearest delta: {best_delta})"
+            self._last_cache_restore_result.update(
+                {
+                    "stage": "select_frame",
+                    "reason": "exact_cache_frame_missing",
+                    "nearest_frame_delta": int(best_delta),
+                }
             )
+            logger.debug("Primitive state cache exact-frame miss for frame %s", frame_idx)
             return False
 
+        cached_frame = int(frame_indices[best])
+        transition_summary: Dict[str, Any] = {}
         try:
+            require_exact_cache_artifacts(cache)
             offset = int(cache["state_offsets"][best])
             size = int(cache["state_sizes"][best])
             state_vec = np.asarray(cache["state_flat"][offset : offset + size])
             state_tensor = th.from_numpy(state_vec)
-            og.sim.load_state(state_tensor, serialized=True)
+            transition_summary = self._restore_serialized_state_with_transition_manifest(
+                state_tensor=state_tensor,
+                raw_manifest=cache.get("transition_manifest_json"),
+                recorded_scene_file=cache.get("recorded_scene_file_json"),
+                init_metadata=cache.get("init_metadata", {}),
+                state_frame=cached_frame,
+                source=str(cache.get("source", "primitive_state_cache")),
+            )
             for _ in range(5):
                 og.sim.step_physics()
                 try:
-                    self._stabilize_robot_post_restore(frame_idx=frame_idx)
+                    self._stabilize_robot_post_restore(frame_idx=cached_frame)
                 except Exception:
                     pass
 
             for _ in range(2):
                 og.sim.render()
-            logger.info(
-                f"Restored full simulation state from primitive cache for frame {frame_idx} "
-                f"(used cached frame {int(frame_indices[best])})"
+            self._last_cache_restore_result.update(
+                {
+                    "restored": True,
+                    "stage": "restored",
+                    "reason": "ok",
+                    "cached_frame": cached_frame,
+                    "nearest_frame_delta": int(best_delta),
+                    **transition_summary,
+                }
             )
+            logger.info("Restored component-classified simulation state from cache frame %s", cached_frame)
             return True
         except Exception as e:
             logger.error(f"Failed to restore full state from primitive cache: {e}")
             traceback.print_exc()
+            if isinstance(e, TransitionManifestError):
+                if e.reason.startswith("recorded_"):
+                    stage = "prepare_recorded_scene"
+                elif e.reason.startswith("exact_cache_"):
+                    stage = "precheck"
+                elif e.reason.startswith("serialized_source_"):
+                    stage = "deserialize_precheck"
+                else:
+                    stage = "materialize_transitions"
+                reason = e.reason
+                error_details = e.details
+            else:
+                stage = "deserialize"
+                missing_entity = "Could not find object" in str(e) or "Could not find" in str(e)
+                reason = (
+                    "transition_manifest_missing_for_serialized_state"
+                    if missing_entity and not cache.get("transition_manifest_present", False)
+                    else "exception"
+                )
+                error_details = {}
+            self._last_cache_restore_result.update(
+                {
+                    "stage": stage,
+                    "reason": reason,
+                    "cached_frame": cached_frame,
+                    "transition_manifest_error_details": error_details,
+                    **self._parse_restore_exception_details(e),
+                    **transition_summary,
+                }
+            )
             return False
 
     def load_demo_annotations(self, demo_id: str) -> Optional[Dict]:
