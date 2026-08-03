@@ -40,6 +40,7 @@ from omnigibson.utils.python_utils import (
     recursively_convert_to_torch,
 )
 from omnigibson.utils.registry_utils import SerializableRegistry
+from omnigibson.utils.scene_restore_utils import detach_system_template_aliases_for_restore
 from omnigibson.utils.ui_utils import create_module_logger
 from omnigibson.utils.usd_utils import CollisionAPI, add_asset_to_stage
 
@@ -813,6 +814,15 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
                 scene_info = json.load(f)
         else:
             scene_info = scene_file
+
+        # A transition-created system template can have a distinct registered alias
+        # sharing its prim. Detach only a fully validated duplicate before system clear;
+        # otherwise the later object diff would access the system-removed expired prim.
+        detached_system_template_aliases = detach_system_template_aliases_for_restore(
+            scene=self,
+            scene_info=scene_info,
+        )
+
         init_info = scene_info["init_info"]
         # The saved state are lists, convert them to torch tensors
         state = recursively_convert_to_torch(scene_info["state"])
@@ -860,6 +870,10 @@ class Scene(Serializable, Registerable, Recreatable, ABC):
 
         if update_initial_file:
             self.update_initial_file(scene_file=scene_file)
+
+        return {
+            "detached_system_template_aliases": detached_system_template_aliases,
+        }
 
     def get_task_metadata(self, key):
         return self._task_metadata.get(key, None)
