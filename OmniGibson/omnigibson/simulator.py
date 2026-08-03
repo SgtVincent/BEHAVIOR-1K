@@ -193,7 +193,7 @@ def _launch_app():
         isaac_version_str = version_content.split("-")[0]
         isaac_version_tuple = tuple(map(int, isaac_version_str.split(".")[:3]))
         assert isaac_version_tuple in m.KIT_FILES, f"Isaac Sim version must be one of {list(m.KIT_FILES.keys())}"
-        kit_file_name = m.KIT_FILES[isaac_version_tuple]
+        kit_file_name = os.getenv("OMNIGIBSON_KIT_FILE") or m.KIT_FILES[isaac_version_tuple]
 
     # Copy the OmniGibson kit file and icon file to the Isaac Sim apps directory. This is necessary because the Isaac Sim app
     # expects the extensions to be reachable in the parent directory of the kit file. We copy on every launch to
@@ -201,6 +201,7 @@ def _launch_app():
     assert "EXP_PATH" in os.environ, "The EXP_PATH variable is not set. Are you in an Isaac Sim installed environment?"
     exp_path = os.environ["EXP_PATH"]
     kit_file = Path(__file__).parent / kit_file_name
+    assert kit_file.exists(), f"OmniGibson kit file not found: {kit_file}"
     kit_file_target = Path(exp_path) / kit_file_name
     icon_file = Path(__file__).parents[2] / "docs" / "assets" / "OmniGibson_logo.png"
     icon_file_target = Path(exp_path) / "OmniGibson_logo.png"
