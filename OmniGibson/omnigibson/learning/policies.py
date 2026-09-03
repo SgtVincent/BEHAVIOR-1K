@@ -133,34 +133,60 @@ class DemoActionReplayPolicy:
         self.end_frame = int(end_frame) if end_frame is not None else None
         self.action_dim = action_dim
         self._step = 0
+        # Path of the parquet currently backing ``self.actions``.  Exposed so a
+        # caller can positively verify that switching demos actually switched
+        # the replayed data (see eval_golden_rule.setup_episode).
+        self.loaded_parquet_path: Optional[str] = None
 
         self._load_demo_data(self.demo_id, self.task_id)
 
     def _load_demo_data(self, demo_id: str, task_id: int) -> None:
-        """Load / reload the backing parquet for demo action replay."""
+        """Load / reload the backing parquet for demo action replay.
 
-        self.demo_id = str(demo_id).zfill(8)
-        self.task_id = int(task_id)
-        parquet_path = self.demo_data_path / "data" / f"task-{self.task_id:04d}" / f"episode_{self.demo_id}.parquet"
+        The switch is all-or-nothing.  ``self.demo_id`` / ``self.task_id`` used
+        to be assigned before the parquet was validated, so a failed load left
+        the object advertising the *new* demo id while still holding the *old*
+        actions.  ``load_demo`` compares against ``self.demo_id`` to decide
+        whether a reload is needed, so a retry of that same id then took the
+        "already loaded" branch, returned cleanly, and replayed the previous
+        demo's actions under the new name.  Identity is therefore committed
+        only once the data is in hand.
+        """
+
+        demo_id = str(demo_id).zfill(8)
+        task_id = int(task_id)
+        parquet_path = self.demo_data_path / "data" / f"task-{task_id:04d}" / f"episode_{demo_id}.parquet"
         if not parquet_path.exists():
             raise FileNotFoundError(f"Demo parquet not found: {parquet_path}")
 
         df = pd.read_parquet(parquet_path)
         if "action" not in df.columns:
             raise KeyError(f"Missing 'action' column in {parquet_path}")
-        self.actions = np.asarray(df["action"].tolist(), dtype=np.float32)
-        if self.actions.ndim != 2:
-            raise ValueError(f"Expected 2D action array, got shape={self.actions.shape}")
+        actions = np.asarray(df["action"].tolist(), dtype=np.float32)
+        if actions.ndim != 2:
+            raise ValueError(f"Expected 2D action array, got shape={actions.shape}")
+
+        # --- commit (everything above can still raise without side effects) ---
+        self.demo_id = demo_id
+        self.task_id = task_id
+        self.actions = actions
         if self.action_dim is None:
             self.action_dim = int(self.actions.shape[1])
+        self.loaded_parquet_path = str(parquet_path)
+        # Rewind: the frame cursor indexes into ``self.actions``, so it is
+        # meaningless once the backing array is replaced.  ``load_demo`` already
+        # rewinds on the "same demo" path; doing it here makes both paths agree
+        # instead of relying on a later ``reset()`` from the caller.
+        self._step = 0
         logging.info(
-            "Loaded demo action replay policy: demo=%s task_id=%d frames=%d start=%d end=%s action_dim=%d",
+            "Loaded demo action replay policy: demo=%s task_id=%d frames=%d start=%d end=%s action_dim=%d path=%s",
             self.demo_id,
             self.task_id,
             len(self.actions),
             self.start_frame,
             self.end_frame,
             self.action_dim,
+            self.loaded_parquet_path,
         )
 
     def load_demo(self, demo_id: str, task_id: Optional[int] = None) -> None:

@@ -55,6 +55,30 @@ except ModuleNotFoundError:
     _gt_plan_loader_mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_gt_plan_loader_mod)
     GTPlanLoader = _gt_plan_loader_mod.GTPlanLoader
+
+# Same dynamic-import workaround for the (simulator-free) diagnostics helpers.
+try:
+    from omnigibson.learning.utils.golden_rule_diagnostics import (
+        BRANCH_ORDER,
+        BRANCH_VERDICT_SEMANTICS,
+        run_skill_success_check,
+        summarize_skill_diagnostics,
+    )
+except ModuleNotFoundError:
+    import importlib.util
+    import os
+    _grd_path = os.path.join(
+        os.path.dirname(__file__), "utils", "golden_rule_diagnostics.py"
+    )
+    _grd_spec = importlib.util.spec_from_file_location(
+        "omnigibson.learning.utils.golden_rule_diagnostics", _grd_path
+    )
+    _grd_mod = importlib.util.module_from_spec(_grd_spec)
+    _grd_spec.loader.exec_module(_grd_mod)
+    BRANCH_ORDER = _grd_mod.BRANCH_ORDER
+    BRANCH_VERDICT_SEMANTICS = _grd_mod.BRANCH_VERDICT_SEMANTICS
+    run_skill_success_check = _grd_mod.run_skill_success_check
+    summarize_skill_diagnostics = _grd_mod.summarize_skill_diagnostics
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.eval_utils import (
     ROBOT_CAMERA_NAMES,
@@ -129,6 +153,25 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
         self._gt_plan_loader: Optional[GTPlanLoader] = None
         self._golden_rule_policy: Optional[Any] = None
 
+        # --- instrumentation (GT action replay arm) -----------------------
+        # Spec 2.2: on the ``terminated`` short-circuit the state-match errors
+        # used to be discarded, which blanked ``state_errors`` on exactly the
+        # path a GT-action replay takes most often.  They are now computed as
+        # diagnostics.  Set to False to restore the old (cheaper) behaviour.
+        self._diagnose_on_terminated: bool = bool(
+            cfg.get("golden_rule_diagnose_on_terminated", True)
+        )
+        # Spec 2.3: per-branch verdict table from the last check_skill_success.
+        self._last_skill_branch_verdicts: Optional[Dict[str, str]] = None
+        self._last_skill_branch_details: Optional[Dict[str, str]] = None
+        self._last_skill_decisive_branch: Optional[str] = None
+        self._last_state_errors_error: Optional[str] = None
+        # Spec 2.4: parquet actually backing the replay policy for this demo.
+        self._last_replay_source: Optional[str] = None
+        self._last_replay_reload: Optional[Dict[str, Any]] = None
+        # Why the last setup_episode returned False, if it did.
+        self._setup_error: Optional[str] = None
+
         logger.info("GoldenRuleEvaluator initialized")
         logger.info(f"  use_gt_plan={self.use_gt_plan}")
         logger.info(f"  skill_timeout_steps={self.skill_timeout_steps}")
@@ -191,6 +234,76 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
     # Episode / plan setup
     # ------------------------------------------------------------------
 
+    def _resolve_replay_policy(self) -> Optional[Any]:
+        """Return the object owning ``load_demo``, or None if there is none.
+
+        The golden-rule policy may be wrapped (``wrap_policy_locally=true``), so
+        look one level in as well -- the same shape ``eval.py`` uses when it
+        reaches the inner client via ``getattr(self.policy, "policy", None)``.
+        """
+        for candidate in (self.policy, getattr(self.policy, "policy", None)):
+            if candidate is not None and hasattr(candidate, "load_demo"):
+                return candidate
+        return None
+
+    def reload_replay_policy_for_demo(self, demo_id: str) -> Optional[Dict[str, Any]]:
+        """Point a demo-replay policy at *demo_id* before the episode starts.
+
+        Spec 2.4.  ``DemoActionReplayPolicy`` binds its parquet at construction
+        time, and both golden-rule entry points
+        (``eval_golden_rule.__main__`` and ``eval_golden_rule_batch``) reuse a
+        single evaluator across demos.  Without this the second and later demos
+        silently replay the *first* demo's actions -- no error, just wrong data.
+        Mirrors ``eval_segment.py:2476-2481``, including setting the frame
+        window before the reload.
+
+        Returns:
+            A record of the reload (``None`` when the policy does not replay
+            demos, e.g. a websocket policy).
+        """
+        policy = self._resolve_replay_policy()
+        if policy is None:
+            self._last_replay_source = None
+            self._last_replay_reload = None
+            return None
+
+        before = getattr(policy, "loaded_parquet_path", None)
+
+        model_cfg = self.cfg.get("model", None) or {}
+        task_id = model_cfg.get("task_id", None)
+        start_frame = model_cfg.get("start_frame", None)
+        end_frame = model_cfg.get("end_frame", None)
+
+        if start_frame is not None and hasattr(policy, "start_frame"):
+            policy.start_frame = int(start_frame)
+        if hasattr(policy, "end_frame"):
+            if end_frame is None or str(end_frame).lower() == "none":
+                policy.end_frame = None
+            else:
+                policy.end_frame = int(end_frame)
+
+        policy.load_demo(demo_id=demo_id, task_id=task_id)
+
+        after = getattr(policy, "loaded_parquet_path", None)
+        record: Dict[str, Any] = {
+            "demo_id": str(demo_id),
+            "task_id": None if task_id is None else int(task_id),
+            "parquet_before": None if before is None else str(before),
+            "parquet_after": None if after is None else str(after),
+            "parquet_changed": bool(before != after),
+            "start_frame": getattr(policy, "start_frame", None),
+            "end_frame": getattr(policy, "end_frame", None),
+        }
+        self._last_replay_source = record["parquet_after"]
+        self._last_replay_reload = record
+        logger.info(
+            "Replay policy rebound for demo %s: parquet=%s (changed=%s)",
+            demo_id,
+            record["parquet_after"],
+            record["parquet_changed"],
+        )
+        return record
+
     def setup_episode(self, demo_id: str) -> bool:
         """
         Load the GT skill plan for *demo_id* and prepare the evaluator.
@@ -201,6 +314,7 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
         self.current_demo_id = demo_id
         self.current_skill_idx = 0
         self.current_skill_step = 0
+        self._setup_error = None
 
         # Load skill plan into a fresh GTPlanLoader
         demo_data_path = self.cfg.get("demo_data_path", None)
@@ -244,6 +358,24 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
             self._golden_rule_policy.plan_loader = self._gt_plan_loader
             # Reset the wrapper so it starts from the first skill.
             self._golden_rule_policy.reset()
+
+        # Rebind a demo-replay policy to THIS demo before any data is loaded.
+        # Spec 2.4: without this a reused evaluator keeps replaying demo #1.
+        try:
+            self.reload_replay_policy_for_demo(demo_id)
+        except Exception as exc:  # noqa: BLE001
+            # Carrying on here would run the episode against the PREVIOUS demo's
+            # actions, which is precisely the silent failure 2.4 removes.  Fail
+            # this demo instead, so the run records a not-measured marker rather
+            # than a wrong number, and the remaining demos still execute.
+            logger.error(
+                "Failed to rebind replay policy to demo %s (%s); refusing to run "
+                "the episode against stale actions",
+                demo_id,
+                exc,
+            )
+            self._setup_error = f"replay_reload_failed: {type(exc).__name__}: {exc}"
+            return False
 
         # Load demo low-dim data for state-match checks
         self.current_demo_data = self.load_demo_lowdim_data(demo_id)
@@ -309,54 +441,51 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
             - "success_state" : state-match success against demo end frame
             - "timeout"       : exceeded step budget
             - "in_progress"   : still running
+
+        The verdict is unchanged from the original sequential early-return
+        criterion.  What is new is that every branch's outcome is recorded (see
+        ``golden_rule_diagnostics.BRANCH_VERDICT_SEMANTICS``) and that state
+        errors are also computed on the ``terminated`` short-circuit, purely as
+        diagnostics.  The decision logic itself lives in
+        ``omnigibson.learning.utils.golden_rule_diagnostics`` so it can be unit
+        tested without starting a simulator.
         """
         timeout = int(timeout_steps) if timeout_steps is not None else self.get_skill_timeout(skill)
 
         self._last_primitive_success_reason = None
         self._last_primitive_state_errors = None
+        self._last_skill_branch_verdicts = None
+        self._last_skill_branch_details = None
+        self._last_skill_decisive_branch = None
+        self._last_state_errors_error = None
 
-        if terminated:
-            self._last_primitive_success_reason = "env_terminated"
-            return True, "success_env"
+        outcome = run_skill_success_check(
+            skill=skill,
+            terminated=terminated,
+            current_step=current_step,
+            timeout=timeout,
+            state_match_enabled=bool(self.cfg.get("primitive_success_use_state_match", True)),
+            thresholds=self.get_primitive_success_thresholds(),
+            compute_state_errors=self.compute_primitive_state_errors,
+            diagnose_on_terminated=self._diagnose_on_terminated,
+        )
 
-        # Re-use the primitive-level state-match machinery from SubTaskEvaluator.
-        # We treat the skill's frame_duration as the primitive boundary.
-        if bool(self.cfg.get("primitive_success_use_state_match", True)):
-            errors = self.compute_primitive_state_errors(skill)
-            self._last_primitive_state_errors = errors
-            if errors is not None:
-                thr = self.get_primitive_success_thresholds()
-                std_rmse = errors.get("std_joint_qpos_rmse", float("inf"))
-                if np.isfinite(std_rmse) and std_rmse <= thr["std_joint_qpos_rmse"]:
-                    self._last_primitive_success_reason = "state_match_std_joint_qpos"
-                    return True, "success_state"
+        if outcome.state_errors_error is not None:
+            logger.warning(
+                "Diagnostic state-error computation failed on the terminated path "
+                "(verdict unaffected): %s",
+                outcome.state_errors_error,
+            )
 
-                eef_errs = [
-                    errors.get("eef_left_pos_err", float("inf")),
-                    errors.get("eef_right_pos_err", float("inf")),
-                ]
-                grip_errs = [
-                    errors.get("gripper_left_qpos_err", float("inf")),
-                    errors.get("gripper_right_qpos_err", float("inf")),
-                ]
-                has_eef = any(np.isfinite(x) for x in eef_errs)
-                has_grip = any(np.isfinite(x) for x in grip_errs)
-                if has_eef and has_grip:
-                    eef_ok = min(eef_errs) <= thr["eef_pos"]
-                    grip_ok = min(grip_errs) <= thr["gripper_qpos"]
-                    if eef_ok and grip_ok:
-                        self._last_primitive_success_reason = "state_match_eef_gripper"
-                        return True, "success_state"
+        decision = outcome.decision
+        self._last_primitive_state_errors = outcome.state_errors
+        self._last_state_errors_error = outcome.state_errors_error
+        self._last_primitive_success_reason = decision.success_reason
+        self._last_skill_branch_verdicts = dict(decision.branch_verdicts)
+        self._last_skill_branch_details = dict(decision.branch_details)
+        self._last_skill_decisive_branch = decision.decisive_branch
 
-                jq = errors.get("joint_qpos_rmse", float("inf"))
-                if np.isfinite(jq) and jq <= thr["joint_qpos_rmse"]:
-                    self._last_primitive_success_reason = "state_match_joint_rmse"
-                    return True, "success_state"
-
-        if current_step >= timeout:
-            return True, "timeout"
-
-        return False, "in_progress"
+        return decision.is_done, decision.result
 
     # ------------------------------------------------------------------
     # Core step
@@ -462,6 +591,32 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
     # Episode execution
     # ------------------------------------------------------------------
 
+    def _build_eval_config_snapshot(self) -> Dict[str, Any]:
+        """Resolved criterion config for this run, for embedding in the metrics JSON.
+
+        Spec 2.1.  Every threshold is resolved through
+        ``_get_cfg_float(key, default)`` (eval_subtask_reset.py:480), so the
+        defaults written in the source are *not* necessarily the values that
+        ran, and this file otherwise writes no config anywhere: its only two
+        outputs are the per-demo ``results`` and the ``aggregate``.  Without
+        this snapshot a finished run's thresholds are unrecoverable from its
+        products, and a success rate computed "assuming the defaults" cannot
+        serve as the yardstick the replay arm is meant to provide.
+        """
+        return {
+            "primitive_success_thresholds": {
+                str(k): float(v) for k, v in self.get_primitive_success_thresholds().items()
+            },
+            "primitive_success_use_state_match": bool(
+                self.cfg.get("primitive_success_use_state_match", True)
+            ),
+            "golden_rule_diagnose_on_terminated": bool(self._diagnose_on_terminated),
+            "skill_timeout_steps": int(self.skill_timeout_steps),
+            "skill_max_steps_multiplier": float(self.skill_max_steps_multiplier),
+            "max_steps": self.cfg.get("max_steps", None),
+            "policy_name": self.cfg.get("policy_name", None),
+        }
+
     def run_episode(self, demo_id: str) -> Dict[str, Any]:
         """
         Run a full episode for *demo_id* following the golden-rule skill plan.
@@ -477,8 +632,17 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
             - "terminated"         : whether the env terminated (task success)
             - "truncated"          : whether the env truncated
         """
+        # Spec 2.1: capture the resolved thresholds before setup, so they are
+        # present even on the setup-failure path.
+        eval_config_snapshot: Dict[str, Any] = self._build_eval_config_snapshot()
+
         if not self.setup_episode(demo_id):
-            return {"error": "setup_failed", "demo_id": demo_id}
+            return {
+                "error": "setup_failed",
+                "error_detail": getattr(self, "_setup_error", None),
+                "demo_id": demo_id,
+                "eval_config": eval_config_snapshot,
+            }
 
         skill_results: List[Tuple[str, bool, str]] = []
         skill_diagnostics: List[Dict[str, Any]] = []
@@ -533,15 +697,33 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
                             str(k): float(v) if np.isscalar(v) and np.isfinite(v) else str(v)
                             for k, v in state_errors.items()
                         }
+                    result_str = str(info.get("skill_result", ""))
+                    branch_verdicts = getattr(self, "_last_skill_branch_verdicts", None)
+                    branch_details = getattr(self, "_last_skill_branch_details", None)
                     skill_diagnostics.append(
                         {
                             "skill_idx": int(skill_idx),
                             "skill_desc": skill_desc,
                             "success": bool(success),
-                            "result": str(info.get("skill_result", "")),
+                            "result": result_str,
                             "steps": int(info.get("skill_step", self.current_skill_step)),
                             "success_reason": getattr(self, "_last_primitive_success_reason", None),
                             "state_errors": state_errors,
+                            # Spec 2.3: `success` conflates the two, so report the
+                            # env-termination signal and the state-match verdict
+                            # separately -- telling them apart is the whole point
+                            # of the GT-action-replay arm.
+                            "success_env": result_str == "success_env",
+                            "success_state": result_str == "success_state",
+                            # Spec 2.3: verdict for EVERY branch, where
+                            # "not-evaluated" (never reached / disabled / metric
+                            # absent) is a third state distinct from "fail".
+                            "branch_verdicts": dict(branch_verdicts) if branch_verdicts else None,
+                            "branch_details": dict(branch_details) if branch_details else None,
+                            "branch_order": list(BRANCH_ORDER),
+                            "decisive_branch": getattr(self, "_last_skill_decisive_branch", None),
+                            # Spec 2.2: non-null on the `terminated` path too.
+                            "state_errors_error": getattr(self, "_last_state_errors_error", None),
                         }
                     )
 
@@ -577,6 +759,13 @@ class GoldenRuleEvaluator(SubTaskEvaluator):
             "total_steps": total_steps,
             "terminated": bool(terminated),
             "truncated": bool(truncated),
+            # Spec 2.1: resolved thresholds / knobs for THIS run.
+            "eval_config": eval_config_snapshot,
+            # Spec 2.3: how to read the branch tables above.
+            "branch_verdict_semantics": BRANCH_VERDICT_SEMANTICS,
+            # Spec 2.4: which parquet actually backed the replay for this demo.
+            "replay_source_parquet": getattr(self, "_last_replay_source", None),
+            "replay_reload": getattr(self, "_last_replay_reload", None),
         }
 
         logger.info(f"Episode complete: {n_successes}/{len(self.current_skill_plan)} skills succeeded")
@@ -862,6 +1051,16 @@ if __name__ == "__main__":
             "successful_skills": evaluator.n_skill_successes,
             "total_episodes": evaluator.n_endtoend_trials,
             "successful_episodes": evaluator.n_endtoend_successes,
+            # Spec 2.1: resolved thresholds for this run, at the top level too.
+            "primitive_success_thresholds": {
+                str(k): float(v)
+                for k, v in evaluator.get_primitive_success_thresholds().items()
+            },
+            # Spec 2.3 / spec section 4: `skill_success_rate` above pools
+            # env-terminated and state-matched passes.  A terminated-driven pass
+            # says nothing about the state-match criterion, so the stratified
+            # counts are what the replay arm should be read from.
+            "skill_diagnostics_summary": summarize_skill_diagnostics(all_results),
             "per_demo_results": all_results,
         }
         with open(metrics_path / f"golden_rule_{config.task.name}_aggregate.json", "w") as f:
