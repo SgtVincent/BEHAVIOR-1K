@@ -70,12 +70,42 @@ class FakePost1Client:
         self._server_metadata = _metadata()
         return self._ws, self._server_metadata
 
+    def get_server_metadata(self):
+        return self._server_metadata
+
     def act(self, obs):
         self.acts.append(obs)
         return _action()
 
     def reset(self):
         self.reset_calls += 1
+
+
+class _GetterOnlyClient:
+    """Client whose metadata is exposed only through the public getter.
+
+    The adapter must read it via the getter and must not call the private
+    wait seam or write any private client attribute.
+    """
+
+    def __init__(self):
+        self._server_metadata = _metadata()
+        self.waited = False
+        self.acts = []
+
+    def get_server_metadata(self):
+        return self._server_metadata
+
+    def _wait_for_server(self):
+        self.waited = True
+        raise AssertionError("adapter must not drive the private wait seam")
+
+    def act(self, obs):
+        self.acts.append(obs)
+        return _action()
+
+    def reset(self):
+        pass
 
 
 def _caller(responses, chunk_size=contracts.CHUNK_SIZE):
@@ -226,3 +256,20 @@ def test_post1_transport_factory_builds_client_kwargs():
     assert seen["port"] == 9000
     assert seen["scheme"] == "ws"
     assert seen["allow_reconnect"] is True
+
+
+def test_post1_transport_uses_getter_without_private_wait_seam():
+    client = _GetterOnlyClient()
+    transport = caller.Post1WebsocketTransport(
+        host="127.0.0.1", port=8000, client=client)
+    meta = transport.connect()
+    assert meta["action_layout"] == contracts.SERVER_METADATA_LAYOUT
+    assert not client.waited
+    assert transport.metadata()["horizon"] == contracts.HORIZON
+
+
+def test_transport_does_not_write_client_private_state():
+    import inspect
+    src = inspect.getsource(caller.Post1WebsocketTransport.connect)
+    assert "client._server_metadata" not in src
+    assert "client._ws =" not in src

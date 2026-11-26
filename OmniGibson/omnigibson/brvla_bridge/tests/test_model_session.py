@@ -130,3 +130,24 @@ def test_urdf_missing_path_rejected():
     manifest.urdf = {"path": "/nonexistent/robot.urdf", "sha256": "0" * 64}
     with raises(Port2026Error):
         model_session.verify_urdf_identity(manifest)
+
+
+def test_build_state45_provider_binds_torso_cpu_fk():
+    path = _write_urdf()
+    try:
+        manifest = _manifest("/nonexistent/server.py", "0" * 64)
+        manifest.urdf = {"path": path, "sha256": _sha_file(path)}
+        provider = model_session.build_state45_provider(
+            manifest, velocity_provider=lambda: [0.0, 0.0, 0.0])
+        torso = [f for f in provider.descriptor().fields if f.role == "torso_se3"]
+        assert all(f.status == "bound_cpu_fk" for f in torso)
+        row = [0.0] * 61
+        row[3:10] = [0.1] * 7
+        row[28:35] = [0.2] * 7
+        row[53:57] = [0.05, -0.05, 0.1, -0.1]
+        row[24:26] = [0.02, 0.02]
+        row[49:51] = [0.03, 0.01]
+        state = provider.map_state(row)
+        assert len(state) == 45
+    finally:
+        os.remove(path)

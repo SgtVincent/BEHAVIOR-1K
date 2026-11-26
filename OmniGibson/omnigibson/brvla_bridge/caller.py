@@ -100,10 +100,19 @@ class Post1WebsocketTransport:
 
     def connect(self) -> Dict[str, Any]:
         client = self._resolve_client()
-        conn, metadata = client._wait_for_server()
-        client._ws = conn
-        client._server_metadata = metadata
-        self._metadata = dict(metadata)
+        # Read metadata through the client's public getter when available; the
+        # adapter never writes back the client's private ``_ws`` or
+        # ``_server_metadata``. The client owns its own connection lifecycle and
+        # lazily (re)populates private state on its first act()/reset().
+        metadata = None
+        getter = getattr(client, "get_server_metadata", None)
+        if callable(getter):
+            metadata = getter()
+        if metadata is None:
+            # Handshake seam: healthz poll, ws connect, first metadata frame.
+            # The returned connection/metadata are not persisted onto the client.
+            _conn, metadata = client._wait_for_server()
+        self._metadata = dict(metadata) if metadata else {}
         return self._metadata
 
     def request(self, obs: Dict[str, Any]) -> Dict[str, Any]:

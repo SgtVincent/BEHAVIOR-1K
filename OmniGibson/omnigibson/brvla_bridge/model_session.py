@@ -208,3 +208,23 @@ def build_torso_fk(manifest):
     urdf = verify_urdf_identity(manifest)
     chain = torso_fk.load_trunk_chain(urdf["path"])
     return torso_fk.TorsoFk(chain)
+
+
+def build_state45_provider(manifest, velocity_provider=None, remove_eef: bool = True):
+    """Assemble the 61-d -> state45 provider from the manifest-injected URDF.
+
+    The torso SE3 slots bind at the CPU FK layer: URDF path/sha are verified
+    here and the four-joint chain matches the frozen adapter (CPU cross-check
+    receipt). A live CPU-FK vs simulator-trunk relative-pose canary and the
+    physical tracking gate are separate later layers; this factory does not
+    certify either. The base-move provider is composed by the caller from the
+    confirmed robot-local velocity slice.
+    """
+    from . import state_mapping
+
+    torso_fk = build_torso_fk(manifest)
+    return state_mapping.OnlineState45Provider(
+        velocity_provider=velocity_provider,
+        torso_fk=torso_fk,
+        remove_eef=remove_eef,
+    )

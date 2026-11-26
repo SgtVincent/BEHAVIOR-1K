@@ -8,9 +8,13 @@ different source widths:
 
 Verified slices come from post1 ``eval/utils/eval_utils.py``
 ``PROPRIOCEPTION_INDICES["R1Pro"]``; the 45-slot assembly mirrors the frozen
-``br_state45_adapter.py`` (sha `8f7bb7b9…30f78f`). Slots whose source context
-is not yet verified (robot-local base velocity frame, torso FK chain) stay
-explicitly pending: they are never zero-filled, padded, or bridged from the
+``br_state45_adapter.py`` (sha `8f7bb7b9…30f78f`). The base-move frame was
+confirmed by the GPU1 live proprio sample (v3 receipt): ``base_qvel`` 0:3 is
+already robot-local ``[vx, vy, wz]``. The torso SE3 provider binds at the CPU
+FK layer once the manifest URDF identity and frozen-adapter chain cross-check
+pass; a live CPU-FK vs simulator-trunk relative-pose canary and the tracking
+gate are separate layers and do not hold the CPU binding pending. Unverified
+slots stay fail-closed: they are never zero-filled, padded, or bridged from the
 old 256-wide vector.
 """
 import math
@@ -126,11 +130,11 @@ class OnlineState45Provider(StateMappingProvider):
     Args:
         source_width: live proprio width (61 for the post1 R1Pro vector).
         velocity_provider: optional callable returning robot-local
-            ``[vx, vy, wz]``. Composed by the wrapper from
-            ``get_linear_velocity`` / ``get_angular_velocity`` and the base
-            orientation; the provider never reaches into privileged objects.
-            Until the frame is confirmed on a minimal GPU proprio sample this
-            stays ``None`` and slots 36:39 fail closed.
+            ``[vx, vy, wz]``. The frame was confirmed on the GPU1 v3 proprio
+            sample: the 61-d ``base_qvel`` slice 0:3 is already robot-local, so
+            the wrapper composes the provider from that slice; the provider
+            never reaches into privileged objects. When ``None`` slots 36:39
+            fail closed.
         torso_fk: optional :class:`~brvla_bridge.torso_fk.TorsoFk` loaded from
             the manifest-injected, sha-verified URDF. Until the chain is bound,
             slots 39:45 fail closed.
@@ -168,7 +172,7 @@ class OnlineState45Provider(StateMappingProvider):
         if role == "base_move":
             return "bound" if self._velocity_provider is not None else "unknown_pending"
         if role == "torso_se3":
-            return "bound" if self._torso_fk is not None else "unknown_pending"
+            return "bound_cpu_fk" if self._torso_fk is not None else "unknown_pending"
         return "bound"
 
     def descriptor(self) -> SchemaDescriptor:
@@ -176,7 +180,10 @@ class OnlineState45Provider(StateMappingProvider):
             FieldMapping(None, role, self._status(role),
                           "post1 61-d verified slice" if self._status(role) == "bound" else
                           ("EE forced zero under remove_eef_state topology" if self._status(role) == "ee_zero_profile"
-                           else "source context not verified; fail-closed"))
+                           else ("manifest URDF identity + CPU FK chain cross-checked; live sim-trunk "
+                                 "relative-pose canary and tracking gate remain separate"
+                                 if self._status(role) == "bound_cpu_fk"
+                                 else "source context not verified; fail-closed")))
             for role in SLOT_ROLES
         ]
         return SchemaDescriptor(
