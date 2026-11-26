@@ -25,11 +25,14 @@ __version__ = "0.1.0-candidate"
 
 from . import (  # noqa: F401
     backend,
+    caller,
     contracts,
     errors,
+    lineage,
     manifest,
     schema,
     state_mapping,
+    torso_fk,
     transport,
     ws_protocol,
 )

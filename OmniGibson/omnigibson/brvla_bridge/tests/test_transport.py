@@ -92,3 +92,25 @@ def test_inverse_cumulative_move_zero_move_is_zero():
 def test_step_base_velocity_zero_move_is_zero():
     vel = transport.step_base_velocity([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
     assert vel == [0.0, 0.0, 0.0]
+
+
+def test_nonzero_pose6_fixture_is_non_identity():
+    T = transport.pose_matrix([0.1, -0.2, 0.3, 0.1, 0.2, 0.3])
+    identity = _identity()
+    assert T != identity
+    assert abs(T[0][3] - 0.1) < 1e-9
+    assert abs(T[1][3] + 0.2) < 1e-9
+    assert abs(T[2][3] - 0.3) < 1e-9
+
+
+def test_nonzero_cumulative_move_fixture_gives_nonzero_velocity():
+    move = [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.1, 0.1, 0.0]]
+    vel = transport.inverse_cumulative_move(move, contracts.CONTROL_DT)
+    assert any(abs(v) > 1e-6 for row in vel for v in row)
+    assert vel[0] == [0.0, 0.0, 0.0]
+
+
+def test_step_base_velocity_nonzero_fixture():
+    vel = transport.step_base_velocity([0.1, 0.0, 0.0], [0.0, 0.0, 0.0])
+    assert abs(vel[0] - 0.1 / contracts.CONTROL_DT) < 1e-6
+    assert abs(vel[1]) < 1e-6
