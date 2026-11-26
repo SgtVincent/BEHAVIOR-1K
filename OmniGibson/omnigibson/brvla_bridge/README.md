@@ -32,6 +32,9 @@ schemas, mapping provider seam, transport, and the websocket protocol boundary.
 - `ws_protocol.py` post1 request/response, chunk cache, metadata gate, envelope
 - `backend.py` controller backend receipts and replay gate
 - `manifest.py` private frozen-asset manifest loader
+- `replay_policy.py` managed policy bound to one pinned converted episode;
+  instantiated by the official evaluator hydra seam, returns saved execution23
+  rows only (no model call, no IK solve, no custom step loop)
 - `tests/` stdlib runner, positive and negative cases
 
 ## Tests

@@ -31,6 +31,7 @@ from . import (  # noqa: F401
     lineage,
     manifest,
     model_session,
+    replay_policy,
     schema,
     state_mapping,
     torso_fk,
