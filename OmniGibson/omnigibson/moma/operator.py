@@ -160,8 +160,33 @@ class MomaEpisodeOperator:
 
     def observe(self) -> Dict[str, Any]:
         scope = self._resolve_scene_objects()
+        missing_cans = [name for name in self.cfg.can_names if name not in scope]
+        bucket = scope.get(self.cfg.bucket_name)
+
+        # Missing scene objects must surface as BLOCKED observation entries,
+        # never a bare KeyError and never a zero-filled placeholder.
+        if missing_cans or bucket is None:
+            obs: Dict[str, Any] = {
+                "objects": {},
+                "task_progress": {},
+                "runner_state": "blocked",
+                "decision_required": False,
+                "active_request": None,
+            }
+            for name in missing_cans:
+                obs["objects"][name] = {"status": "BLOCKED", "error": "object_not_in_scope", "object": name}
+            if bucket is None:
+                obs["objects"][self.cfg.bucket_name] = {
+                    "status": "BLOCKED", "error": "object_not_in_scope",
+                    "object": self.cfg.bucket_name,
+                }
+            arms: Dict[str, Any] = {}
+            for arm in self.robot.arm_names():
+                arms[arm] = self.robot.safe_hand_record(arm)
+            obs["robot_state"] = {"arms": arms}
+            return obs
+
         cans = {name: scope[name] for name in self.cfg.can_names}
-        bucket = scope[self.cfg.bucket_name]
         obs = self.observe_fn(
             self.robot.robot,
             cans,
@@ -170,7 +195,7 @@ class MomaEpisodeOperator:
             inside_type=self.live_reads.get("inside_type"),
             contact_type=self.live_reads.get("contact_type"),
         )
-        arms: Dict[str, Any] = {}
+        arms = {}
         for arm in self.robot.arm_names():
             arms[arm] = self.robot.safe_hand_record(arm)
         obs.setdefault("robot_state", {})["arms"] = arms

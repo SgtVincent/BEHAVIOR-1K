@@ -183,6 +183,31 @@ def test_full_task_terminal_rejects_missing_can_inside():
     assert full_task_terminal(obs, CFG) is False
 
 
+def test_bddl_true_but_bucket_release_missing_is_not_terminal():
+    obs = _terminal_obs(task_progress=_progress({"bucket_release_observed": False}))
+    assert full_task_terminal(obs, CFG) is False
+
+
+def test_bddl_true_but_one_can_release_missing_is_not_terminal():
+    releases = {c: True for c in CANS}
+    releases[CANS[1]] = False
+    obs = _terminal_obs(task_progress=_progress({"can_release_observed": releases}))
+    assert full_task_terminal(obs, CFG) is False
+
+
+def test_bddl_true_but_bucket_not_on_floor_is_not_terminal():
+    objects = _default_objects()
+    objects[BUCKET] = {"on_ground": True, "contact_bodies": ["/table/top"]}
+    obs = _terminal_obs(objects=objects)
+    assert full_task_terminal(obs, CFG) is False
+
+
+def test_bddl_true_but_residual_constraint_is_not_terminal():
+    obs = _terminal_obs()
+    obs["robot_state"]["arms"]["right"]["constraint_present"] = True
+    assert full_task_terminal(obs, CFG) is False
+
+
 def test_full_task_terminal_rejects_non_empty_hands():
     obs = _terminal_obs()
     obs["robot_state"]["arms"]["left"]["object_in_hand"] = CANS[2]
