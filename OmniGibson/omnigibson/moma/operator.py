@@ -41,6 +41,10 @@ class EpisodeImmutableAfterStart(RuntimeError):
     """Post-start state mutation (reset/load_state/teleport) was attempted."""
 
 
+class ExecutorAdapterMissing(RuntimeError):
+    """No MP executor is bound. The operator refuses to plan or env.step."""
+
+
 @dataclass
 class EpisodeConfig:
     run_id: str
@@ -224,6 +228,19 @@ class MomaEpisodeOperator:
         events = self._events(current)
         arms = dict(current.get("robot_state", {}).get("arms", {}))
 
+        # Boundary short-circuit: a blocked / non-decision observation must not
+        # reach the S2 HTTP caller or the executor. No API request, no env.step.
+        if current.get("runner_state") == "blocked" or current.get("decision_required") is not True:
+            events = events + [{
+                "type": "boundary_blocked",
+                "reason": current.get("runner_state") or "decision_not_required",
+            }]
+            record = StepRecord(step=self._step, action_label=None, action_dim=None,
+                                events=events, arms=arms)
+            self._previous_obs = current
+            self.records.append(record)
+            return record
+
         terminal = full_task_terminal(current, self._s2_cfg())
         record = StepRecord(step=self._step, action_label=None, action_dim=None, events=events, arms=arms)
 
@@ -232,6 +249,11 @@ class MomaEpisodeOperator:
             self._previous_obs = current
             self.records.append(record)
             return record
+
+        if self.executor is None:
+            raise ExecutorAdapterMissing(
+                "MP executor adapter missing; no plan and no env.step issued"
+            )
 
         decision = self.request_decision(current)
         plan = self.executor.plan(decision["args"])

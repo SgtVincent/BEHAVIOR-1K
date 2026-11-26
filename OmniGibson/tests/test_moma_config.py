@@ -1,4 +1,6 @@
 """CPU tests for the frozen a28 effective runner configuration."""
+import pytest
+
 from omnigibson.moma.config import (
     RunnerConfig,
     FROZEN_CAN_NAMES,
@@ -60,3 +62,31 @@ def test_unknown_primitive_rejected():
     cfg = _cfg(allowed_primitives=["not_a_real_primitive"])
     problems = cfg.validate()
     assert any(p.startswith("unknown_primitives") for p in problems)
+
+
+def test_from_frozen_baseline_allows_only_endpoint_output_paths():
+    cfg = RunnerConfig.from_frozen_baseline(
+        "run-whitelist",
+        output_dir="/tmp/moma-out",
+        model_base_url="http://127.0.0.1:10823/v1",
+        asset_manifest_path="/dev/shm/moma/manifest.json",
+    )
+    assert cfg.output_dir == "/tmp/moma-out"
+    assert cfg.model_base_url == "http://127.0.0.1:10823/v1"
+    assert cfg.asset_manifest_path == "/dev/shm/moma/manifest.json"
+    # Frozen criteria / controller / scene fields stay at baseline values.
+    assert cfg.step_hz == 30 and cfg.physics_hz == 120
+    assert cfg.task_name == FROZEN_TASK_NAME
+    assert cfg.can_names == FROZEN_CAN_NAMES
+    assert cfg.bucket_name == FROZEN_BUCKET_NAME
+
+
+@pytest.mark.parametrize("field", [
+    "initial_state_npz", "initial_state_hdf5", "task_name", "can_names",
+    "bucket_name", "robot_name", "condition", "step_hz", "physics_hz",
+    "max_steps", "policy_mode", "allowed_primitives", "primitive_caps",
+    "assisted_grasping", "max_decisions",
+])
+def test_from_frozen_baseline_rejects_frozen_field_override(field):
+    with pytest.raises(ValueError, match="frozen_baseline_override_rejected"):
+        RunnerConfig.from_frozen_baseline("run-reject", **{field: "tampered"})

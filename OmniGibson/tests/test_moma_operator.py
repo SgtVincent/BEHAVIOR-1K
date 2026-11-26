@@ -12,9 +12,12 @@ from omnigibson.moma.operator import (
     EpisodeConfig,
     MomaEpisodeOperator,
     EpisodeImmutableAfterStart,
+    ExecutorAdapterMissing,
 )
 from omnigibson.moma.sdk import SdkEnvironmentAdapter, SdkRobotAccessor
 from omnigibson.moma.schema import NATIVE23_JOINT, native23_action
+from omnigibson.moma.s2.client import ChatCompletionsClient
+from omnigibson.moma.s2.rule_service import RuleS2Service
 
 CANS = ["can_of_soda_114", "can_of_soda_115", "can_of_soda_113"]
 BUCKET = "trash_can_116"
@@ -25,6 +28,52 @@ CFG = {
     "allowed_primitives": ["approach_object", "stabilize_and_brake"],
     "primitive_caps": {"approach_object": 300, "stabilize_and_brake": 1800},
 }
+
+MODEL = "fake-embodied-s2-native-v2"
+S2_CFG = {
+    "can_names": CANS,
+    "bucket_name": BUCKET,
+    "allowed_primitives": [
+        "continue_nominal_tracking", "stabilize_and_brake", "open_right_gripper",
+        "retract_to_pregrasp", "reanchor_to_live_object", "approach_object",
+        "close_and_acquire_grasp",
+    ],
+    "primitive_caps": {
+        "continue_nominal_tracking": 12000,
+        "stabilize_and_brake": 120,
+        "open_right_gripper": 120,
+        "retract_to_pregrasp": 240,
+        "reanchor_to_live_object": 240,
+        "approach_object": 800,
+        "close_and_acquire_grasp": 60,
+    },
+}
+
+
+def _loopback_obs():
+    return {
+        "runner_state": "decision_required",
+        "decision_required": True,
+        "active_request": None,
+        "robot_state": {"arms": {
+            "left": {"object_in_hand": None, "constraint_present": False,
+                     "release_counter": None, "valid_sdk_hold": False},
+            "right": {"object_in_hand": None, "constraint_present": False,
+                      "release_counter": None, "valid_sdk_hold": False},
+        }},
+        "allowed_primitives_schema": {
+            "continue_nominal_tracking": {
+                "allowed_objects": [None, *CANS, BUCKET],
+                "min_steps": 1, "max_steps": 15000, "default_max_steps": 3000,
+                "allowed_stop_conditions": ["next_grasp_check_or_episode_end", "episode_end"],
+            },
+            "approach_object": {
+                "allowed_objects": CANS, "min_steps": 10, "max_steps": 800,
+                "default_max_steps": 600, "allowed_stop_conditions": None,
+            },
+        },
+        "objects": {c: {"inside_bucket": False, "contact_bodies": []} for c in CANS},
+    }
 
 
 class _GraspState:
@@ -127,13 +176,18 @@ def _terminal_obs():
     }
 
 
-def _make_operator(obs, executor=None, s2=None):
+_UNSET = object()
+
+
+def _make_operator(obs, executor=_UNSET, s2=_UNSET):
     scope = _scope()
     env = FakeEnv(scope)
     adapter = SdkEnvironmentAdapter(env, 0)
     robot = SdkRobotAccessor(FakeRobot())
-    executor = executor or FakeExecutor()
-    s2 = s2 or FakeS2()
+    if executor is _UNSET:
+        executor = FakeExecutor()
+    if s2 is _UNSET:
+        s2 = FakeS2()
 
     def observe_fn(robot_, cans, bucket, pose_fn=None, inside_type=None, contact_type=None):
         return obs
@@ -229,9 +283,79 @@ def test_observe_missing_scope_objects_return_blocked_not_keyerror():
     assert set(obs["robot_state"]["arms"]) == {"left", "right"}
 
 
+def test_blocked_observation_short_circuits_before_s2_and_step():
+    scope = {BUCKET: SimpleNamespace(name=BUCKET)}  # cans absent: blocked scope
+    env = FakeEnv(scope)
+    adapter = SdkEnvironmentAdapter(env, 0)
+    robot = SdkRobotAccessor(FakeRobot())
+    s2 = FakeS2()
+    op = MomaEpisodeOperator(
+        EpisodeConfig(run_id="run-blocked-step", can_names=CANS, bucket_name=BUCKET, max_steps=10),
+        adapter,
+        robot,
+        observe_fn=lambda *a, **k: {},
+        transition_fn=lambda *a: [],
+        executor=FakeExecutor(),
+        s2_client=s2,
+        live_reads={"s2_cfg": CFG},
+    )
+    op.reset_episode()
+    record = op.step()
+
+    assert record.terminal is False
+    assert record.action_label is None
+    assert env.steps == []
+    assert s2.calls == 0
+    assert any(e["type"] == "boundary_blocked" for e in record.events)
+
+
 def test_closed_loop_requires_bddl_success_and_terminal_gate():
     op, _, _, _ = _make_operator(_terminal_obs())
     op.reset_episode()
     # FakeEnv task.success stays False: BDDL alone is not enough, and a False
     # BDDL dict must never be truthy-coerced.
     assert op.closed_loop_success() is False
+
+
+def test_loopback_http_decision_reaches_operator_consumer():
+    """Real local HTTP: rule service -> S2 client -> operator consumer -> env.step."""
+    service = RuleS2Service(model_name=MODEL, cfg=S2_CFG)
+    service.start()
+    try:
+        client = ChatCompletionsClient(
+            base_url=service.base_url, model=MODEL, prompt_text="test",
+            cfg=S2_CFG, history_turns=8, timeout_s=5.0,
+        )
+        op, env, executor, _ = _make_operator(_loopback_obs(), s2=client)
+        op.reset_episode()
+        record = op.step()
+
+        assert record.action_label == NATIVE23_JOINT
+        assert record.action_dim == 23
+        assert len(env.steps) == 1 and len(env.steps[0]) == 23
+        assert executor.plans[0]["primitive"] == "continue_nominal_tracking"
+        assert executor.plans[0]["target_object"] == CANS[0]
+        assert record.s2["call_id"].startswith("call_")
+        assert record.s2["request_sha256"]
+        assert len(service.requests) == 1
+    finally:
+        service.stop()
+
+
+def test_missing_executor_blocks_before_decision_and_step():
+    """No MP adapter: explicit blocker, no S2 round-trip, no env.step."""
+    service = RuleS2Service(model_name=MODEL, cfg=S2_CFG)
+    service.start()
+    try:
+        client = ChatCompletionsClient(
+            base_url=service.base_url, model=MODEL, prompt_text="test",
+            cfg=S2_CFG, history_turns=8, timeout_s=5.0,
+        )
+        op, env, _, _ = _make_operator(_loopback_obs(), executor=None, s2=client)
+        op.reset_episode()
+        with pytest.raises(ExecutorAdapterMissing):
+            op.step()
+        assert env.steps == []
+        assert service.requests == []
+    finally:
+        service.stop()
