@@ -74,8 +74,8 @@ ACTION_KEY = "action"
 ACTION_CHUNK_KEY = "action_chunk"
 SERVER_TIMING_KEY = "server_timing"
 RESET_KEY = "reset"
-NDARRAY_KEY = "__ndarray__"
-NPGENERIC_KEY = "__npgeneric__"
+NDARRAY_KEY = b"__ndarray__"
+NPGENERIC_KEY = b"__npgeneric__"
 
 # Frozen server metadata contract (checked at policy reset).
 SERVER_METADATA_FIELDS = ("action_layout", "horizon", "chunk_generated",

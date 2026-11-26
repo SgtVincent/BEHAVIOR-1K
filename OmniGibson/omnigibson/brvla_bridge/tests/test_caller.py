@@ -50,6 +50,34 @@ class FakeTransport:
         self.reset_calls.append(request)
 
 
+class _FakeConn:
+    def close(self):
+        self.closed = True
+
+
+class FakePost1Client:
+    """Stand-in for the post1 WebsocketClientPolicy (same method surface)."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self._ws = None
+        self._server_metadata = None
+        self.acts = []
+        self.reset_calls = 0
+
+    def _wait_for_server(self):
+        self._ws = _FakeConn()
+        self._server_metadata = _metadata()
+        return self._ws, self._server_metadata
+
+    def act(self, obs):
+        self.acts.append(obs)
+        return _action()
+
+    def reset(self):
+        self.reset_calls += 1
+
+
 def _caller(responses, chunk_size=contracts.CHUNK_SIZE):
     transport = FakeTransport(_metadata(), responses)
     return caller.WsPolicyCaller(
@@ -159,3 +187,42 @@ def test_model_input_adapter_builds_frozen_bundle():
         assert len(bundle["br_action_is_pad"]) == contracts.CHUNK_SIZE
     finally:
         os.remove(urdf)
+
+
+def test_post1_transport_wraps_real_client_surface():
+    client = FakePost1Client()
+    transport = caller.Post1WebsocketTransport(
+        host="127.0.0.1", port=8000, action_chunk_size=contracts.CHUNK_SIZE,
+        client=client)
+    obj = caller.WsPolicyCaller(
+        "127.0.0.1", 8000, chunk_size=contracts.CHUNK_SIZE,
+        transport=transport, wire=FakeWire())
+    meta = obj.connect()
+    assert meta["action_layout"] == contracts.SERVER_METADATA_LAYOUT
+    obs = {"robot_r1::proprio": [0.0] * 61}
+    action = obj.forward(obs)
+    assert action == _action()
+    sent = client.acts[0]
+    assert sent["robot_r1::proprio"] == obs["robot_r1::proprio"]
+    assert sent[contracts.ACTION_CHUNK_REQUEST_KEY] == contracts.CHUNK_SIZE
+    obj.reset()
+    assert client.reset_calls == 1
+    transport.close()
+    assert client._ws.closed
+
+
+def test_post1_transport_factory_builds_client_kwargs():
+    seen = {}
+
+    def factory(kwargs):
+        seen.update(kwargs)
+        return FakePost1Client(**kwargs)
+
+    transport = caller.Post1WebsocketTransport(
+        host="10.0.0.5", port=9000, scheme="ws", allow_reconnect=True,
+        client_factory=factory)
+    transport.connect()
+    assert seen["host"] == "10.0.0.5"
+    assert seen["port"] == 9000
+    assert seen["scheme"] == "ws"
+    assert seen["allow_reconnect"] is True

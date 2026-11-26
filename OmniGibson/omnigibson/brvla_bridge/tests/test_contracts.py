@@ -51,4 +51,4 @@ def test_wire_keys_match_post1():
     assert contracts.ACTION_KEY == "action"
     assert contracts.ACTION_CHUNK_KEY == "action_chunk"
     assert contracts.RESET_KEY == "reset"
-    assert contracts.NDARRAY_KEY == "__ndarray__"
+    assert contracts.NDARRAY_KEY == b"__ndarray__"

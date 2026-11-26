@@ -155,15 +155,21 @@ def verify_metadata(
 # ---- msgpack ndarray envelope (post1 pack_data / unpack_data semantics) ---
 
 def pack_data(obj: Any) -> Any:
-    if hasattr(obj, "detach") and hasattr(obj, "cpu"):  # torch tensor duck
+    # Duck-typed port of post1 network_utils.pack_data (tensor -> numpy first).
+    if hasattr(obj, "detach") and hasattr(obj, "cpu"):
         obj = obj.detach().cpu().numpy()
     if hasattr(obj, "dtype") and hasattr(obj, "tobytes"):  # numpy ndarray duck
-        dtype = obj.dtype.str
         return {
             contracts.NDARRAY_KEY: True,
-            "data": obj.tobytes(),
-            "dtype": dtype,
-            "shape": list(obj.shape),
+            b"data": obj.tobytes(),
+            b"dtype": obj.dtype.str,
+            b"shape": list(obj.shape),
+        }
+    if hasattr(obj, "dtype") and hasattr(obj, "item"):  # numpy generic duck
+        return {
+            contracts.NPGENERIC_KEY: True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
         }
     return obj
 
@@ -171,10 +177,11 @@ def pack_data(obj: Any) -> Any:
 def unpack_data(obj: Any) -> Any:
     if isinstance(obj, dict) and contracts.NDARRAY_KEY in obj:
         np = _numpy()
-        return np.ndarray(buffer=obj["data"], dtype=np.dtype(obj["dtype"]), shape=tuple(obj["shape"]))
+        return np.ndarray(buffer=obj[b"data"], dtype=np.dtype(obj[b"dtype"]),
+                          shape=tuple(obj[b"shape"]))
     if isinstance(obj, dict) and contracts.NPGENERIC_KEY in obj:
         np = _numpy()
-        return np.dtype(obj["dtype"]).type(obj["data"])
+        return np.dtype(obj[b"dtype"]).type(obj[b"data"])
     return obj
 
 

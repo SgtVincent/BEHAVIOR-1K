@@ -34,7 +34,9 @@ class LineageReport:
 
 
 def _stat_arrays(record: Dict[str, Any], stat_key: str) -> Dict[str, Any]:
-    return record.get("shapes", {}).get(stat_key, {})
+    shapes = record.get("shapes", {})
+    # Manifest keys carry the "stats." prefix; accept either form.
+    return shapes.get(stat_key) or shapes.get(f"stats.{stat_key}") or {}
 
 
 def _check_width(record, stat_key, array_names, expected, problems, checks):
