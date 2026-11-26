@@ -23,12 +23,18 @@ Stdlib-only at import.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from . import contracts, native_action, planner_grid, scope
 from .delta_tf import FixedAnchorTargets
 from .errors import BackendNotDeclaredError, ContractViolation
-from .native_action import SOURCE_PLANNER, SOURCE_REPLAY, assemble_native23, extract_group
+from .native_action import (
+    SOURCE_CURRENT_Q,
+    SOURCE_PLANNER,
+    SOURCE_REPLAY,
+    assemble_native23,
+    extract_group,
+)
 
 
 class ReplayWrapperViolation(ContractViolation):
@@ -58,6 +64,7 @@ class ManagedReplayWrapper:
         executor: Optional[Any] = None,
         planner_dt: float = planner_grid.PLANNER_DT_S,
         physics_dt: float = contracts.CONTROL_DT,
+        current_q: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         if not isinstance(targets, FixedAnchorTargets):
             raise ReplayWrapperViolation("targets must be a FixedAnchorTargets")
@@ -67,6 +74,23 @@ class ManagedReplayWrapper:
         self._executor = executor
         self._planner_dt = float(planner_dt)
         self._physics_dt = float(physics_dt)
+        # Inactive-arm current-q bindings: group name -> bind entry from
+        # :func:`native_action.bind_current_q`. An unbound inactive group
+        # still fails closed; no zero default is substituted.
+        self._current_q: Dict[str, Dict[str, Any]] = dict(current_q or {})
+
+    def bind_current_q(
+        self,
+        arm: str,
+        qpos: Sequence[Any],
+        *,
+        source_sha256: str,
+        source_kind: str = "live_sdk_qpos",
+    ) -> None:
+        """Bind an inactive arm's live current qpos to hold under collision."""
+        entry = native_action.bind_current_q(
+            arm, qpos, source_sha256=source_sha256, source_kind=source_kind)
+        self._current_q[entry["group"]] = entry
 
     # -- read-only identity -------------------------------------------------
 
@@ -164,28 +188,37 @@ class ManagedReplayWrapper:
         planner_row = list(command["native23"])
 
         evidence = self._scope.evidence
+        bound_arm = evidence.get("bound_arm")
+        left_planned = bound_arm in (scope.ARM_LEFT, scope.ARM_BOTH)
         right_certified = evidence.get("right_arm_planned") is True
+
+        def _arm(group: str, planned: bool) -> tuple:
+            if planned:
+                return extract_group(planner_row, group), SOURCE_PLANNER, None
+            entry = self._current_q.get(group)
+            if entry is not None:
+                return list(entry["values"]), SOURCE_CURRENT_Q, entry
+            return None, "missing", None
+
+        arm_left, src_left, q_left = _arm("arm_left", left_planned)
+        arm_right, src_right, q_right = _arm("arm_right", right_certified)
 
         groups = {
             "trunk": extract_group(planner_row, "trunk"),
-            "arm_left": extract_group(planner_row, "arm_left"),
+            "arm_left": arm_left,
             "gripper_left": [float(target["continuous_gripper"][0])],
             "gripper_right": [float(target["continuous_gripper"][1])],
             "base": list(target["base_velocity_body"]),
+            "arm_right": arm_right,
         }
         sources = {
             "trunk": SOURCE_PLANNER,
-            "arm_left": SOURCE_PLANNER,
+            "arm_left": src_left,
             "gripper_left": SOURCE_REPLAY,
             "gripper_right": SOURCE_REPLAY,
             "base": SOURCE_REPLAY,
+            "arm_right": src_right,
         }
-        if right_certified:
-            groups["arm_right"] = extract_group(planner_row, "arm_right")
-            sources["arm_right"] = SOURCE_PLANNER
-        else:
-            groups["arm_right"] = None
-            sources["arm_right"] = "missing"
 
         assembled = assemble_native23(
             base_vel=groups["base"],
@@ -196,11 +229,17 @@ class ManagedReplayWrapper:
             gripper_right=groups["gripper_right"],
             sources=sources,
         )
+        held_q = {
+            g: {"source": e["source"], "source_kind": e["source_kind"],
+                "source_sha256": e["source_sha256"]}
+            for g, e in (("arm_left", q_left), ("arm_right", q_right)) if e is not None
+        }
         assembled.update({
             "physics_step": physics_step,
             "planner_segment": command["planner_segment"],
             "fraction": command["fraction"],
             "time_s": command["time_s"],
             "target_row": target["source_row"],
+            "held_current_q": held_q,
         })
         return assembled

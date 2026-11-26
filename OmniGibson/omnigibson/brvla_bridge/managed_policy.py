@@ -24,7 +24,7 @@ import os
 import pathlib
 from typing import Any, Dict, List, Optional
 
-from . import contracts, delta_tf, plan_wrapper, scope
+from . import action_tag, contracts, delta_tf, plan_wrapper, scope
 from .errors import ContractViolation, Port2026Error
 from .replay_policy import DemoReplayPolicy
 
@@ -157,9 +157,20 @@ class ManagedReplayPolicy:
 
     def forward(self, obs: Optional[dict] = None, **kwargs: Any) -> Any:
         native23 = self._next_native23()
+        # Boundary: the wrapper output is tagged joint-native23 and re-checked
+        # by the consumer guard before it leaves the policy. A non-native or
+        # non-finite vector raises ControlledActionBlocked; no bare physical
+        # row reaches the evaluator.
+        tagged = action_tag.tag_native23(
+            native23["vector"],
+            provenance={"sources": native23["sources"],
+                        "held_current_q": native23.get("held_current_q", {}),
+                        "target_row": native23["target_row"]},
+        )
+        vector = action_tag.assert_native23_joint(tagged)
         import torch  # lazy; package import stays torch-free
 
-        return torch.tensor(native23["vector"], dtype=torch.float32)
+        return torch.tensor(vector, dtype=torch.float32)
 
     act = forward
 

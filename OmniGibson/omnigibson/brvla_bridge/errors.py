@@ -18,3 +18,13 @@ class BackendNotDeclaredError(Port2026Error):
 
 class ContractViolation(Port2026Error):
     """Server metadata, layout, step count, or frozen identity mismatch."""
+
+
+class ControlledActionBlocked(ContractViolation):
+    """An action without a legal joint-native23 label reached the step boundary.
+
+    Raised by the consumer guard immediately before the official ``env.step``.
+    The model query may have succeeded; the action is held and zero simulator
+    steps are taken. Same-width physical23 / IK-target23 rows must never be
+    stepped as joint-native23 commands.
+    """

@@ -20,6 +20,10 @@ ARM_RIGHT = "right"
 ARM_BOTH = "both"
 ALLOWED_ARMS = (ARM_LEFT, ARM_RIGHT, ARM_BOTH)
 
+# Scene identity values that never count as a proven live scene.
+_LIVE_SCENE_NULL_VALUES = {"", "null", "none", "unknown", "scene_unknown",
+                           "scene=NULL", "scene_model_null"}
+
 
 @dataclass(frozen=True)
 class ScopeReport:
@@ -152,12 +156,31 @@ def verify_receipt(
         missing.append("left_arm_unproven")
     if required_arm in (ARM_RIGHT, ARM_BOTH) and right_planned is not True:
         missing.append("right_arm_unproven")
+    if right_planned is True and bound_arm not in (ARM_RIGHT, ARM_BOTH):
+        missing.append("right_arm_bound_arm_mismatch")
 
-    # -- live scene scope -----------------------------------------------------
+    # -- live scene scope ------------------------------------------------------
+    # A live-scene plan needs an explicit identity receipt: a non-null scene
+    # identity, a source epoch, and the pinned config sha back-link. Empty,
+    # None, "unknown", or "scene=NULL" values all block; a null token in the
+    # scope text blocks. Until that receipt exists the consumer must serve an
+    # exported / obstacle-cache root unit, not a live-scene plan.
     scope_text = str(cert.get("certified_scope") or "")
     evidence["certified_scope"] = scope_text
-    if require_live_scene and "scene_model_null" in scope_text:
-        missing.append("live_scene_unproven")
+    scene_identity = cert.get("scene_identity")
+    identity_plain = "" if scene_identity is None else str(scene_identity).strip().lower()
+    null_tokens = ("scene_model_null", "scene_unknown", "scene=NULL", "null", "unknown", "none")
+    null_in_text = any(tok in scope_text.lower() for tok in null_tokens)
+    evidence["scene_identity"] = scene_identity
+    evidence["source_epoch"] = cert.get("source_epoch")
+    if require_live_scene:
+        if (identity_plain in _LIVE_SCENE_NULL_VALUES or null_in_text):
+            missing.append("live_scene_unproven")
+        else:
+            if not cert.get("source_epoch"):
+                missing.append("live_scene_source_epoch_unproven")
+            if not cert.get("config_yml_sha256"):
+                missing.append("live_scene_config_sha_unproven")
 
     # -- trajectory shape ----------------------------------------------------
     evidence["trajectory"] = {

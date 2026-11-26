@@ -32,6 +32,7 @@ def _receipt(**overrides):
         "right_arm_planned": False, "device_uuid": "GPU-abc",
         "device_uuid_source": "manifest_argument_not_live_probe",
         "receipt": "r", "config_yml_sha256": "c",
+        "scene_identity": None, "source_epoch": None,
     }
     certificate.update(overrides)
     return {
@@ -89,7 +90,8 @@ def test_left_policy_blocks_unproven_right_group():
 
 def test_dual_certified_policy_composes_native23():
     receipt = _receipt(bound_arm="both", right_arm_planned=True,
-                       certified_scope="dual_arm; live_scene_known")
+                       certified_scope="dual_arm; live_scene_known",
+                       scene_identity="scene_ep0475_001", source_epoch="epoch-1")
     policy = _policy(receipt, required_arm="both", require_live_scene=True)
     out = policy._next_native23()
     assert len(out["vector"]) == contracts.ACTION23
@@ -109,7 +111,8 @@ def test_empty_receipt_blocks_construction():
 
 def test_reset_clears_plan_cache():
     receipt = _receipt(bound_arm="both", right_arm_planned=True,
-                       certified_scope="dual_arm; live_scene_known")
+                       certified_scope="dual_arm; live_scene_known",
+                       scene_identity="scene_ep0475_001", source_epoch="epoch-1")
     policy = _policy(receipt, required_arm="both", require_live_scene=True)
     policy._next_native23()
     policy.reset()

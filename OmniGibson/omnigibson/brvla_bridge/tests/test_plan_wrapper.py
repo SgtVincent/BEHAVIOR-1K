@@ -5,7 +5,7 @@ plan -> grid -> native23 assembly, replay-sourced base/gripper groups, the
 right-arm unproven fail-closed gap, missing-executor and missing-waypoint
 gates. No planner, simulator, torch, numpy, or omnigibson is imported.
 """
-from brvla_bridge import contracts, delta_tf, plan_wrapper, scope
+from brvla_bridge import contracts, delta_tf, native_action, plan_wrapper, scope
 from brvla_bridge.errors import BackendNotDeclaredError, ContractViolation
 
 DT = 1.0 / 30.0
@@ -37,6 +37,7 @@ def _receipt(**overrides):
         "right_arm_planned": False, "device_uuid": "GPU-abc",
         "device_uuid_source": "manifest_argument_not_live_probe",
         "receipt": "r", "config_yml_sha256": "c", "position_error_mm": 0.00043,
+        "scene_identity": "scene_ep0475_001", "source_epoch": "epoch-1",
     }
     certificate.update(overrides)
     return {
@@ -89,6 +90,19 @@ def test_left_scope_fails_closed_on_unproven_right_group():
         assert "arm_right" in str(exc)
     else:
         raise AssertionError("unproven right group must fail closed")
+
+
+def test_inactive_right_arm_holds_live_current_q():
+    report = scope.verify_receipt(_receipt(), required_arm="left")
+    wrapper = plan_wrapper.ManagedReplayWrapper(
+        targets=_targets(), scope_report=report, executor=FakeExecutor())
+    held = [0.5] * 7
+    wrapper.bind_current_q("right", held, source_sha256="sha-current-q")
+    plan = wrapper.plan_row(0)
+    out = wrapper.assemble_step(plan, 0)
+    assert out["sources"]["arm_right"] == native_action.SOURCE_CURRENT_Q
+    assert out["vector"][15:22] == held
+    assert out["held_current_q"]["arm_right"]["source_sha256"] == "sha-current-q"
 
 
 def test_right_certified_plan_assembles_full_native23():

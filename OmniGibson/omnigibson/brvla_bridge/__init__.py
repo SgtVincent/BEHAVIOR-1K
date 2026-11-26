@@ -24,6 +24,7 @@ this Mac.
 __version__ = "0.1.0-candidate"
 
 from . import (  # noqa: F401
+    action_tag,
     backend,
     caller,
     contracts,
