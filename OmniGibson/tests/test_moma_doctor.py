@@ -4,8 +4,10 @@ GPU-stage dependencies, and the single missing-piece pointer.
 import sys
 import textwrap
 
+import json
+
 from omnigibson.moma.config import RunnerConfig
-from omnigibson.moma.doctor import run_doctor
+from omnigibson.moma.doctor import main, run_doctor
 
 
 def _cfg(**overrides):
@@ -51,6 +53,14 @@ def test_invalid_s2_url_is_blocking_fail():
     report = run_doctor(cfg, manifest=None)
     s2 = next(c for c in report.checks if c.name == "s2_endpoint")
     assert s2.status == "FAIL" and s2.blocking is True
+
+
+def test_main_reports_blocked_without_manifest(capsys):
+    rc = main(["--run-id", "doctor-main-1"])
+    assert rc == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["ready"] is False
+    assert report["missing_pointer"]["kind"] == "executor_plugin"
 
 
 def test_present_plugin_and_deferred_assets_report_ready(tmp_path):

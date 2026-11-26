@@ -154,3 +154,38 @@ def run_doctor(cfg: RunnerConfig, manifest: Optional[Dict[str, Any]] = None) -> 
     for check in check_s2_endpoint(cfg):
         report.add(check)
     return report
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Static CLI: print the JSON preflight report; exit 0 ready, 2 blocked."""
+    import argparse
+    import json
+    import sys
+
+    parser = argparse.ArgumentParser(description="MoMa static preflight doctor (no Kit, no sim boot)")
+    parser.add_argument("--run-id", default="moma_static_doctor")
+    parser.add_argument("--manifest", default=None, help="private executor plugin manifest JSON path")
+    parser.add_argument("--initial-npz", default=None)
+    parser.add_argument("--initial-hdf5", default=None)
+    parser.add_argument("--asset-manifest", default=None)
+    parser.add_argument("--model-base-url", default=None)
+    args = parser.parse_args(argv)
+
+    overrides: Dict[str, Any] = {}
+    if args.initial_npz:
+        overrides["initial_state_npz"] = args.initial_npz
+    if args.initial_hdf5:
+        overrides["initial_state_hdf5"] = args.initial_hdf5
+    if args.asset_manifest:
+        overrides["asset_manifest_path"] = args.asset_manifest
+    if args.model_base_url:
+        overrides["model_base_url"] = args.model_base_url
+
+    cfg = RunnerConfig(run_id=args.run_id, **overrides)
+    manifest: Optional[Dict[str, Any]] = None
+    if args.manifest:
+        manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+
+    report = run_doctor(cfg, manifest)
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    return 0 if report.ready() else 2
