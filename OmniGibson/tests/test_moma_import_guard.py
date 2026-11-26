@@ -44,6 +44,8 @@ ALL_LEAVES = [
     "dynamics.py",
     "object_provider.py",
     "object_identity.py",
+    "restore_compat.py",
+    "bootstrap_config.py",
     "freshness.py",
     "observer/three_can.py",
     "s2/contract.py",
