@@ -8,10 +8,11 @@ different source widths:
 
 Verified slices come from post1 ``eval/utils/eval_utils.py``
 ``PROPRIOCEPTION_INDICES["R1Pro"]``; the 45-slot assembly mirrors the frozen
-``br_state45_adapter.py`` (sha `8f7bb7b9…30f78f`). Slots whose source context
-is not yet verified (robot-local base velocity frame, torso FK chain) stay
-explicitly pending: they are never zero-filled, padded, or bridged from the
-old 256-wide vector.
+``br_state45_adapter.py`` (sha `8f7bb7b9…30f78f`). The base-move frame was
+confirmed by the GPU1 live proprio sample (v3 receipt): ``base_qvel`` 0:3 is
+already robot-local ``[vx, vy, wz]``. The torso FK chain slots stay explicitly
+pending until the tracked live chain is bound; pending slots are never
+zero-filled, padded, or bridged from the old 256-wide vector.
 """
 import math
 from dataclasses import dataclass
@@ -126,11 +127,11 @@ class OnlineState45Provider(StateMappingProvider):
     Args:
         source_width: live proprio width (61 for the post1 R1Pro vector).
         velocity_provider: optional callable returning robot-local
-            ``[vx, vy, wz]``. Composed by the wrapper from
-            ``get_linear_velocity`` / ``get_angular_velocity`` and the base
-            orientation; the provider never reaches into privileged objects.
-            Until the frame is confirmed on a minimal GPU proprio sample this
-            stays ``None`` and slots 36:39 fail closed.
+            ``[vx, vy, wz]``. The frame was confirmed on the GPU1 v3 proprio
+            sample: the 61-d ``base_qvel`` slice 0:3 is already robot-local, so
+            the wrapper composes the provider from that slice; the provider
+            never reaches into privileged objects. When ``None`` slots 36:39
+            fail closed.
         torso_fk: optional :class:`~brvla_bridge.torso_fk.TorsoFk` loaded from
             the manifest-injected, sha-verified URDF. Until the chain is bound,
             slots 39:45 fail closed.

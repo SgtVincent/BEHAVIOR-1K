@@ -125,3 +125,78 @@ def test_raw623_unmapped_provider_still_fails_closed():
     provider = state_mapping.UnmappedProvider("rawdata_hdf5", contracts.RAW623)
     with raises(MappingNotDeclaredError):
         provider.map_state([0.0] * 623)
+
+
+# ---- state45 slot-group parity against the frozen adapter digest -----------
+
+_EXPECTED_GROUPS = [
+    (0, 6, "left_ee_se3"),
+    (6, 12, "right_ee_se3"),
+    (14, 21, "arm_left_qpos"),
+    (21, 28, "arm_right_qpos"),
+    (28, 32, "trunk_qpos"),
+    (32, 34, "finger_left_qpos"),
+    (34, 36, "finger_right_qpos"),
+    (36, 39, "base_move"),
+    (39, 45, "torso_se3"),
+]
+
+
+def test_slot_group_ranges_match_frozen_adapter_digest():
+    roles = state_mapping.SLOT_ROLES
+    assert len(roles) == contracts.STATE45
+    for lo, hi, role in _EXPECTED_GROUPS:
+        assert roles[lo:hi] == [role] * (hi - lo), (role, roles[lo:hi])
+    # Gripper widths are one slot each, left/right.
+    assert roles[12] == "gripper_width_left"
+    assert roles[13] == "gripper_width_right"
+
+
+def test_v3_actual_local_base_qvel_scaled_by_dt():
+    # Last-step robot-local base_qvel from the GPU1 v3 canary RAW
+    # (post_step_2, instance 301, sha 85a24cf2…442d4).
+    v3_local = [0.0012236839393153787, -8.159904973581433e-05, -0.0007244913140311837]
+    urdf = _write_urdf()
+    try:
+        fk = torso_fk.TorsoFk(torso_fk.load_trunk_chain(urdf))
+        provider = state_mapping.OnlineState45Provider(
+            velocity_provider=lambda: list(v3_local), torso_fk=fk)
+        row = _row()
+        # The row's own base_qvel slice 0:3 must NOT populate slots 36:39;
+        # those come from the bound velocity provider only.
+        row[0:3] = [9.0, 9.0, 9.0]
+        state = provider.map_state(row)
+        dt = contracts.CONTROL_DT
+        for k in range(3):
+            assert abs(state[36 + k] - v3_local[k] * dt) < 1e-12
+        # The raw row slice is not leaked into the body move slots.
+        assert state[36:39] != [9.0 * dt, 9.0 * dt, 9.0 * dt]
+    finally:
+        os.remove(urdf)
+
+
+def test_base_bound_torso_pending_still_fail_closed():
+    provider = state_mapping.OnlineState45Provider(
+        velocity_provider=lambda: [0.0, 0.0, 0.0])
+    desc = provider.descriptor()
+    base = [f for f in desc.fields if f.role == "base_move"]
+    torso = [f for f in desc.fields if f.role == "torso_se3"]
+    assert all(f.status == "bound" for f in base)
+    assert all(f.status == "unknown_pending" for f in torso)
+    assert provider.pending_slots().count("torso_se3") == 6
+    with raises(MappingNotDeclaredError):
+        provider.map_state(_row())
+
+
+def test_pending_torso_slots_are_not_zero_filled():
+    provider = state_mapping.OnlineState45Provider(
+        velocity_provider=lambda: [1.0, 2.0, 0.3])
+    with raises(MappingNotDeclaredError):
+        provider.map_state(_row())
+    # Descriptor exposes the pending group explicitly; no bound/zero profile
+    # status is granted to torso SE3.
+    fields = provider.descriptor().fields
+    torso = fields[39:45]
+    assert all(f.status == "unknown_pending" for f in torso)
+    assert all(f.source_index is None for f in torso)
+

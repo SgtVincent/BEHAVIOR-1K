@@ -10,8 +10,10 @@ schemas, mapping provider seam, transport, and the websocket protocol boundary.
   or real controller installation in this layer.
 - Checkpoint/stats/data paths and hashes live in a private runtime manifest
   (`BRVLA_MANIFEST_PATH`), never hardcoded in public source.
-- The 61/623 -> legacy 45 field mapping is fail-closed until a verified
-  provider is registered against post1 source and frozen transforms.
+- The 61 -> legacy 45 mapping is fail-closed for unverified slots. The base-move
+  frame was confirmed by the GPU1 live proprio sample (robot-local `[vx, vy, wz]`);
+  the torso SE3 chain remains pending until the tracked live FK chain is bound.
+  No slot is zero-filled or bridged from the old 256-wide vector.
 - Gate A (physical replay) must run through the official post1 cuRobo seam.
   Legacy DLS/stock IK implementations cannot substitute for it; their receipt
   status is recorded in the backend registry.
