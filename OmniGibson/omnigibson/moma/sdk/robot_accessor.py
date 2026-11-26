@@ -13,8 +13,9 @@ Verified surface (post1 ``bd049de3``):
 - ``get_relative_eef_pose(arm=...)``
 - ``is_grasping(arm=..., candidate_obj=...)`` assisted-grasping readout
 - assisted-grasping bookkeeping: ``_ag_obj_in_hand``, ``_ag_release_counter``,
-  ``_ag_grasp_counter``, ``_ag_obj_constraints``, ``_ag_obj_constraint_params``,
-  ``_ag_freeze_gripper``
+  ``_ag_grasp_counter``, ``_ag_obj_constraints``, ``_ag_obj_constraint_params``.
+  ``_ag_freeze_gripper`` does not exist on post1 ``bd049de3``; the record reports
+  an UNKNOWN field rather than raising (canary attempt3 evidence).
 - ``release_grasp_immediately(arm=...)``
 
 Gap G2/G3: DOF order, frames and controller mode are re-verified against the
@@ -105,6 +106,15 @@ class SdkRobotAccessor:
     def trunk_qvel(self) -> np.ndarray:
         return np.asarray(self.proprio_dict().get("trunk_qvel"), dtype=float)
 
+    def joint_qpos(self) -> np.ndarray:
+        """Full robot joint position vector via the post1 method surface.
+
+        Gap G3 (canary attempt3): post1 ``Robot`` exposes
+        ``get_joint_positions()``; there is no ``.joint_positions`` property.
+        This method reads the method, never a property guess.
+        """
+        return np.asarray(self.robot.get_joint_positions(), dtype=float)
+
     # -- grasp / assisted-grasping bookkeeping ----------------------------
 
     def grasp(self, arm: str, obj: Any = None) -> GraspReadout:
@@ -137,7 +147,9 @@ class SdkRobotAccessor:
             "grasp_counter": self.grasp_counter(arm),
             "constraint_present": self.robot._ag_obj_constraints[arm] is not None,
             "constraint_params": clean(self.robot._ag_obj_constraint_params[arm]),
-            "freeze_gripper": clean(self.robot._ag_freeze_gripper[arm]),
+            "freeze_gripper": (clean(self.robot._ag_freeze_gripper[arm])
+                               if hasattr(self.robot, "_ag_freeze_gripper")
+                               else {"status": "UNKNOWN", "error": "field_absent_post1"}),
             "sdk_grasp_state": grasp_state.name,
             "valid_sdk_hold": held_name is not None and grasp_state.name == "TRUE",
         }
