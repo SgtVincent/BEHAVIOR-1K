@@ -189,3 +189,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     report = run_doctor(cfg, manifest)
     print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     return 0 if report.ready() else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
