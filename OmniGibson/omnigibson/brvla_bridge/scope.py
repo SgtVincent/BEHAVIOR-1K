@@ -11,7 +11,7 @@ Stdlib-only at import. No planner, simulator, torch, numpy, or omnigibson
 import.
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from .errors import ContractViolation
 

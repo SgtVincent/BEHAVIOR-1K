@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from . import contracts, delta_tf, plan_wrapper, scope
 from .errors import ContractViolation, Port2026Error
-from .replay_policy import DemoReplayPolicy, ReplayExhausted, ReplayPinMismatch
+from .replay_policy import DemoReplayPolicy
 
 
 def _sha256_file(path: pathlib.Path) -> str:

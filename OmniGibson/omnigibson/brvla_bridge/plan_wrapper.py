@@ -23,7 +23,7 @@ Stdlib-only at import.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 from . import contracts, native_action, planner_grid, scope
 from .delta_tf import FixedAnchorTargets
