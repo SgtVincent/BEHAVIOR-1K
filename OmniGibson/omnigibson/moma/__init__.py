@@ -5,9 +5,11 @@ Sim-free leaves are importable without omnigibson/torch; simulator coupling
 stays behind the :class:`~omnigibson.moma.seams.SimAdapter` boundary.
 """
 from .schema import (  # noqa: F401
-    JOINT_NATIVE23,
-    IK_TARGET23,
-    EXECUTION23_SE3,
+    NATIVE23_JOINT,
+    BRIDGE_DECODED23_IK_POSE,
+    EXECUTION23_SE3_DELTA,
+    LEGACY_LABEL_ALIASES,
+    normalize_label,
     TaggedAction,
     native23_action,
 )
@@ -19,9 +21,11 @@ from .seams import (  # noqa: F401
 )
 
 __all__ = [
-    "JOINT_NATIVE23",
-    "IK_TARGET23",
-    "EXECUTION23_SE3",
+    "NATIVE23_JOINT",
+    "BRIDGE_DECODED23_IK_POSE",
+    "EXECUTION23_SE3_DELTA",
+    "LEGACY_LABEL_ALIASES",
+    "normalize_label",
     "TaggedAction",
     "native23_action",
     "MoMaObjectProvider",

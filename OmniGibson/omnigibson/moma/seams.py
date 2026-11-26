@@ -5,7 +5,7 @@ Layers (INTERFACE_SPEC.md §5):
 - **provider**: task / scene / target supply; the MoMa line uses the
   object-centric MoMaGen-style provider.
 - **executor**: turn a planned target into a 2026 controller command tagged
-  ``joint-native23``. The official post1 ``CuRoboMotionGenerator`` is the
+  ``native23_joint``. The official post1 ``CuRoboMotionGenerator`` is the
   intended MP binding; the baseline QP / MoMaGen provider is a second
   implementation under the same contract and must not silently substitute
   for cuRobo (gap G1, integration-owned license/build).
@@ -42,7 +42,7 @@ class MoMaExecutor(ABC):
     """Executor layer: planned target -> bounded controller command.
 
     Implementations must return a :class:`TaggedAction` with the schema label
-    fixed to ``joint-native23`` for the MoMa line. A solver failure must be
+    fixed to ``native23_joint`` for the MoMa line. A solver failure must be
     surfaced as a rejected/unknown outcome, never as a zero-action success.
     """
 
