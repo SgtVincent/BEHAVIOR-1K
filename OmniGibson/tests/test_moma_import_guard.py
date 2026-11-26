@@ -30,6 +30,7 @@ STANDALONE_LEAVES = [
     "controller_bounds.py",
     "dynamics.py",
     "object_provider.py",
+    "freshness.py",
     "observer/three_can.py",
     "s2/contract.py",
 ]
@@ -41,6 +42,7 @@ ALL_LEAVES = [
     "controller_bounds.py",
     "dynamics.py",
     "object_provider.py",
+    "freshness.py",
     "observer/three_can.py",
     "s2/contract.py",
     "s2/client.py",

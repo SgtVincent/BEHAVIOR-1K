@@ -13,6 +13,8 @@ from omnigibson.moma.operator import (
     MomaEpisodeOperator,
     EpisodeImmutableAfterStart,
     ExecutorAdapterMissing,
+    ExecutorPlanRejected,
+    DecisionFreshnessRejected,
 )
 from omnigibson.moma.sdk import SdkEnvironmentAdapter, SdkRobotAccessor
 from omnigibson.moma.schema import NATIVE23_JOINT, native23_action
@@ -122,13 +124,23 @@ class FakeEnv:
         return {}, 0.0, False, False, {}
 
 
+def _valid_certificate(**overrides) -> dict:
+    cert = {"validated": True, "backend": "curobo_v2-fake", "receipt": "rcpt-1"}
+    cert.update(overrides)
+    return cert
+
+
 class FakeExecutor:
     def __init__(self) -> None:
         self.plans: list[dict] = []
 
     def plan(self, args):
         self.plans.append(args)
-        return {"action23": native23_action(np.zeros(23)), "certificate": {"primitive": args["primitive"]}}
+        command = np.full(23, 0.05, dtype=np.float64)
+        return {
+            "action23": native23_action(command),
+            "certificate": _valid_certificate(receipt=f"rcpt-{args['primitive']}"),
+        }
 
 
 class FakeS2:
@@ -359,3 +371,144 @@ def test_missing_executor_blocks_before_decision_and_step():
         assert service.requests == []
     finally:
         service.stop()
+
+
+class _PlanReturningExecutor:
+    def __init__(self, plan):
+        self.plan_value = plan
+        self.calls = 0
+
+    def plan(self, args):
+        self.calls += 1
+        return self.plan_value
+
+
+class _RaisingExecutor:
+    def plan(self, args):
+        raise RuntimeError("solver unreachable target")
+
+
+def _plan_test_operator(executor):
+    op, env, _, _ = _make_operator(_loopback_obs(), executor=executor)
+    op.reset_episode()
+    return op, env
+
+
+def test_plan_missing_action23_rejected_without_step():
+    op, env = _plan_test_operator(_PlanReturningExecutor({"certificate": {"ok": True}}))
+    with pytest.raises(ExecutorPlanRejected, match="action23_missing"):
+        op.step()
+    assert env.steps == []
+
+
+def test_plan_all_zero_vector_with_valid_certificate_passes():
+    """A legal hold/initial absolute q-position is all zero; proven cert passes."""
+    zero = native23_action(np.zeros(23))
+    op, env, _, _ = _make_operator(
+        _loopback_obs(),
+        executor=_PlanReturningExecutor({"action23": zero, "certificate": _valid_certificate()}),
+    )
+    op.reset_episode()
+    record = op.step()
+    assert record.action_dim == 23
+    assert len(env.steps) == 1
+    assert env.steps[0] == [0.0] * 23
+
+
+def test_plan_backend_receipt_identity_also_proves_certificate():
+    """Alternate evidence path: backend + trajectory_id, no validated flag."""
+    command = np.full(23, 0.05)
+    cert = {"backend": "curobo_v2-fake", "trajectory_id": "traj-42"}
+    op, env, _, _ = _make_operator(
+        _loopback_obs(),
+        executor=_PlanReturningExecutor({"action23": native23_action(command), "certificate": cert}),
+    )
+    op.reset_episode()
+    record = op.step()
+    assert record.action_dim == 23
+    assert len(env.steps) == 1
+
+
+def test_plan_unverified_certificate_rejected():
+    command = np.full(23, 0.05)
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({
+            "action23": native23_action(command),
+            "certificate": {"validated": False},
+        })
+    )
+    with pytest.raises(ExecutorPlanRejected, match="certificate_unverified"):
+        op.step()
+    assert env.steps == []
+
+
+def test_plan_placeholder_mode_certificate_rejected():
+    command = np.full(23, 0.05)
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({
+            "action23": native23_action(command),
+            "certificate": _valid_certificate(mode="placeholder"),
+        })
+    )
+    with pytest.raises(ExecutorPlanRejected, match="certificate_mode_rejected"):
+        op.step()
+    assert env.steps == []
+
+
+def test_plan_explicit_placeholder_meta_action_rejected():
+    action = native23_action(np.full(23, 0.05), meta={"placeholder": True})
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({"action23": action, "certificate": _valid_certificate()})
+    )
+    with pytest.raises(ExecutorPlanRejected, match="placeholder_action"):
+        op.step()
+    assert env.steps == []
+
+
+def test_plan_missing_certificate_rejected():
+    command = np.full(23, 0.05)
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({"action23": native23_action(command)})
+    )
+    with pytest.raises(ExecutorPlanRejected, match="certificate_missing"):
+        op.step()
+    assert env.steps == []
+
+
+def test_executor_exception_reclassified_without_step():
+    op, env = _plan_test_operator(_RaisingExecutor())
+    with pytest.raises(ExecutorPlanRejected, match="executor_raised"):
+        op.step()
+    assert env.steps == []
+
+
+def test_stale_decision_rejected_before_executor_and_step(monkeypatch):
+    rejected_plan = {"action23": native23_action(np.full(23, 0.05)), "certificate": {"ok": True}}
+    op, env, executor, _ = _make_operator(
+        _loopback_obs(), executor=_PlanReturningExecutor(rejected_plan)
+    )
+
+    def _reject_binding(**kwargs):
+        raise DecisionFreshnessRejected("stale_observation_id", "late plan")
+
+    monkeypatch.setattr("omnigibson.moma.operator.validate_binding", _reject_binding)
+    with pytest.raises(DecisionFreshnessRejected, match="stale_observation_id"):
+        op.step()
+    assert env.steps == []
+    assert executor.calls == 0
+    assert any(e["type"] == "decision_freshness_rejected" for e in op.records[-1].events)
+
+
+def test_freshness_envelope_identity_archived_and_reminted():
+    op, env, _, _ = _make_operator(_loopback_obs())
+    op.reset_episode()
+    first = op.step()
+    assert first.s2["observation_id"] is not None
+    assert isinstance(first.s2["snapshot_version"], int)
+    first_id = first.s2["observation_id"]
+    assert first_id in op._historical_observation_ids
+
+    second = op.step()
+    assert second.s2["observation_id"] != first_id
+    assert second.s2["snapshot_version"] > first.s2["snapshot_version"]
+    assert len(env.steps) == 2

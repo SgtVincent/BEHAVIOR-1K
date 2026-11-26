@@ -69,7 +69,12 @@ class FakeExecutor:
 
     def plan(self, args):
         self.plans.append(args)
-        return {"action23": native23_action(np.zeros(23)), "certificate": {"primitive": args["primitive"]}}
+        command = np.full(23, 0.05, dtype=np.float64)
+        return {
+            "action23": native23_action(command),
+            "certificate": {"validated": True, "backend": "curobo_v2-fake",
+                             "receipt": f"rcpt-{args['primitive']}"},
+        }
 
 
 class FakeS2:

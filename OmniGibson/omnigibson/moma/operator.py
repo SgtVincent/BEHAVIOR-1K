@@ -29,8 +29,14 @@ CPU-testable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
+from .freshness import (
+    DecisionFreshnessRejected,
+    binding_from_envelope,
+    build_envelope,
+    validate_binding,
+)
 from .sdk.env_adapter import SdkEnvironmentAdapter
 from .sdk.robot_accessor import SdkRobotAccessor
 from .s2.contract import RequestTracker, digest, full_task_terminal
@@ -45,6 +51,64 @@ class ExecutorAdapterMissing(RuntimeError):
     """No MP executor is bound. The operator refuses to plan or env.step."""
 
 
+class ExecutorPlanRejected(RuntimeError):
+    """The bound executor returned a rejected/invalid plan.
+
+    Raised when the executor raises, omits the tagged action, omits the
+    certificate, returns a non-tagged action, or returns a certificate without
+    solver provenance (validated flag or backend receipt/trajectory identity).
+    A rejected plan must never be turned into a zero-action env.step; the caller
+    records the rejection instead.
+
+    NOTE: an all-zero 23-vector is **not** treated as a placeholder on its own.
+    An absolute joint-position target can legitimately hold at zero; the gate
+    decides on certificate evidence, never on command magnitude.
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
+# Certificate outcomes that can never represent a successfully solved plan.
+FORBIDDEN_CERTIFICATE_MODES = frozenset({
+    "placeholder", "unverified", "error", "rejected", "unknown", "failed", "none",
+})
+
+# Receipt identity fields that, together with a non-empty backend, prove the
+# plan came from a real solver call rather than an empty/local stand-in.
+_RECEIPT_FIELDS = ("receipt", "trajectory_id", "plan_id")
+
+
+def _certificate_evidence_reason(certificate: Dict[str, Any]) -> Optional[str]:
+    """Return a rejection reason when the certificate lacks solver provenance.
+
+    A plan is proven either by an explicit strict ``validated is True`` flag,
+    or by a backend receipt identity: non-empty ``backend`` plus one of
+    ``receipt`` / ``trajectory_id`` / ``plan_id``. Mode/status/outcome values in
+    :data:`FORBIDDEN_CERTIFICATE_MODES` reject outright.
+    """
+    mode = (
+        certificate.get("plan_mode")
+        or certificate.get("mode")
+        or certificate.get("status")
+        or certificate.get("outcome")
+    )
+    if isinstance(mode, str) and mode.strip().lower() in FORBIDDEN_CERTIFICATE_MODES:
+        return "certificate_mode_rejected"
+    if certificate.get("validated") is True:
+        return None
+    backend = certificate.get("backend")
+    receipt = next(
+        (certificate.get(field) for field in _RECEIPT_FIELDS if certificate.get(field)),
+        None,
+    )
+    if isinstance(backend, str) and backend.strip() and isinstance(receipt, str) and receipt.strip():
+        return None
+    return "certificate_unverified"
+
+
 @dataclass
 class EpisodeConfig:
     run_id: str
@@ -54,6 +118,10 @@ class EpisodeConfig:
     step_hz: int = 30
     physics_hz: int = 120
     allow_initial_state_restore: bool = True
+    # Frozen a28 freshness windows; retuning dt/window/allowed delay is out of
+    # scope for this lane.
+    max_snapshot_age_steps: int = 1800
+    max_snapshot_age_sim_s: float = 60.0
 
 
 @dataclass
@@ -103,6 +171,15 @@ class MomaEpisodeOperator:
         self._recent_turns: List[Dict[str, Any]] = []
         self.records: List[StepRecord] = []
 
+        # Snapshot identity / freshness bookkeeping (a28 observation envelope).
+        self._decision_seq = 0
+        self._snapshot_version = 0
+        self._decision_entry_snapshot_version = 0
+        self._decision_entry_sim_time_s: Optional[float] = None
+        self._observation_id: Optional[str] = None
+        self._historical_observation_ids: Set[str] = set()
+        self._current_envelope: Optional[Dict[str, Any]] = None
+
     # -- lifecycle ---------------------------------------------------------
 
     def reset_episode(
@@ -136,6 +213,13 @@ class MomaEpisodeOperator:
         self.records = []
         self.tracker.pending = None
         self.tracker.completed = []
+        self._decision_seq = 0
+        self._snapshot_version = 0
+        self._decision_entry_snapshot_version = 0
+        self._decision_entry_sim_time_s = None
+        self._observation_id = None
+        self._historical_observation_ids = set()
+        self._current_envelope = None
         return obs
 
     def restore_initial_state(self, load_state_fn: Callable[[], Any]) -> None:
@@ -210,12 +294,78 @@ class MomaEpisodeOperator:
             return []
         return self.transition_fn(self._previous_obs, current, self.cfg.can_names)
 
+    @staticmethod
+    def _validate_plan(plan: Any) -> tuple[TaggedAction, Dict[str, Any]]:
+        """Reject an invalid/unproven plan before any env.step is issued.
+
+        The seam contract: ``{"action23": TaggedAction, "certificate": dict}``.
+        Rejection rests on missing evidence, not command magnitude: a finite
+        all-zero absolute joint-position target is a legal hold/initial pose and
+        passes when its certificate carries solver provenance.
+        """
+        if not isinstance(plan, dict):
+            raise ExecutorPlanRejected("plan_not_dict", f"got {type(plan).__name__}")
+        if "action23" not in plan:
+            raise ExecutorPlanRejected("action23_missing", "plan has no action23")
+        action = plan["action23"]
+        if not isinstance(action, TaggedAction):
+            raise ExecutorPlanRejected(
+                "action23_not_tagged", f"got {type(action).__name__}"
+            )
+        certificate = plan.get("certificate")
+        if not isinstance(certificate, dict):
+            raise ExecutorPlanRejected("certificate_missing", "certificate must be a dict")
+        evidence_reason = _certificate_evidence_reason(certificate)
+        if evidence_reason is not None:
+            raise ExecutorPlanRejected(
+                evidence_reason, "certificate carries no validated solver receipt"
+            )
+        if action.meta.get("placeholder") is True:
+            raise ExecutorPlanRejected(
+                "placeholder_action", "action meta flags an explicit placeholder"
+            )
+        return action, certificate
+
     # -- decision / step ---------------------------------------------------
+
+    def _bind_fresh_snapshot(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the a28 identity/freshness envelope to a boundary observation."""
+        self._snapshot_version += 1
+        if self._decision_entry_snapshot_version <= 0:
+            self._decision_entry_snapshot_version = self._snapshot_version
+        sim_t = obs.get("sim_time_s")
+        if sim_t is not None:
+            sim_t = float(sim_t)
+            if self._decision_entry_sim_time_s is None:
+                self._decision_entry_sim_time_s = sim_t
+        if self._observation_id is None:
+            self._decision_seq += 1
+            run_short = digest(self.cfg.run_id)[:8]
+            self._observation_id = f"obs_{run_short}_d{self._decision_seq:04d}"
+        envelope = build_envelope(
+            run_id=self.cfg.run_id,
+            observation_id=self._observation_id,
+            snapshot_version=self._snapshot_version,
+            decision_entry_snapshot_version=self._decision_entry_snapshot_version,
+            decision_seq=self._decision_seq,
+            sim_time_s=sim_t,
+            max_age_steps=self.cfg.max_snapshot_age_steps,
+            max_age_sim_s=self.cfg.max_snapshot_age_sim_s,
+        )
+        envelope["decision_entry_sim_time_s"] = self._decision_entry_sim_time_s
+        for key in ("run_id", "observation_id", "snapshot_version",
+                    "decision_entry_snapshot_version", "decision_seq", "sim_time_s"):
+            obs[key] = envelope[key]
+        obs["freshness_policy"] = envelope["freshness_policy"]
+        self._current_envelope = envelope
+        return envelope
 
     def request_decision(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         if self.s2_client is None:
             raise ValueError("s2_client not bound; no privileged decision available")
         decision = self.s2_client.decide(obs, self._recent_turns)
+        # Owner-controlled identity binding; the model cannot mint or rewrite it.
+        decision["binding"] = binding_from_envelope(self._current_envelope or obs)
         self._recent_turns.append({"messages": [{"role": "user", "content": obs}]})
         return decision
 
@@ -255,20 +405,53 @@ class MomaEpisodeOperator:
                 "MP executor adapter missing; no plan and no env.step issued"
             )
 
+        self._bind_fresh_snapshot(current)
         decision = self.request_decision(current)
-        plan = self.executor.plan(decision["args"])
-        action: TaggedAction = plan["action23"]
+        try:
+            validate_binding(
+                binding=decision.get("binding", {}),
+                envelope=self._current_envelope or current,
+                historical_observation_ids=self._historical_observation_ids,
+                run_id=self.cfg.run_id,
+                max_age_steps=self.cfg.max_snapshot_age_steps,
+                max_age_sim_s=self.cfg.max_snapshot_age_sim_s,
+            )
+        except DecisionFreshnessRejected as exc:
+            record.events = events + [{
+                "type": "decision_freshness_rejected",
+                "reason": exc.reason,
+                "detail": exc.detail,
+            }]
+            self._previous_obs = current
+            self.records.append(record)
+            raise
+
+        try:
+            plan = self.executor.plan(decision["args"])
+        except ExecutorAdapterMissing:
+            raise
+        except Exception as exc:
+            raise ExecutorPlanRejected(
+                "executor_raised", f"{type(exc).__name__}: {exc}"
+            ) from exc
+        action, certificate = self._validate_plan(plan)
         record.action_label = action.label
         record.action_dim = len(action.vector)
-        record.certificate = plan.get("certificate", {})
+        record.certificate = certificate
+        binding = decision.get("binding", {})
         record.s2 = {
             "call_id": decision.get("call_id"),
             "latency_s": decision.get("latency_s"),
             "request_sha256": decision.get("request_sha256"),
+            "observation_id": binding.get("observation_id"),
+            "snapshot_version": binding.get("snapshot_version"),
         }
 
         self.env.step(action.to_list())
         self._step += 1
+        if self._observation_id is not None:
+            self._historical_observation_ids.add(self._observation_id)
+        self._observation_id = None
         self._previous_obs = current
         self.records.append(record)
         return record
