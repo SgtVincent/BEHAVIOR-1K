@@ -23,7 +23,11 @@ def to_plain(value):
 
 
 def shape_of(value):
-    """Return nested shape for plain sequences; duck ``.shape`` otherwise."""
+    """Return nested shape for plain sequences; duck ``.shape`` otherwise.
+
+    Empty sequences stop descending immediately: an empty list reports a
+    leading ``0`` dimension and must not feed ``[]`` back into the loop.
+    """
     if hasattr(value, "shape") and not isinstance(value, (str, bytes)):
         return tuple(value.shape)
     v = to_plain(value)
@@ -32,7 +36,9 @@ def shape_of(value):
     shape, cur = [], v
     while isinstance(cur, list):
         shape.append(len(cur))
-        cur = cur[0] if cur else []
+        if not cur:
+            break
+        cur = cur[0]
     return tuple(shape)
 
 
