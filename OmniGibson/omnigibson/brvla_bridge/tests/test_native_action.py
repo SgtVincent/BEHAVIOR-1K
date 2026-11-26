@@ -74,3 +74,41 @@ def test_extract_group_round_trip():
     out = native_action.assemble_native23(**_full_groups())
     assert native_action.extract_group(out["vector"], "trunk") == [4.0, 5.0, 6.0, 7.0]
     assert native_action.extract_group(out["vector"], "base") == [1.0, 2.0, 3.0]
+
+
+def test_bind_current_q_records_live_qpos_provenance():
+    entry = native_action.bind_current_q("right", [0.1] * 7, source_sha256="abc123")
+    assert entry["group"] == "arm_right"
+    assert entry["source"] == native_action.SOURCE_CURRENT_Q
+    assert entry["source_sha256"] == "abc123"
+    assert len(entry["values"]) == 7
+
+
+def test_bind_current_q_rejects_invalid_qpos():
+    with raises(ContractViolation):
+        native_action.bind_current_q("left", [0.1] * 3, source_sha256="abc")
+    with raises(ContractViolation):
+        native_action.bind_current_q("left", [float("nan")] * 7, source_sha256="abc")
+    with raises(ContractViolation):
+        native_action.bind_current_q("left", [0.1] * 7, source_sha256="")
+    with raises(ContractViolation):
+        native_action.bind_current_q("torso", [0.1] * 4, source_sha256="abc")
+
+
+def test_inactive_arm_holds_current_q_without_zero_fill():
+    groups = _full_groups()
+    held = [0.5] * 7
+    groups["arm_right"] = held
+    sources = {g: "planner" for g in native_action.GROUP_WIDTHS}
+    sources["arm_right"] = native_action.SOURCE_CURRENT_Q
+    out = native_action.assemble_native23(**groups, sources=sources)
+    assert out["sources"]["arm_right"] == native_action.SOURCE_CURRENT_Q
+    assert out["vector"][15:22] == held
+
+
+def test_unknown_group_source_rejected():
+    groups = _full_groups()
+    sources = {g: "planner" for g in native_action.GROUP_WIDTHS}
+    sources["trunk"] = "telepathy"
+    with raises(ContractViolation):
+        native_action.assemble_native23(**groups, sources=sources)

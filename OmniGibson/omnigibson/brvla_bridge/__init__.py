@@ -24,6 +24,7 @@ this Mac.
 __version__ = "0.1.0-candidate"
 
 from . import (  # noqa: F401
+    action_tag,
     backend,
     caller,
     contracts,
@@ -32,6 +33,7 @@ from . import (  # noqa: F401
     lineage,
     managed_policy,
     manifest,
+    model_decoder,
     model_session,
     native_action,
     plan_wrapper,

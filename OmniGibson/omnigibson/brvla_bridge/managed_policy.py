@@ -24,7 +24,7 @@ import os
 import pathlib
 from typing import Any, Dict, List, Optional
 
-from . import contracts, delta_tf, plan_wrapper, scope
+from . import action_tag, contracts, delta_tf, model_decoder, plan_wrapper, scope
 from .errors import ContractViolation, Port2026Error
 from .replay_policy import DemoReplayPolicy
 
@@ -157,9 +157,20 @@ class ManagedReplayPolicy:
 
     def forward(self, obs: Optional[dict] = None, **kwargs: Any) -> Any:
         native23 = self._next_native23()
+        # Boundary: the wrapper output is tagged joint-native23 and re-checked
+        # by the consumer guard before it leaves the policy. A non-native or
+        # non-finite vector raises ControlledActionBlocked; no bare physical
+        # row reaches the evaluator.
+        tagged = action_tag.tag_native23(
+            native23["vector"],
+            provenance={"sources": native23["sources"],
+                        "held_current_q": native23.get("held_current_q", {}),
+                        "target_row": native23["target_row"]},
+        )
+        vector = action_tag.assert_native23_joint(tagged)
         import torch  # lazy; package import stays torch-free
 
-        return torch.tensor(native23["vector"], dtype=torch.float32)
+        return torch.tensor(vector, dtype=torch.float32)
 
     act = forward
 
@@ -192,6 +203,183 @@ class ManagedReplayPolicy:
             "scope": {"pass": self._scope.pass_, "missing": self._scope.missing,
                       "evidence": self._scope.evidence},
             "episode_length": self._wrapper.episode_length,
+            "executor_injected": self._executor_injected,
+            "evaluator_action_dim": self._action_dim,
+        }
+
+    # -- trace -----------------------------------------------------------------
+
+    def _emit(self, event: str, detail: Dict[str, Any]) -> None:
+        if not self._trace_path:
+            return
+        path = pathlib.Path(self._trace_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": event, **detail}, allow_nan=False) + "\n")
+            f.flush()
+
+
+def _load_scope_receipt(
+    receipt: Optional[Dict[str, Any]],
+    receipt_path: Optional[str],
+    receipt_file_sha256: Optional[str],
+    expected_receipt_sha256: Optional[str],
+    expected_config_sha256: Optional[str],
+    required_arm: str,
+    require_live_scene: bool,
+) -> scope.ScopeReport:
+    if receipt is not None:
+        loaded: Dict[str, Any] = dict(receipt)
+    elif receipt_path:
+        rp = pathlib.Path(receipt_path)
+        if not rp.exists():
+            raise ManagedPolicyViolation(f"planner receipt absent: {rp}")
+        if receipt_file_sha256 is not None:
+            actual = _sha256_file(rp)
+            if actual != receipt_file_sha256:
+                raise ManagedPolicyViolation(
+                    f"receipt file sha drift: expected {receipt_file_sha256}, got {actual}")
+        loaded = json.loads(rp.read_text(encoding="utf-8"))
+    else:
+        loaded = {}
+    report = scope.verify_receipt(
+        loaded,
+        required_arm=required_arm,
+        require_live_scene=require_live_scene,
+        expected_receipt_sha=expected_receipt_sha256,
+        expected_config_sha=expected_config_sha256,
+    )
+    report.require()
+    return report
+
+
+class ModelChunkPolicy:
+    """Evaluator policy fed by one frozen model physical23 same-anchor chunk.
+
+    Composes the :class:`~brvla_bridge.model_decoder.ModelChunkDecoder`
+    (cumulative-profile decompose), the certified planner seam, and the
+    native23 grid. The model chunk is captured once per fresh plan; rows are
+    never repeated after exhaustion. The policy applies the joint-native23 tag
+    and consumer guard in :meth:`forward`; the decoder itself never relabels a
+    physical row as native.
+
+    Args:
+        chunk: model physical23 rows (``N x 23``), same-anchor cumulative.
+        anchors: fixed frame0 physical-base pose6 for left / right / chest.
+        dt_seconds: model control step dt (sealed 1/30).
+        receipt / receipt_path: planner canary receipt dict or JSON file.
+        required_arm / require_live_scene: scope requirements forwarded.
+        executor: optional duck-typed planner seam; absent until registered.
+        current_q: inactive-arm current-q bindings from
+            :func:`native_action.bind_current_q`.
+        source_receipt: frozen checkpoint / stats / server identity shas.
+        max_step_delta: closed per-coordinate motion bound for the native grid.
+        native_state_receipt: live native joint-state snapshot provenance.
+    """
+
+    def __init__(
+        self,
+        *,
+        chunk: List[List[float]],
+        anchors: Dict[str, List[float]],
+        dt_seconds: float = contracts.CONTROL_DT,
+        receipt: Optional[Dict[str, Any]] = None,
+        receipt_path: Optional[str] = None,
+        receipt_file_sha256: Optional[str] = None,
+        expected_receipt_sha256: Optional[str] = None,
+        expected_config_sha256: Optional[str] = None,
+        required_arm: str = scope.ARM_LEFT,
+        require_live_scene: bool = False,
+        executor: Any = None,
+        current_q: Optional[Dict[str, Dict[str, Any]]] = None,
+        source_receipt: Optional[Dict[str, Any]] = None,
+        planner_dt: Optional[float] = None,
+        physics_dt: float = contracts.CONTROL_DT,
+        max_step_delta: Optional[float] = None,
+        native_state_receipt: Optional[Dict[str, Any]] = None,
+        trace_path: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        self._scope = _load_scope_receipt(
+            receipt, receipt_path, receipt_file_sha256,
+            expected_receipt_sha256, expected_config_sha256,
+            required_arm, require_live_scene,
+        )
+        self._decoder = model_decoder.ModelChunkDecoder(
+            chunk=chunk,
+            anchors=anchors,
+            dt_seconds=dt_seconds,
+            scope_report=self._scope,
+            executor=executor,
+            current_q=current_q,
+            source_receipt=source_receipt,
+            planner_dt=planner_dt or plan_wrapper.planner_grid.PLANNER_DT_S,
+            physics_dt=physics_dt,
+            max_step_delta=max_step_delta,
+            native_state_receipt=native_state_receipt,
+        )
+        self._executor_injected = executor is not None
+        self._trace_path = trace_path or os.environ.get("BR_REPLAY_TRACE")
+        self._action_dim: Optional[int] = None
+        self._plan: Optional[Dict[str, Any]] = None
+        self._step_in_plan = 0
+        self._chunk_index = 0
+
+    # -- evaluator seam -------------------------------------------------------
+
+    def set_action_dim(self, action_dim: int) -> None:
+        self._action_dim = int(action_dim)
+
+    def reset(self) -> None:
+        self._plan = None
+        self._step_in_plan = 0
+        self._chunk_index = 0
+        self._emit("model_chunk_policy_reset", {"index": self._chunk_index})
+
+    def forward(self, obs: Optional[dict] = None, **kwargs: Any) -> Any:
+        native23 = self._next_native23()
+        tagged = action_tag.tag_native23(
+            native23["vector"],
+            provenance={"sources": native23["sources"],
+                        "held_current_q": native23.get("held_current_q", {}),
+                        "target_row": native23["target_row"]},
+        )
+        vector = action_tag.assert_native23_joint(tagged)
+        import torch  # lazy; package import stays torch-free
+
+        return torch.tensor(vector, dtype=torch.float32)
+
+    act = forward
+
+    # -- composition ----------------------------------------------------------
+
+    def _next_native23(self) -> Dict[str, Any]:
+        if self._plan is None:
+            self._plan = self._decoder.plan_row(self._chunk_index)
+        command: Optional[Dict[str, Any]] = None
+        try:
+            command = self._decoder.assemble_step(self._plan, self._step_in_plan)
+        except plan_wrapper.planner_grid.TrajectoryExhausted:
+            self._chunk_index += 1
+            self._step_in_plan = 0
+            self._plan = self._decoder.plan_row(self._chunk_index)
+            command = self._decoder.assemble_step(self._plan, 0)
+        self._step_in_plan += 1
+        self._emit("model_chunk_native23", {
+            "chunk_index": self._chunk_index,
+            "step_in_plan": self._step_in_plan - 1,
+            "target_row": command["target_row"],
+            "sources": command["sources"],
+        })
+        return command
+
+    def bound_receipt(self) -> Dict[str, Any]:
+        return {
+            "policy": "ModelChunkPolicy",
+            "decoder": self._decoder.receipt(),
+            "scope": {"pass": self._scope.pass_, "missing": self._scope.missing,
+                      "evidence": self._scope.evidence},
+            "episode_length": self._decoder.episode_length,
             "executor_injected": self._executor_injected,
             "evaluator_action_dim": self._action_dim,
         }

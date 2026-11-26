@@ -21,6 +21,8 @@ def _receipt(**cert_overrides):
         "receipt": "receipt-sha",
         "config_yml_sha256": "config-sha",
         "position_error_mm": 0.00043,
+        "scene_identity": None,
+        "source_epoch": None,
     }
     certificate.update(cert_overrides)
     return {
@@ -100,10 +102,46 @@ def test_device_uuid_is_checked():
 
 def test_right_certified_receipt_serves_right_consumer():
     receipt = _receipt(bound_arm="both", right_arm_planned=True,
-                       certified_scope="dual_arm; live_scene_known")
+                       certified_scope="dual_arm; live_scene_known",
+                       scene_identity="scene_ep0475_001",
+                       source_epoch="2026-11-26T00:00:00Z")
     report = scope.verify_receipt(receipt, required_arm="both",
                                   require_live_scene=True)
     assert report.pass_ is True, report.missing
+
+
+def test_live_scene_blocks_on_unknown_identity_values():
+    for bad in (None, "", "unknown", "scene_unknown", "scene=NULL", "null"):
+        receipt = _receipt(bound_arm="both", right_arm_planned=True,
+                           scene_identity=bad, source_epoch="epoch-1")
+        report = scope.verify_receipt(receipt, required_arm="both",
+                                      require_live_scene=True)
+        assert "live_scene_unproven" in report.missing, bad
+
+
+def test_live_scene_blocks_without_source_epoch():
+    receipt = _receipt(bound_arm="both", right_arm_planned=True,
+                       certified_scope="dual_arm; live_scene_known",
+                       scene_identity="scene_ep0475_001", source_epoch=None)
+    report = scope.verify_receipt(receipt, required_arm="both",
+                                  require_live_scene=True)
+    assert "live_scene_source_epoch_unproven" in report.missing
+
+
+def test_live_scene_blocks_without_config_sha():
+    receipt = _receipt(bound_arm="both", right_arm_planned=True,
+                       certified_scope="dual_arm; live_scene_known",
+                       scene_identity="scene_ep0475_001",
+                       source_epoch="epoch-1", config_yml_sha256=None)
+    report = scope.verify_receipt(receipt, required_arm="both",
+                                  require_live_scene=True)
+    assert "live_scene_config_sha_unproven" in report.missing
+
+
+def test_right_planned_bound_arm_mismatch_blocks():
+    receipt = _receipt(bound_arm="left", right_arm_planned=True)
+    report = scope.verify_receipt(receipt, required_arm="left")
+    assert "right_arm_bound_arm_mismatch" in report.missing
 
 
 def test_non_object_receipt_fails_closed():

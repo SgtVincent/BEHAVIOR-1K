@@ -27,7 +27,11 @@ GROUP_WIDTHS: Dict[str, int] = {
 
 SOURCE_PLANNER = "planner"
 SOURCE_REPLAY = "replay"
+SOURCE_CURRENT_Q = "current_q"
 SOURCE_MISSING = "missing"
+
+# Sources a native23 group may carry after fail-closed validation.
+KNOWN_SOURCES = (SOURCE_PLANNER, SOURCE_REPLAY, SOURCE_CURRENT_Q, SOURCE_MISSING)
 
 
 def group_slices() -> Dict[str, slice]:
@@ -46,6 +50,9 @@ def group_slices() -> Dict[str, slice]:
 def _check_group(group: str, values: Sequence[Any], source: str) -> List[float]:
     width = GROUP_WIDTHS[group]
     plain = to_plain(values)
+    if source not in KNOWN_SOURCES:
+        raise ContractViolation(
+            f"native23 group '{group}' has unknown source {source!r}")
     if source == SOURCE_MISSING:
         raise ContractViolation(
             f"native23 group '{group}' has no verified source; do not zero-fill "
@@ -56,6 +63,40 @@ def _check_group(group: str, values: Sequence[Any], source: str) -> List[float]:
     if not is_finite(plain):
         raise ContractViolation(f"native23 group '{group}' contains non-finite values")
     return [float(v) for v in plain]
+
+
+def bind_current_q(
+    arm: str,
+    qpos: Sequence[Any],
+    *,
+    source_sha256: str,
+    source_kind: str = "live_sdk_qpos",
+) -> Dict[str, Any]:
+    """Bind an inactive arm's current joint q from the live SDK state.
+
+    The held arm keeps its current configuration under collision authority;
+    its group is never defaulted to zero. The live qpos vector must carry a
+    source sha256 so the binding is auditable. A missing or non-finite qpos
+    fails closed instead of substituting a planner default.
+    """
+    if arm not in ("left", "right"):
+        raise ContractViolation(f"unknown arm {arm!r}")
+    group = f"arm_{arm}"
+    plain = to_plain(qpos)
+    width = GROUP_WIDTHS[group]
+    if len(plain) != width or not is_finite(plain):
+        raise ContractViolation(
+            f"current-q binding for {group} width/finite invalid")
+    if not source_sha256 or not isinstance(source_sha256, str):
+        raise ContractViolation(
+            f"current-q binding for {group} requires a source sha256")
+    return {
+        "group": group,
+        "values": [float(v) for v in plain],
+        "source": SOURCE_CURRENT_Q,
+        "source_kind": source_kind,
+        "source_sha256": source_sha256,
+    }
 
 
 def assemble_native23(
