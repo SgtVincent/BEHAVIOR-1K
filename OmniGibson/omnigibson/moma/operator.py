@@ -45,6 +45,21 @@ class ExecutorAdapterMissing(RuntimeError):
     """No MP executor is bound. The operator refuses to plan or env.step."""
 
 
+class ExecutorPlanRejected(RuntimeError):
+    """The bound executor returned a rejected/invalid plan.
+
+    Raised when the executor raises, omits the tagged action, omits the
+    certificate, returns a non-tagged action, or returns an all-zero
+    placeholder command. A rejected plan must never be turned into a
+    zero-action env.step; the caller records the rejection instead.
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+
+
 @dataclass
 class EpisodeConfig:
     run_id: str
@@ -210,6 +225,31 @@ class MomaEpisodeOperator:
             return []
         return self.transition_fn(self._previous_obs, current, self.cfg.can_names)
 
+    @staticmethod
+    def _validate_plan(plan: Any) -> tuple[TaggedAction, Dict[str, Any]]:
+        """Reject an invalid/empty plan before any env.step is issued.
+
+        The seam contract: ``{"action23": TaggedAction, "certificate": dict}``.
+        An all-zero vector is treated as a placeholder, not a solved command.
+        """
+        if not isinstance(plan, dict):
+            raise ExecutorPlanRejected("plan_not_dict", f"got {type(plan).__name__}")
+        if "action23" not in plan:
+            raise ExecutorPlanRejected("action23_missing", "plan has no action23")
+        action = plan["action23"]
+        if not isinstance(action, TaggedAction):
+            raise ExecutorPlanRejected(
+                "action23_not_tagged", f"got {type(action).__name__}"
+            )
+        certificate = plan.get("certificate")
+        if not isinstance(certificate, dict):
+            raise ExecutorPlanRejected("certificate_missing", "certificate must be a dict")
+        if all(float(v) == 0.0 for v in action.to_list()):
+            raise ExecutorPlanRejected(
+                "zero_action_placeholder", "action23 vector is all zero"
+            )
+        return action, certificate
+
     # -- decision / step ---------------------------------------------------
 
     def request_decision(self, obs: Dict[str, Any]) -> Dict[str, Any]:
@@ -256,11 +296,18 @@ class MomaEpisodeOperator:
             )
 
         decision = self.request_decision(current)
-        plan = self.executor.plan(decision["args"])
-        action: TaggedAction = plan["action23"]
+        try:
+            plan = self.executor.plan(decision["args"])
+        except ExecutorAdapterMissing:
+            raise
+        except Exception as exc:
+            raise ExecutorPlanRejected(
+                "executor_raised", f"{type(exc).__name__}: {exc}"
+            ) from exc
+        action, certificate = self._validate_plan(plan)
         record.action_label = action.label
         record.action_dim = len(action.vector)
-        record.certificate = plan.get("certificate", {})
+        record.certificate = certificate
         record.s2 = {
             "call_id": decision.get("call_id"),
             "latency_s": decision.get("latency_s"),

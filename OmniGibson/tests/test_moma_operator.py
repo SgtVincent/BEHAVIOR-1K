@@ -13,6 +13,7 @@ from omnigibson.moma.operator import (
     MomaEpisodeOperator,
     EpisodeImmutableAfterStart,
     ExecutorAdapterMissing,
+    ExecutorPlanRejected,
 )
 from omnigibson.moma.sdk import SdkEnvironmentAdapter, SdkRobotAccessor
 from omnigibson.moma.schema import NATIVE23_JOINT, native23_action
@@ -128,7 +129,8 @@ class FakeExecutor:
 
     def plan(self, args):
         self.plans.append(args)
-        return {"action23": native23_action(np.zeros(23)), "certificate": {"primitive": args["primitive"]}}
+        command = np.full(23, 0.05, dtype=np.float64)
+        return {"action23": native23_action(command), "certificate": {"primitive": args["primitive"]}}
 
 
 class FakeS2:
@@ -359,3 +361,58 @@ def test_missing_executor_blocks_before_decision_and_step():
         assert service.requests == []
     finally:
         service.stop()
+
+
+class _PlanReturningExecutor:
+    def __init__(self, plan):
+        self.plan_value = plan
+        self.calls = 0
+
+    def plan(self, args):
+        self.calls += 1
+        return self.plan_value
+
+
+class _RaisingExecutor:
+    def plan(self, args):
+        raise RuntimeError("solver unreachable target")
+
+
+def _plan_test_operator(executor):
+    op, env, _, _ = _make_operator(_loopback_obs(), executor=executor)
+    op.reset_episode()
+    return op, env
+
+
+def test_plan_missing_action23_rejected_without_step():
+    op, env = _plan_test_operator(_PlanReturningExecutor({"certificate": {"ok": True}}))
+    with pytest.raises(ExecutorPlanRejected, match="action23_missing"):
+        op.step()
+    assert env.steps == []
+
+
+def test_plan_zero_vector_rejected_as_placeholder():
+    zero = native23_action(np.zeros(23))
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({"action23": zero, "certificate": {"ok": True}})
+    )
+    with pytest.raises(ExecutorPlanRejected, match="zero_action_placeholder"):
+        op.step()
+    assert env.steps == []
+
+
+def test_plan_missing_certificate_rejected():
+    command = np.full(23, 0.05)
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({"action23": native23_action(command)})
+    )
+    with pytest.raises(ExecutorPlanRejected, match="certificate_missing"):
+        op.step()
+    assert env.steps == []
+
+
+def test_executor_exception_reclassified_without_step():
+    op, env = _plan_test_operator(_RaisingExecutor())
+    with pytest.raises(ExecutorPlanRejected, match="executor_raised"):
+        op.step()
+    assert env.steps == []
