@@ -65,6 +65,7 @@ class ManagedReplayWrapper:
         planner_dt: float = planner_grid.PLANNER_DT_S,
         physics_dt: float = contracts.CONTROL_DT,
         current_q: Optional[Dict[str, Dict[str, Any]]] = None,
+        max_step_delta: Optional[float] = None,
     ) -> None:
         if not isinstance(targets, FixedAnchorTargets):
             raise ReplayWrapperViolation("targets must be a FixedAnchorTargets")
@@ -74,6 +75,7 @@ class ManagedReplayWrapper:
         self._executor = executor
         self._planner_dt = float(planner_dt)
         self._physics_dt = float(physics_dt)
+        self._max_step_delta = max_step_delta
         # Inactive-arm current-q bindings: group name -> bind entry from
         # :func:`native_action.bind_current_q`. An unbound inactive group
         # still fails closed; no zero default is substituted.
@@ -164,6 +166,7 @@ class ManagedReplayWrapper:
             waypoints=waypoints,
             planner_dt=planner_dt,
             physics_dt=self._physics_dt,
+            max_step_delta=self._max_step_delta,
         )
         return {
             "grid": grid,

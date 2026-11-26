@@ -33,6 +33,7 @@ from . import (  # noqa: F401
     lineage,
     managed_policy,
     manifest,
+    model_decoder,
     model_session,
     native_action,
     plan_wrapper,
