@@ -14,6 +14,7 @@ from omnigibson.moma.operator import (
     EpisodeImmutableAfterStart,
     ExecutorAdapterMissing,
     ExecutorPlanRejected,
+    DecisionFreshnessRejected,
 )
 from omnigibson.moma.sdk import SdkEnvironmentAdapter, SdkRobotAccessor
 from omnigibson.moma.schema import NATIVE23_JOINT, native23_action
@@ -416,3 +417,35 @@ def test_executor_exception_reclassified_without_step():
     with pytest.raises(ExecutorPlanRejected, match="executor_raised"):
         op.step()
     assert env.steps == []
+
+
+def test_stale_decision_rejected_before_executor_and_step(monkeypatch):
+    rejected_plan = {"action23": native23_action(np.full(23, 0.05)), "certificate": {"ok": True}}
+    op, env, executor, _ = _make_operator(
+        _loopback_obs(), executor=_PlanReturningExecutor(rejected_plan)
+    )
+
+    def _reject_binding(**kwargs):
+        raise DecisionFreshnessRejected("stale_observation_id", "late plan")
+
+    monkeypatch.setattr("omnigibson.moma.operator.validate_binding", _reject_binding)
+    with pytest.raises(DecisionFreshnessRejected, match="stale_observation_id"):
+        op.step()
+    assert env.steps == []
+    assert executor.calls == 0
+    assert any(e["type"] == "decision_freshness_rejected" for e in op.records[-1].events)
+
+
+def test_freshness_envelope_identity_archived_and_reminted():
+    op, env, _, _ = _make_operator(_loopback_obs())
+    op.reset_episode()
+    first = op.step()
+    assert first.s2["observation_id"] is not None
+    assert isinstance(first.s2["snapshot_version"], int)
+    first_id = first.s2["observation_id"]
+    assert first_id in op._historical_observation_ids
+
+    second = op.step()
+    assert second.s2["observation_id"] != first_id
+    assert second.s2["snapshot_version"] > first.s2["snapshot_version"]
+    assert len(env.steps) == 2

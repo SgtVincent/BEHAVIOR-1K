@@ -187,6 +187,8 @@ class MomaRunner:
                 step_hz=self.cfg.step_hz,
                 physics_hz=self.cfg.physics_hz,
                 allow_initial_state_restore=True,
+                max_snapshot_age_steps=self.cfg.snapshot_max_age_steps,
+                max_snapshot_age_sim_s=self.cfg.snapshot_max_age_sim_s,
             )
             self.operator = MomaEpisodeOperator(
                 episode_cfg,

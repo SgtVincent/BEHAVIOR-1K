@@ -29,8 +29,14 @@ CPU-testable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
+from .freshness import (
+    DecisionFreshnessRejected,
+    binding_from_envelope,
+    build_envelope,
+    validate_binding,
+)
 from .sdk.env_adapter import SdkEnvironmentAdapter
 from .sdk.robot_accessor import SdkRobotAccessor
 from .s2.contract import RequestTracker, digest, full_task_terminal
@@ -69,6 +75,10 @@ class EpisodeConfig:
     step_hz: int = 30
     physics_hz: int = 120
     allow_initial_state_restore: bool = True
+    # Frozen a28 freshness windows; retuning dt/window/allowed delay is out of
+    # scope for this lane.
+    max_snapshot_age_steps: int = 1800
+    max_snapshot_age_sim_s: float = 60.0
 
 
 @dataclass
@@ -118,6 +128,15 @@ class MomaEpisodeOperator:
         self._recent_turns: List[Dict[str, Any]] = []
         self.records: List[StepRecord] = []
 
+        # Snapshot identity / freshness bookkeeping (a28 observation envelope).
+        self._decision_seq = 0
+        self._snapshot_version = 0
+        self._decision_entry_snapshot_version = 0
+        self._decision_entry_sim_time_s: Optional[float] = None
+        self._observation_id: Optional[str] = None
+        self._historical_observation_ids: Set[str] = set()
+        self._current_envelope: Optional[Dict[str, Any]] = None
+
     # -- lifecycle ---------------------------------------------------------
 
     def reset_episode(
@@ -151,6 +170,13 @@ class MomaEpisodeOperator:
         self.records = []
         self.tracker.pending = None
         self.tracker.completed = []
+        self._decision_seq = 0
+        self._snapshot_version = 0
+        self._decision_entry_snapshot_version = 0
+        self._decision_entry_sim_time_s = None
+        self._observation_id = None
+        self._historical_observation_ids = set()
+        self._current_envelope = None
         return obs
 
     def restore_initial_state(self, load_state_fn: Callable[[], Any]) -> None:
@@ -252,10 +278,44 @@ class MomaEpisodeOperator:
 
     # -- decision / step ---------------------------------------------------
 
+    def _bind_fresh_snapshot(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the a28 identity/freshness envelope to a boundary observation."""
+        self._snapshot_version += 1
+        if self._decision_entry_snapshot_version <= 0:
+            self._decision_entry_snapshot_version = self._snapshot_version
+        sim_t = obs.get("sim_time_s")
+        if sim_t is not None:
+            sim_t = float(sim_t)
+            if self._decision_entry_sim_time_s is None:
+                self._decision_entry_sim_time_s = sim_t
+        if self._observation_id is None:
+            self._decision_seq += 1
+            run_short = digest(self.cfg.run_id)[:8]
+            self._observation_id = f"obs_{run_short}_d{self._decision_seq:04d}"
+        envelope = build_envelope(
+            run_id=self.cfg.run_id,
+            observation_id=self._observation_id,
+            snapshot_version=self._snapshot_version,
+            decision_entry_snapshot_version=self._decision_entry_snapshot_version,
+            decision_seq=self._decision_seq,
+            sim_time_s=sim_t,
+            max_age_steps=self.cfg.max_snapshot_age_steps,
+            max_age_sim_s=self.cfg.max_snapshot_age_sim_s,
+        )
+        envelope["decision_entry_sim_time_s"] = self._decision_entry_sim_time_s
+        for key in ("run_id", "observation_id", "snapshot_version",
+                    "decision_entry_snapshot_version", "decision_seq", "sim_time_s"):
+            obs[key] = envelope[key]
+        obs["freshness_policy"] = envelope["freshness_policy"]
+        self._current_envelope = envelope
+        return envelope
+
     def request_decision(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         if self.s2_client is None:
             raise ValueError("s2_client not bound; no privileged decision available")
         decision = self.s2_client.decide(obs, self._recent_turns)
+        # Owner-controlled identity binding; the model cannot mint or rewrite it.
+        decision["binding"] = binding_from_envelope(self._current_envelope or obs)
         self._recent_turns.append({"messages": [{"role": "user", "content": obs}]})
         return decision
 
@@ -295,7 +355,27 @@ class MomaEpisodeOperator:
                 "MP executor adapter missing; no plan and no env.step issued"
             )
 
+        self._bind_fresh_snapshot(current)
         decision = self.request_decision(current)
+        try:
+            validate_binding(
+                binding=decision.get("binding", {}),
+                envelope=self._current_envelope or current,
+                historical_observation_ids=self._historical_observation_ids,
+                run_id=self.cfg.run_id,
+                max_age_steps=self.cfg.max_snapshot_age_steps,
+                max_age_sim_s=self.cfg.max_snapshot_age_sim_s,
+            )
+        except DecisionFreshnessRejected as exc:
+            record.events = events + [{
+                "type": "decision_freshness_rejected",
+                "reason": exc.reason,
+                "detail": exc.detail,
+            }]
+            self._previous_obs = current
+            self.records.append(record)
+            raise
+
         try:
             plan = self.executor.plan(decision["args"])
         except ExecutorAdapterMissing:
@@ -308,14 +388,20 @@ class MomaEpisodeOperator:
         record.action_label = action.label
         record.action_dim = len(action.vector)
         record.certificate = certificate
+        binding = decision.get("binding", {})
         record.s2 = {
             "call_id": decision.get("call_id"),
             "latency_s": decision.get("latency_s"),
             "request_sha256": decision.get("request_sha256"),
+            "observation_id": binding.get("observation_id"),
+            "snapshot_version": binding.get("snapshot_version"),
         }
 
         self.env.step(action.to_list())
         self._step += 1
+        if self._observation_id is not None:
+            self._historical_observation_ids.add(self._observation_id)
+        self._observation_id = None
         self._previous_obs = current
         self.records.append(record)
         return record
