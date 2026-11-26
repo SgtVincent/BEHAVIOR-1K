@@ -134,6 +134,49 @@ class FailClosedTest(unittest.TestCase):
         self.assertTrue(seam2["gripper_left"]["supplied"])
         self.assertTrue(seam2["gripper_right"]["supplied"])
 
+class RightProfileRouteTest(unittest.TestCase):
+    @staticmethod
+    def _goal(**kwargs: Any) -> PlannerGoal:
+        defaults = {"source": "object_provider", "arm": "right"}
+        defaults.update(kwargs)
+        return PlannerGoal(**defaults)
+
+    def test_right_only_goal_routes_through_right_profile(self) -> None:
+        backend = CuroboV2Backend(robot_profile="r1pro", arm_profile="right")
+        right = self._goal(arm="right", right_pose=((0.5, 0.0, 0.4), (0, 0, 0, 1)))
+        self.assertIsNone(backend._route_arm(right))  # noqa: SLF001
+
+    def test_left_only_goal_rejected_on_right_profile(self) -> None:
+        backend = CuroboV2Backend(robot_profile="r1pro", arm_profile="right")
+        left = self._goal(arm="left", left_pose=((0.3, 0.0, 0.4), (0, 0, 0, 1)))
+        routed = backend._route_arm(left)  # noqa: SLF001
+        self.assertEqual(routed["certificate"]["reason"], "left_planner_unproven")
+
+    def test_dual_goal_rejected_on_right_profile(self) -> None:
+        backend = CuroboV2Backend(robot_profile="r1pro", arm_profile="right")
+        both = self._goal(arm="both", left_pose=((0.3, 0.0, 0.4), (0, 0, 0, 1)),
+                          right_pose=((0.5, 0.0, 0.4), (0, 0, 0, 1)))
+        routed = backend._route_arm(both)  # noqa: SLF001
+        self.assertEqual(routed["certificate"]["reason"], "dual_arm_unproven")
+
+    def test_right_scope_recorded(self) -> None:
+        backend = CuroboV2Backend(robot_profile="r1pro", arm_profile="right")
+        scope = backend._scope_info()  # noqa: SLF001
+        self.assertEqual(scope["bound_arm"], "right")
+        self.assertEqual(scope["primary_tool"], "right_gripper_link")
+        self.assertEqual(scope["certified_scope"], "right_arm_only; self_collision; scene_model_null")
+        self.assertTrue(scope["right_arm_planned"])
+        self.assertEqual(scope["device_uuid_source"], "manifest_argument_not_live_probe")
+
+    def test_invalid_arm_profile_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            CuroboV2Backend(robot_profile="r1pro", arm_profile="dual")
+
+    def test_factory_passes_arm_profile(self) -> None:
+        from curobo_v2.factory import make_curobo_v2_executor  # noqa: E402
+        executor = make_curobo_v2_executor(robot_profile="r1pro", arm_profile="right")
+        self.assertEqual(executor._backend._arm_profile, "right")  # noqa: SLF001
+
     def test_profile_reports_unbound(self) -> None:
         executor = CuroboV2Executor(context={"robot_profile": "r1pro"})
         report = executor.profile()

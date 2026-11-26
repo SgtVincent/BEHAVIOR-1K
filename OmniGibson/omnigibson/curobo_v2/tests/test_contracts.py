@@ -137,6 +137,20 @@ class ParseTargetTest(unittest.TestCase):
         with self.assertRaises(ContractViolation):
             parse_target({"target_pose8x4_world": [_identity_4x4(0.3)], "base_vel": [0.1, 0.2, math.nan]})
 
+    def test_provider_explicit_right_arm_target(self) -> None:
+        target = {"arm": "right", "target_pose8x4_world": [_identity_4x4(-0.2)]}
+        goal = parse_target(target)
+        self.assertEqual(goal.arm, "right")
+        self.assertIsNone(goal.left_pose)
+        self.assertIsNotNone(goal.right_pose)
+
+    def test_provider_explicit_left_arm_target(self) -> None:
+        target = {"arm": "left", "target_pose8x4_world": [_identity_4x4(0.3)]}
+        goal = parse_target(target)
+        self.assertEqual(goal.arm, "left")
+        self.assertIsNotNone(goal.left_pose)
+        self.assertIsNone(goal.right_pose)
+
     def test_s2_args_target(self) -> None:
         goal = parse_target({"primitive": "pick_up", "target_object": "trash_can_116"})
         self.assertEqual(goal.source, "s2_args")

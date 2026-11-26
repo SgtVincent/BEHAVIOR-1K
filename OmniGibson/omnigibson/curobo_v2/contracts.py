@@ -307,17 +307,33 @@ def parse_target(target: Dict[str, Any]) -> PlannerGoal:
 
     if "target_pose8x4_world" in target:
         rows = target["target_pose8x4_world"]
-        try:
-            left = _pose8x4_to_pos_quat(rows[0])
-        except (IndexError, TypeError, ValueError) as exc:
-            raise ContractViolation(f"provider_target_invalid: {exc}") from exc
-        right = None
-        if len(rows) > 1 and rows[1] is not None:
+        explicit_arm = target.get("arm")
+        if explicit_arm == "right":
             try:
-                right = _pose8x4_to_pos_quat(rows[1])
-            except (TypeError, ValueError) as exc:
+                right = _pose8x4_to_pos_quat(rows[0])
+            except (IndexError, TypeError, ValueError) as exc:
                 raise ContractViolation(f"provider_target_invalid: {exc}") from exc
-        arm = "both" if right is not None else "left"
+            left = None
+            arm = "right"
+        elif explicit_arm == "left":
+            try:
+                left = _pose8x4_to_pos_quat(rows[0])
+            except (IndexError, TypeError, ValueError) as exc:
+                raise ContractViolation(f"provider_target_invalid: {exc}") from exc
+            right = None
+            arm = "left"
+        else:
+            try:
+                left = _pose8x4_to_pos_quat(rows[0])
+            except (IndexError, TypeError, ValueError) as exc:
+                raise ContractViolation(f"provider_target_invalid: {exc}") from exc
+            right = None
+            if len(rows) > 1 and rows[1] is not None:
+                try:
+                    right = _pose8x4_to_pos_quat(rows[1])
+                except (TypeError, ValueError) as exc:
+                    raise ContractViolation(f"provider_target_invalid: {exc}") from exc
+            arm = "both" if right is not None else "left"
         grips = target.get("grippers")
         grippers = None
         if grips is not None:

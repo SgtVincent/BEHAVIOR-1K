@@ -74,8 +74,12 @@ class CuroboV2Backend:
         cache_dir: Optional[str] = None,
         canary_evidence: Optional[Dict[str, Any]] = None,
         private_manifest: Optional[Dict[str, Any]] = None,
+        arm_profile: str = "left",
     ) -> None:
+        if arm_profile not in ("left", "right"):
+            raise ValueError(f"unsupported arm_profile: {arm_profile!r}")
         self._profile_name = robot_profile
+        self._arm_profile = arm_profile
         self._device_uuid = device_uuid
         self._robot_config_yaml = robot_config_yaml
         self._urdf_path = urdf_path
@@ -99,6 +103,7 @@ class CuroboV2Backend:
             "active_joints": list(R1PRO_PLANNER_JOINTS),
             "locked_joints": list(R1PRO_LOCKED_JOINTS),
             "tool_frames": dict(R1PRO_TOOL_FRAMES),
+            "arm_profile": self._arm_profile,
             "bound_arm": self._bound_arm,
             "primary_tool": self._primary_tool,
             "dt_s": PLANNER_DT_S,
@@ -149,16 +154,16 @@ class CuroboV2Backend:
             if not isinstance(robot_dict, dict):
                 raise RobotProfileUnbound("robot config yaml did not parse to a dict")
             # Per-arm unit gate: the internal IK solver expects one tool frame per
-            # planner. The bound planner holds the left tool; right-arm planning
-            # is a separate unproven unit and fails closed rather than sharing this
-            # dual-frame solver.
-            primary = R1PRO_TOOL_FRAMES["left"]
+            # planner. Each arm profile binds its own tool frame; the opposite arm
+            # is an unproven unit on this planner and fails closed rather than
+            # sharing a dual-frame solver.
+            primary = R1PRO_TOOL_FRAMES[self._arm_profile]
             robot_dict.setdefault("kinematics", {})["tool_frames"] = [primary]
             cfg = MotionPlannerCfg.create(robot=robot_dict, self_collision_check=True)
             planner = MotionPlanner(cfg)
             planner.warmup(enable_graph=True, num_warmup_iterations=5)
             self._objects["planner"] = planner
-            self._bound_arm = "left"
+            self._bound_arm = self._arm_profile
             self._primary_tool = primary
             self._backend_name = get_backend_name()
             self._version = getattr(curobo, "__version__", "unknown")
@@ -212,12 +217,12 @@ class CuroboV2Backend:
 
         from curobo.types import JointState, GoalToolPose
 
-        pose = goal.left_pose
+        pose = goal.right_pose if self._arm_profile == "right" else goal.left_pose
         if pose is None:
             return self._blocked("goal_pose_missing")
 
         pos, quat = pose
-        tool_frame = self._primary_tool or R1PRO_TOOL_FRAMES["left"]
+        tool_frame = self._primary_tool or R1PRO_TOOL_FRAMES[self._arm_profile]
         q_start = JointState.from_position(
             planner.default_joint_state.position.unsqueeze(0),
             joint_names=planner.joint_names,
@@ -323,13 +328,20 @@ class CuroboV2Backend:
         }
 
     def _route_arm(self, goal: PlannerGoal) -> Optional[Dict[str, Any]]:
-        """Fail-closed arm routing for the left-only bound profile.
+        """Fail-closed arm routing for the single-arm bound profile.
 
-        A dual-arm goal (both poses, or a left goal carrying a right pose) is
-        rejected as ``dual_arm_unproven``; a right-only goal is rejected as
-        ``right_planner_unproven``. The bound profile must never silently drop
-        the right pose and report an optimal left plan as a dual-arm result.
+        A dual-arm goal (both poses) is rejected as ``dual_arm_unproven``. On a
+        left-bound profile a right-only goal is ``right_planner_unproven``; on a
+        right-bound profile a left-only goal is ``left_planner_unproven``. The
+        bound profile must never silently drop the opposite pose and report an
+        optimal plan as a coordinated-arm result.
         """
+        if self._arm_profile == "right":
+            if goal.arm == "both" or goal.left_pose is not None:
+                if goal.arm == "left" or goal.right_pose is None:
+                    return self._blocked("left_planner_unproven")
+                return self._blocked("dual_arm_unproven")
+            return None
         if goal.arm == "both" or goal.right_pose is not None:
             if goal.arm == "right" or goal.left_pose is None:
                 return self._blocked("right_planner_unproven")
@@ -338,11 +350,12 @@ class CuroboV2Backend:
 
     def _scope_info(self) -> Dict[str, Any]:
         """Explicit planner-scope record attached to every success certificate."""
+        right = self._arm_profile == "right"
         return {
-            "bound_arm": self._bound_arm,
-            "primary_tool": self._primary_tool,
-            "certified_scope": "left_arm_only; self_collision; scene_model_null",
-            "right_arm_planned": False,
+            "bound_arm": self._bound_arm or self._arm_profile,
+            "primary_tool": self._primary_tool or R1PRO_TOOL_FRAMES[self._arm_profile],
+            "certified_scope": f"{self._arm_profile}_arm_only; self_collision; scene_model_null",
+            "right_arm_planned": right,
             "device_uuid_source": "manifest_argument_not_live_probe",
         }
 

@@ -49,6 +49,7 @@ class CuroboV2Executor:
     def _backend_kwargs(context: Dict[str, Any]) -> Dict[str, Any]:
         keys = {
             "robot_profile",
+            "arm_profile",
             "device_uuid",
             "robot_config_yaml",
             "urdf_path",
