@@ -1,4 +1,5 @@
 """Online 61 -> state45 provider: verified slots, pending contexts fail closed."""
+import math
 import os
 import tempfile
 
@@ -199,4 +200,27 @@ def test_pending_torso_slots_are_not_zero_filled():
     torso = fields[39:45]
     assert all(f.status == "unknown_pending" for f in torso)
     assert all(f.source_index is None for f in torso)
+
+
+def test_torso_bound_cpu_fk_when_chain_injected():
+    urdf = _write_urdf()
+    try:
+        fk = torso_fk.TorsoFk(torso_fk.load_trunk_chain(urdf))
+        provider = state_mapping.OnlineState45Provider(
+            velocity_provider=lambda: [0.0, 0.0, 0.0], torso_fk=fk)
+        desc = provider.descriptor()
+        torso = desc.fields[39:45]
+        assert all(f.status == "bound_cpu_fk" for f in torso)
+        assert "torso_se3" not in provider.pending_slots()
+        state = provider.map_state(_row())
+        assert len(state) == 45
+        assert all(math.isfinite(v) for v in state)
+        # Second observation moves the trunk; slots 39:45 come from the CPU FK
+        # provider relative to the frame-0 anchor, not a zero fill.
+        second = _row()
+        second[53:57] = [0.2, -0.1, 0.15, -0.05]
+        state2 = provider.append(second)
+        assert any(v != 0.0 for v in state2[39:45])
+    finally:
+        os.remove(urdf)
 

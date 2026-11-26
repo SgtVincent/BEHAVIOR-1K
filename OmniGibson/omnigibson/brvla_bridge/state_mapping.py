@@ -10,9 +10,12 @@ Verified slices come from post1 ``eval/utils/eval_utils.py``
 ``PROPRIOCEPTION_INDICES["R1Pro"]``; the 45-slot assembly mirrors the frozen
 ``br_state45_adapter.py`` (sha `8f7bb7b9…30f78f`). The base-move frame was
 confirmed by the GPU1 live proprio sample (v3 receipt): ``base_qvel`` 0:3 is
-already robot-local ``[vx, vy, wz]``. The torso FK chain slots stay explicitly
-pending until the tracked live chain is bound; pending slots are never
-zero-filled, padded, or bridged from the old 256-wide vector.
+already robot-local ``[vx, vy, wz]``. The torso SE3 provider binds at the CPU
+FK layer once the manifest URDF identity and frozen-adapter chain cross-check
+pass; a live CPU-FK vs simulator-trunk relative-pose canary and the tracking
+gate are separate layers and do not hold the CPU binding pending. Unverified
+slots stay fail-closed: they are never zero-filled, padded, or bridged from the
+old 256-wide vector.
 """
 import math
 from dataclasses import dataclass
@@ -169,7 +172,7 @@ class OnlineState45Provider(StateMappingProvider):
         if role == "base_move":
             return "bound" if self._velocity_provider is not None else "unknown_pending"
         if role == "torso_se3":
-            return "bound" if self._torso_fk is not None else "unknown_pending"
+            return "bound_cpu_fk" if self._torso_fk is not None else "unknown_pending"
         return "bound"
 
     def descriptor(self) -> SchemaDescriptor:
@@ -177,7 +180,10 @@ class OnlineState45Provider(StateMappingProvider):
             FieldMapping(None, role, self._status(role),
                           "post1 61-d verified slice" if self._status(role) == "bound" else
                           ("EE forced zero under remove_eef_state topology" if self._status(role) == "ee_zero_profile"
-                           else "source context not verified; fail-closed"))
+                           else ("manifest URDF identity + CPU FK chain cross-checked; live sim-trunk "
+                                 "relative-pose canary and tracking gate remain separate"
+                                 if self._status(role) == "bound_cpu_fk"
+                                 else "source context not verified; fail-closed")))
             for role in SLOT_ROLES
         ]
         return SchemaDescriptor(
