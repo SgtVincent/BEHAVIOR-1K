@@ -59,7 +59,10 @@ def observe(robot: Any, cans: Dict[str, Any], bucket: Any,
     result: Dict[str, Any] = {"grasping_mode": grasping_mode, "objects": {}, "arms": {}}
 
     objects = dict(cans)
-    objects[_label(bucket, "bucket")] = bucket
+    bucket_resolved = bucket is not None and not (
+        isinstance(bucket, dict) and bucket.get("status") in ("UNKNOWN", "BLOCKED"))
+    if bucket_resolved:
+        objects[_label(bucket, "bucket")] = bucket
     for name, obj in objects.items():
         if isinstance(obj, dict) and obj.get("status") in ("UNKNOWN", "BLOCKED"):
             result["objects"][name] = dict(obj)
@@ -88,7 +91,9 @@ def observe(robot: Any, cans: Dict[str, Any], bucket: Any,
                 "grasp_counter": clean(robot._ag_grasp_counter[arm]),
                 "constraint_present": robot._ag_obj_constraints[arm] is not None,
                 "constraint_params": clean(robot._ag_obj_constraint_params[arm]),
-                "freeze_gripper": clean(robot._ag_freeze_gripper[arm]),
+                "freeze_gripper": (clean(robot._ag_freeze_gripper[arm])
+                                   if hasattr(robot, "_ag_freeze_gripper")
+                                   else {"status": "UNKNOWN", "error": "field_absent_post1"}),
             }
         result["arms"][arm] = read_value(ag)
     return result

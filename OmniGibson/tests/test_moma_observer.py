@@ -177,3 +177,22 @@ def test_empty_hand_reads_no_false_grasp():
     for arm in ("left", "right"):
         assert obs["arms"][arm]["object_in_hand"] is None
         assert obs["arms"][arm]["constraint_present"] is False
+
+
+def test_none_bucket_is_skipped_not_read_as_object():
+    empty = _FakeObj("can_of_soda_115", inside=False)
+    robot = _make_robot({"can_of_soda_115": empty}, None)  # type: ignore[arg-type]
+    obs = observe(robot, {"can_of_soda_115": empty}, None, _pose_fn, "Inside", "ContactBodies")
+    assert "trash_can_116" not in obs["objects"]
+    assert list(obs["objects"].keys()) == ["can_of_soda_115"]
+
+
+def test_observer_absent_freeze_field_stays_unknown():
+    bucket = _FakeObj("trash_can_116")
+    empty = _FakeObj("can_of_soda_115", inside=False)
+    robot = _make_robot({"can_of_soda_115": empty}, bucket)
+    del robot._ag_freeze_gripper
+    obs = observe(robot, {"can_of_soda_115": empty}, bucket, _pose_fn, "Inside", "ContactBodies")
+    for arm in ("left", "right"):
+        freeze = obs["arms"][arm]["freeze_gripper"]
+        assert isinstance(freeze, dict) and freeze.get("status") == "UNKNOWN"

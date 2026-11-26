@@ -67,6 +67,9 @@ class FakeRobot:
     def release_grasp_immediately(self, arm="default"):
         self.released.append(arm)
 
+    def get_joint_positions(self):
+        return np.arange(26, dtype=float)
+
     def controller_action_idx(self):
         return {"base": np.arange(3)}
 
@@ -127,3 +130,21 @@ def test_safe_hand_record_keeps_unknown_on_read_failure():
     acc = SdkRobotAccessor(robot)
     record = acc.safe_hand_record("left")
     assert record.get("status") == "UNKNOWN"
+
+
+def test_joint_qpos_reads_method_surface():
+    robot = FakeRobot()
+    acc = SdkRobotAccessor(robot)
+    qpos = acc.joint_qpos()
+    assert qpos.shape == (26,)
+    assert np.allclose(qpos, np.arange(26, dtype=float))
+
+
+def test_absent_freeze_field_stays_unknown():
+    robot = FakeRobot()
+    del robot._ag_freeze_gripper
+    acc = SdkRobotAccessor(robot)
+    record = acc.hand_record("left")
+    freeze = record["freeze_gripper"]
+    assert isinstance(freeze, dict) and freeze.get("status") == "UNKNOWN"
+    assert freeze.get("error") == "field_absent_post1"
