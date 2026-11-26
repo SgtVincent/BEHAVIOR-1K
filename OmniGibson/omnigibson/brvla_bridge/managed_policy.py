@@ -70,6 +70,7 @@ class ManagedReplayPolicy:
         representation: str = delta_tf.REPRESENTATION_PAIRWISE,
         dt_seconds: float = contracts.CONTROL_DT,
         receipt_path: Optional[str] = None,
+        receipt_file_sha256: Optional[str] = None,
         expected_receipt_sha256: Optional[str] = None,
         expected_config_sha256: Optional[str] = None,
         required_arm: str = scope.ARM_LEFT,
@@ -112,11 +113,11 @@ class ManagedReplayPolicy:
             rp = pathlib.Path(receipt_path)
             if not rp.exists():
                 raise ManagedPolicyViolation(f"planner receipt absent: {rp}")
-            if expected_receipt_sha256 is not None:
+            if receipt_file_sha256 is not None:
                 actual = _sha256_file(rp)
-                if actual != expected_receipt_sha256:
+                if actual != receipt_file_sha256:
                     raise ManagedPolicyViolation(
-                        f"receipt sha drift: expected {expected_receipt_sha256}, got {actual}")
+                        f"receipt file sha drift: expected {receipt_file_sha256}, got {actual}")
             receipt = json.loads(rp.read_text(encoding="utf-8"))
         else:
             receipt = {}
