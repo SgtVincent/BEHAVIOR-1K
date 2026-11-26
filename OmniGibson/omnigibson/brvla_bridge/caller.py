@@ -25,9 +25,103 @@ class Transport(Protocol):
 
     def connect(self) -> Dict[str, Any]: ...
 
-    def request(self, payload: bytes) -> Any: ...
+    def request(self, payload: Any) -> Any: ...
 
     def reset(self, request: Dict[str, Any]) -> None: ...
+
+
+class Post1WebsocketTransport:
+    """Concrete transport backed by the post1 ``WebsocketClientPolicy``.
+
+    The post1 client (``omnigibson.eval.utils.network_utils``) owns the healthz
+    poll, ws handshake, first-frame metadata, msgpack ndarray envelope, and
+    open-loop chunk replay. This adapter forwards the obs dict unchanged and
+    wraps the returned action tensor in the response envelope. The OmniGibson
+    module is imported lazily at connect time; the CPU contract layer never
+    requires OmniGibson, websockets, torch, or numpy at package import.
+
+    Args:
+        host/port/scheme/api_key: frozen server endpoint.
+        allow_reconnect: forwarded to the post1 client.
+        action_chunk_size: forwarded; ``<= 1`` disables chunk requests.
+        client: prebuilt client instance (test injection).
+        client_factory: callable taking the client kwargs and returning a client.
+    """
+
+    NETWORK_UTILS_MODULE = "omnigibson.eval.utils.network_utils"
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        scheme: str = "ws",
+        api_key: Optional[str] = None,
+        allow_reconnect: bool = False,
+        action_chunk_size: int = 0,
+        client: Any = None,
+        client_factory: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ):
+        self._host = host
+        self._port = int(port)
+        self._scheme = scheme
+        self._api_key = api_key
+        self._allow_reconnect = bool(allow_reconnect)
+        self._action_chunk_size = int(action_chunk_size)
+        self._client = client
+        self._client_factory = client_factory
+        self._metadata: Optional[Dict[str, Any]] = None
+
+    def _client_kwargs(self) -> Dict[str, Any]:
+        return {
+            "host": self._host,
+            "port": self._port,
+            "scheme": self._scheme,
+            "api_key": self._api_key,
+            "allow_reconnect": self._allow_reconnect,
+            "action_chunk_size": self._action_chunk_size,
+        }
+
+    def _resolve_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        if self._client_factory is not None:
+            self._client = self._client_factory(self._client_kwargs())
+            return self._client
+        import importlib
+
+        module = importlib.import_module(self.NETWORK_UTILS_MODULE)
+        self._client = module.WebsocketClientPolicy(**self._client_kwargs())
+        return self._client
+
+    def healthz(self) -> None:
+        # The healthz poll is folded into the client's ``_wait_for_server``;
+        # ``connect`` drives it on the real client.
+        return None
+
+    def connect(self) -> Dict[str, Any]:
+        client = self._resolve_client()
+        conn, metadata = client._wait_for_server()
+        client._ws = conn
+        client._server_metadata = metadata
+        self._metadata = dict(metadata)
+        return self._metadata
+
+    def request(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        action = self._resolve_client().act(obs)
+        return {"action": action}
+
+    def reset(self, _request: Dict[str, Any]) -> None:
+        self._resolve_client().reset()
+
+    def metadata(self) -> Optional[Dict[str, Any]]:
+        return None if self._metadata is None else dict(self._metadata)
+
+    def close(self) -> None:
+        ws = getattr(self._client, "_ws", None)
+        if ws is not None:
+            close = getattr(ws, "close", None)
+            if callable(close):
+                close()
 
 
 class WsPolicyCaller:
@@ -85,8 +179,7 @@ class WsPolicyCaller:
 
         request = ws_protocol.build_observation_request(
             obs, self._chunk_size if self._chunk_size > 1 else 0)
-        payload = self._wire.encode(request)
-        response = self._transport.request(payload)
+        response = self._transport.request(request)
         if isinstance(response, (bytes, bytearray)):
             response = self._wire.decode(bytes(response))
         validated = ws_protocol.validate_response(

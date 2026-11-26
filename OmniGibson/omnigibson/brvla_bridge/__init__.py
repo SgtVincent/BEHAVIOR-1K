@@ -30,6 +30,7 @@ from . import (  # noqa: F401
     errors,
     lineage,
     manifest,
+    model_session,
     schema,
     state_mapping,
     torso_fk,

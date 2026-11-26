@@ -19,7 +19,7 @@ from typing import Callable, List, Optional, Sequence
 
 from . import contracts
 from ._arr import is_finite, to_plain
-from .errors import MappingNotDeclaredError, Port2026Error
+from .errors import ContractViolation, MappingNotDeclaredError, Port2026Error
 
 # post1 R1Pro 61-d proprio slices (eval_utils PROPRIOCEPTION_INDICES["R1Pro"]).
 POST1_R1PRO_SLICES = {
@@ -147,6 +147,12 @@ class OnlineState45Provider(StateMappingProvider):
         source_width: int = contracts.STATE61,
         remove_eef: bool = True,
     ):
+        if not remove_eef:
+            raise ContractViolation(
+                "remove_eef=False is unsupported: the post1 61-d proprio carries no "
+                "EE pose source, so slots 0:12 must not be faked as bound. The frozen "
+                "online topology is remove_eef_state=true (EE slots forced zero by profile)."
+            )
         self._source_width = source_width
         self._velocity_provider = velocity_provider
         self._torso_fk = torso_fk
@@ -158,7 +164,7 @@ class OnlineState45Provider(StateMappingProvider):
 
     def _status(self, role: str) -> str:
         if role.endswith("ee_se3"):
-            return "ee_zero_profile" if self._remove_eef else "bound"
+            return "ee_zero_profile"
         if role == "base_move":
             return "bound" if self._velocity_provider is not None else "unknown_pending"
         if role == "torso_se3":

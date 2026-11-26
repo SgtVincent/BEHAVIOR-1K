@@ -3,7 +3,7 @@ import os
 import tempfile
 
 from brvla_bridge import contracts, state_mapping, torso_fk
-from brvla_bridge.errors import MappingNotDeclaredError
+from brvla_bridge.errors import ContractViolation, MappingNotDeclaredError
 from brvla_bridge.tests._assert import raises
 
 
@@ -37,6 +37,13 @@ def test_pending_base_and_torso_rejected_without_context():
     assert pending.count("torso_se3") == 6
     with raises(MappingNotDeclaredError):
         provider.map_state(_row())
+
+
+def test_remove_eef_false_profile_is_unsupported_fail_closed():
+    # No EE pose source exists in the post1 61-d proprio; a non-zero-EE profile
+    # must be rejected, never marked bound with zero-filled EE slots.
+    with raises(ContractViolation):
+        state_mapping.OnlineState45Provider(remove_eef=False)
 
 
 def test_descriptor_marks_zero_profile_and_pending():
