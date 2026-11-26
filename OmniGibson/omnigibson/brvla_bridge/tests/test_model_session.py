@@ -65,7 +65,11 @@ def test_load_frozen_server_module_sha_gate():
             model_session.load_frozen_server_module(manifest)
 
         manifest = _manifest(path, _sha_file(path))
-        module = model_session.load_frozen_server_module(manifest)
+        ref = model_session.frozen_server_reference(manifest)
+        assert ref.path == path and ref.exists
+        with raises(Port2026Error):
+            model_session.load_frozen_server_module(manifest)
+        module = model_session.load_frozen_server_module(manifest, execute=True)
         assert module.VALUE == 7
     finally:
         os.remove(path)
@@ -83,3 +87,46 @@ def test_runtime_probe_records_dep_status():
     assert env["cwd"]
     assert set(env["dependencies"]).issuperset(
         {"torch", "numpy", "websockets", "requests", "msgpack"})
+
+
+def _write_urdf() -> str:
+    joints = "".join(
+        f'<joint name="torso_joint{i}" type="revolute">'
+        f'<origin xyz="0 0 0"/><axis xyz="0 0 1"/></joint>'
+        for i in range(1, 5)
+    )
+    fd, path = tempfile.mkstemp(suffix=".urdf")
+    os.write(fd, f"<robot>{joints}</robot>".encode())
+    os.close(fd)
+    return path
+
+
+def test_build_torso_fk_uses_verified_urdf():
+    path = _write_urdf()
+    try:
+        manifest = _manifest("/nonexistent/server.py", "0" * 64)
+        manifest.urdf = {"path": path, "sha256": _sha_file(path)}
+        fk = model_session.build_torso_fk(manifest)
+        pose = fk.relative_se3([0.05, -0.05, 0.1, -0.1])
+        assert len(pose) == 6
+        assert all(isinstance(v, float) for v in pose)
+    finally:
+        os.remove(path)
+
+
+def test_urdf_sha_mismatch_rejected():
+    path = _write_urdf()
+    try:
+        manifest = _manifest("/nonexistent/server.py", "0" * 64)
+        manifest.urdf = {"path": path, "sha256": "0" * 64}
+        with raises(Port2026Error):
+            model_session.build_torso_fk(manifest)
+    finally:
+        os.remove(path)
+
+
+def test_urdf_missing_path_rejected():
+    manifest = _manifest("/nonexistent/server.py", "0" * 64)
+    manifest.urdf = {"path": "/nonexistent/robot.urdf", "sha256": "0" * 64}
+    with raises(Port2026Error):
+        model_session.verify_urdf_identity(manifest)

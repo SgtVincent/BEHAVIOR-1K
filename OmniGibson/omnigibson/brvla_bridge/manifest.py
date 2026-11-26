@@ -25,6 +25,7 @@ class FrozenManifest:
     server_session: Dict[str, Any]
     replay: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
+    urdf: Dict[str, Any] = field(default_factory=dict)
 
     def get(self, section: str, key: str, default: Any = None) -> Any:
         return getattr(self, section, {}).get(key, default)
@@ -46,4 +47,5 @@ def load_manifest(path: Optional[str] = None) -> FrozenManifest:
         server_session=data["server_session"],
         replay=data.get("replay", {}),
         raw=data.get("raw", {}),
+        urdf=data.get("urdf", {}),
     )

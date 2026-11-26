@@ -13,6 +13,7 @@ import importlib.util
 import os
 import platform
 import sys
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from .errors import Port2026Error
@@ -62,8 +63,9 @@ def _manifest_refs(manifest) -> Dict[str, Any]:
     stats = getattr(manifest, "stats", {}) or {}
     server_session = getattr(manifest, "server_session", {}) or {}
     worker = getattr(manifest, "worker", {}) or {}
+    urdf = getattr(manifest, "urdf", {}) or {}
     return {"checkpoint": checkpoint, "stats": stats, "server_session": server_session,
-            "worker": worker}
+            "worker": worker, "urdf": urdf}
 
 
 def record_session(manifest, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -82,6 +84,8 @@ def record_session(manifest, runtime: Optional[Dict[str, Any]] = None) -> Dict[s
     old = stats.get("stats_251101", {})
     ckpt_dir = checkpoint.get("dir")
     server_path = server_session.get("frozen_server_path")
+    urdf_ref = refs["urdf"]
+    urdf_path = urdf_ref.get("path")
 
     def exists(path: Optional[str]) -> bool:
         return bool(path and os.path.exists(path))
@@ -105,6 +109,12 @@ def record_session(manifest, runtime: Optional[Dict[str, Any]] = None) -> Dict[s
             "sha256": server_session.get("frozen_server_sha256"),
             "exists": exists(server_path),
         },
+        "urdf": {
+            "path": urdf_path,
+            "realpath": os.path.realpath(urdf_path) if exists(urdf_path) else None,
+            "sha256": urdf_ref.get("sha256"),
+            "exists": exists(urdf_path),
+        },
         "server_metadata": server_session.get("metadata", {}),
         "device_roles": {
             EVALUATOR_GPU_ROLE: gpu_assignment.get(EVALUATOR_GPU_ROLE),
@@ -115,12 +125,20 @@ def record_session(manifest, runtime: Optional[Dict[str, Any]] = None) -> Dict[s
     return record
 
 
-def load_frozen_server_module(manifest):
-    """Import the frozen server by manifest path after sha verification.
+@dataclass(frozen=True)
+class FrozenServerReference:
+    path: str
+    sha256: str
+    exists: bool
 
-    The module is loaded from its original NAS location via importlib; no source
-    is copied into the public worktree. Raises :class:`Port2026Error` when the
-    path/sha is missing, the file is absent, or the sha drifts.
+
+def frozen_server_reference(manifest) -> FrozenServerReference:
+    """Gate the frozen server path/sha without importing or executing it.
+
+    The frozen server performs its own env shims, distributed init, model
+    instantiation, weight load, and 7-GPU sharding at module import. It must run
+    in its original frozen serving venv on the model GPU; the eval/bridge env
+    must not exec it. This gate only records identity and existence.
     """
     refs = _manifest_refs(manifest)
     server_session = refs["server_session"]
@@ -128,16 +146,65 @@ def load_frozen_server_module(manifest):
     expected_sha = server_session.get("frozen_server_sha256")
     if not path or not expected_sha:
         raise Port2026Error("manifest server_session frozen_server path/sha missing")
-    if not os.path.exists(path):
+    exists = os.path.exists(path)
+    if not exists:
         raise Port2026Error(f"frozen server source absent: {path}")
     actual_sha = _sha256_file(path)
     if actual_sha != expected_sha:
         raise Port2026Error(
             f"frozen server sha drift: expected {expected_sha}, got {actual_sha}")
+    return FrozenServerReference(path=path, sha256=actual_sha, exists=True)
 
-    spec = importlib.util.spec_from_file_location("brvla_frozen_server", path)
+
+def load_frozen_server_module(manifest, *, execute: bool = False):
+    """Import the frozen server by manifest path after sha verification.
+
+    Import is opt-in only: ``execute=True`` is reserved for the original frozen
+    serving venv on the model GPU. The bridge/eval contract layer never passes
+    ``execute=True``; model loading and forward remain outside this lane's CPU
+    admission. No source is copied or vendored.
+    """
+    ref = frozen_server_reference(manifest)
+    if not execute:
+        raise Port2026Error(
+            "frozen server module exec deferred to the original frozen serving "
+            "venv; pass execute=True only in the model-GPU serving session")
+    spec = importlib.util.spec_from_file_location("brvla_frozen_server", ref.path)
     if spec is None or spec.loader is None:
-        raise Port2026Error(f"cannot build import spec for {path}")
+        raise Port2026Error(f"cannot build import spec for {ref.path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def verify_urdf_identity(manifest) -> Dict[str, str]:
+    """Verify the manifest-pinned URDF path/sha before any torso FK use.
+
+    Returns ``{path, realpath, sha256}``. Read-only hash check; the URDF is still
+    copied to the local SSD cache by the C0 runtime before business use.
+    """
+    ref = _manifest_refs(manifest)["urdf"]
+    path = ref.get("path")
+    expected_sha = ref.get("sha256")
+    if not path or not expected_sha:
+        raise Port2026Error("manifest urdf path/sha missing")
+    if not os.path.exists(path):
+        raise Port2026Error(f"URDF source absent: {path}")
+    actual_sha = _sha256_file(path)
+    if actual_sha != expected_sha:
+        raise Port2026Error(
+            f"URDF sha drift: expected {expected_sha}, got {actual_sha}")
+    return {"path": path, "realpath": os.path.realpath(path), "sha256": actual_sha}
+
+
+def build_torso_fk(manifest):
+    """Build the verified torso FK chain from the manifest URDF.
+
+    Lazy-imports :mod:`torso_fk`; raises :class:`Port2026Error` on missing or
+    drifted URDF. The chain is bound to the provider only after this gate passes.
+    """
+    from . import torso_fk
+
+    urdf = verify_urdf_identity(manifest)
+    chain = torso_fk.load_trunk_chain(urdf["path"])
+    return torso_fk.TorsoFk(chain)
