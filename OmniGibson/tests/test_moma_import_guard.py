@@ -44,6 +44,7 @@ ALL_LEAVES = [
     "observer/three_can.py",
     "s2/contract.py",
     "s2/client.py",
+    "s2/rule_service.py",
     "sdk/__init__.py",
     "sdk/robot_accessor.py",
     "sdk/env_adapter.py",
