@@ -1,8 +1,9 @@
 """CPU tests for source-to-live object identity matching.
 
 Sim-free: live objects are duck-typed fakes. Class-only alignment must never
-be accepted as the same initial state; only an exact name/prim-path match
-confirms identity.
+be accepted as the same initial state; only an exact BDDL instance / name /
+prim-path match confirms identity. Category and model are corroboration
+evidence, recorded on the candidate, never a confirmation by themselves.
 """
 import numpy as np
 
@@ -11,6 +12,7 @@ from omnigibson.moma.object_identity import (
     match_objects,
     parse_source_name,
     pose_residual,
+    refs_from_anchor,
 )
 
 
@@ -22,12 +24,14 @@ def _pose(translation=(0.0, 0.0, 0.0)):
 
 class _FakeLiveObj:
     def __init__(self, name, prim_path, category="object", translation=(0.0, 0.0, 0.0),
-                 model="/fake/asset.usd"):
+                 model="itolcg", in_rooms=None):
         self.name = name
         self.prim_path = prim_path
         self.relative_prim_path = prim_path
         self.category = category
-        self._usd_path = model
+        self.model = model
+        self.in_rooms = in_rooms
+        self._usd_path = f"/fake/{model}.usd"
         self._uuid = f"uuid-{name}"
         self._translation = translation
 
@@ -35,12 +39,13 @@ class _FakeLiveObj:
         return np.array(self._translation, dtype=float), np.array([0.0, 0.0, 0.0, 1.0])
 
 
-def _ref(name, translation=(0.0, 0.0, 0.0)):
+def _ref(name, translation=(0.0, 0.0, 0.0), **kwargs):
     return SourceObjectRef(
         role=parse_source_name(name)["role"],
         source_name=name,
         source_pose=_pose(translation),
         source_index=818,
+        **kwargs,
     )
 
 
@@ -55,7 +60,7 @@ def test_parse_source_name_splits_prefix_and_suffix():
 
 
 def test_name_exact_match_confirms_identity():
-    live = _FakeLiveObj("can_of_soda_114", "/World/can_of_soda_114", category="soda_can")
+    live = _FakeLiveObj("can_of_soda_114", "/World/can_of_soda_114", category="can_of_soda")
     report = match_objects([_ref("can_of_soda_114")], [live])
     match = report["matches"]["can_of_soda_114"]
     assert match["verdict"] == "name_exact"
@@ -64,9 +69,35 @@ def test_name_exact_match_confirms_identity():
     assert report["identity_confirmed"] is True
 
 
+def test_instance_exact_via_scope_key_confirms():
+    live = _FakeLiveObj("can__of__soda.n.01_2", "/World/can__of__soda.n.01_2",
+                        category="can_of_soda", model="itolcg")
+    ref = _ref("can_of_soda_114", bddl_instance="can__of__soda.n.01_2",
+               category="can_of_soda", model="itolcg")
+    report = match_objects([ref], [live], scope_keys=["can__of__soda.n.01_2"])
+    match = report["matches"]["can_of_soda_114"]
+    assert match["verdict"] == "instance_exact"
+    assert match["identity_confirmed"] is True
+    assert match["matched_live_name"] == "can__of__soda.n.01_2"
+    assert match["candidates"][0]["corroboration"]["category_match"] is True
+    assert match["candidates"][0]["corroboration"]["model_match"] is True
+
+
+def test_instance_exact_with_model_mismatch_still_records_residual():
+    live = _FakeLiveObj("can__of__soda.n.01_3", "/World/can__of__soda.n.01_3",
+                        category="can_of_soda", model="lugwcz")
+    ref = _ref("can_of_soda_113", bddl_instance="can__of__soda.n.01_3",
+               category="can_of_soda", model="itolcg")
+    report = match_objects([ref], [live], scope_keys=["can__of__soda.n.01_3"])
+    match = report["matches"]["can_of_soda_113"]
+    assert match["verdict"] == "instance_exact"
+    assert match["identity_confirmed"] is True
+    assert match["candidates"][0]["corroboration"]["model_match"] is False
+
+
 def test_class_only_match_is_unconfirmed():
     live = _FakeLiveObj("can__of__soda.n.01_1", "/World/can__of__soda.n.01_1",
-                        category="can__of__soda.n.01", translation=(0.1, 0.2, 0.3))
+                        category="can_of_soda", translation=(0.1, 0.2, 0.3))
     ref = _ref("can_of_soda_115", translation=(0.1, 0.2, 0.3))
     report = match_objects([ref], [live])
     match = report["matches"]["can_of_soda_115"]
@@ -77,7 +108,7 @@ def test_class_only_match_is_unconfirmed():
 
 def test_role_only_match_within_pose_still_unconfirmed():
     live = _FakeLiveObj("can__of__soda.n.01_2", "/World/can__of__soda.n.01_2",
-                        category="can__of__soda.n.01")
+                        category="can_of_soda")
     report = match_objects([_ref("can_of_soda_114", translation=(9.0, 9.0, 9.0))], [live])
     match = report["matches"]["can_of_soda_114"]
     assert match["verdict"] == "unconfirmed_role_only"
@@ -86,8 +117,10 @@ def test_role_only_match_within_pose_still_unconfirmed():
 
 def test_two_role_candidates_are_ambiguous_unconfirmed():
     lives = [
-        _FakeLiveObj("can__of__soda.n.01_1", "/World/can__of__soda.n.01_1", translation=(0.1, 0.2, 0.3)),
-        _FakeLiveObj("can__of__soda.n.01_2", "/World/can__of__soda.n.01_2", translation=(0.1, 0.2, 0.3)),
+        _FakeLiveObj("can__of__soda.n.01_1", "/World/can__of__soda.n.01_1",
+                     translation=(0.1, 0.2, 0.3)),
+        _FakeLiveObj("can__of__soda.n.01_2", "/World/can__of__soda.n.01_2",
+                     translation=(0.1, 0.2, 0.3)),
     ]
     report = match_objects([_ref("can_of_soda_114", translation=(0.1, 0.2, 0.3))], lives)
     match = report["matches"]["can_of_soda_114"]
@@ -110,6 +143,31 @@ def test_source_identity_fields_default_unknown():
     assert record["source_uid"] == "UNKNOWN"
     assert record["category"] == "UNKNOWN"
     assert record["model"] == "UNKNOWN"
+    assert record["bddl_instance"] == "UNKNOWN"
+
+
+def test_refs_from_anchor_carries_closure_fields():
+    anchor_rows = [{
+        "source_name": "can_of_soda_113",
+        "bddl_instance": "can__of__soda.n.01_3",
+        "category": "can_of_soda",
+        "model": "lugwcz",
+        "expected_file_hash": "da746049c08bf94e0950b74ecc5fb686",
+        "in_rooms": ["living_room_0"],
+        "registry_root_link_pose": {"pos": [4.243, 6.991, 0.0646], "ori": [0, 0, 0.587, 0.81]},
+        "npz_pose_frame0": [4.644, 6.478, 0.0646],
+        "npz_pose_frame818": [4.644, 6.478, 0.0646],
+    }]
+    refs = refs_from_anchor(anchor_rows)
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref.bddl_instance == "can__of__soda.n.01_3"
+    assert ref.category == "can_of_soda"
+    assert ref.model == "lugwcz"
+    assert ref.expected_file_hash == "da746049c08bf94e0950b74ecc5fb686"
+    assert ref.in_rooms == ["living_room_0"]
+    record = ref.record()
+    assert record["expected_file_hash"] == "da746049c08bf94e0950b74ecc5fb686"
 
 
 def test_pose_residual_reports_translation_and_rotation():
