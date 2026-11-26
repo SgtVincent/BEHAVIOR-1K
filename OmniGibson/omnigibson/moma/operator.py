@@ -41,6 +41,10 @@ class EpisodeImmutableAfterStart(RuntimeError):
     """Post-start state mutation (reset/load_state/teleport) was attempted."""
 
 
+class ExecutorAdapterMissing(RuntimeError):
+    """No MP executor is bound. The operator refuses to plan or env.step."""
+
+
 @dataclass
 class EpisodeConfig:
     run_id: str
@@ -232,6 +236,11 @@ class MomaEpisodeOperator:
             self._previous_obs = current
             self.records.append(record)
             return record
+
+        if self.executor is None:
+            raise ExecutorAdapterMissing(
+                "MP executor adapter missing; no plan and no env.step issued"
+            )
 
         decision = self.request_decision(current)
         plan = self.executor.plan(decision["args"])
