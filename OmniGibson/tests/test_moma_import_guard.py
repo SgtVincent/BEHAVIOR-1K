@@ -48,6 +48,11 @@ ALL_LEAVES = [
     "sdk/robot_accessor.py",
     "sdk/env_adapter.py",
     "operator.py",
+    "config.py",
+    "mp_plugin.py",
+    "episode_writer.py",
+    "runner.py",
+    "doctor.py",
 ]
 
 

@@ -146,6 +146,29 @@ def test_transitions_inside_and_grasp_events():
     assert ("sdk_grasp_released", "can_of_soda_114", "left") in kinds
 
 
+def test_transitions_missing_predicate_keys_report_degraded_not_keyerror():
+    prev = {"objects": {"can_of_soda_114": {"status": "UNKNOWN", "error": "read_failed"}}}
+    curr = {"objects": {"can_of_soda_114": {"inside_bucket": True}}}
+    events = transitions(prev, curr, ["can_of_soda_114"])
+    assert events == [{"event": "observation_degraded", "object": "can_of_soda_114",
+                       "code": "missing_predicate_keys"}]
+
+
+def test_transitions_missing_object_entry_report_degraded():
+    events = transitions({"objects": {}}, {"objects": {}}, ["can_of_soda_115"])
+    assert events[0]["event"] == "observation_degraded"
+    assert events[0]["code"] == "missing_predicate_keys"
+
+
+def test_observe_passes_through_blocked_marker_object():
+    bucket = _FakeObj("trash_can_116")
+    marker = {"status": "BLOCKED", "error": "object_not_in_scope", "object": "can_of_soda_113"}
+    robot = _FakeRobot()
+    obs = observe(robot, {"can_of_soda_113": marker}, bucket, _pose_fn, "Inside", "ContactBodies")
+    assert obs["objects"]["can_of_soda_113"]["status"] == "BLOCKED"
+    assert obs["objects"]["can_of_soda_113"]["error"] == "object_not_in_scope"
+
+
 def test_empty_hand_reads_no_false_grasp():
     bucket = _FakeObj("trash_can_116")
     empty = _FakeObj("can_of_soda_115", inside=False)

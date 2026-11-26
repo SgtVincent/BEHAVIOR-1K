@@ -43,11 +43,27 @@ def grasp_state(robot: Any, arm: str, obj: Any) -> Dict[str, Any]:
     return {"name": state.name, "value": int(state)}
 
 
+def _label(obj: Any, fallback: str) -> str:
+    if isinstance(obj, dict):
+        return str(obj.get("name", fallback))
+    return read_value(lambda: obj.name) if hasattr(obj, "name") else fallback
+
+
 def observe(robot: Any, cans: Dict[str, Any], bucket: Any,
              pose_fn: Callable[[Any], Any], inside_type: Any,
              contact_type: Any) -> Dict[str, Any]:
-    result: Dict[str, Any] = {"grasping_mode": robot.grasping_mode, "objects": {}, "arms": {}}
-    for name, obj in {**cans, bucket.name: bucket}.items():
+    grasping_mode = read_value(lambda: robot.grasping_mode)
+    arm_names = read_value(lambda: list(robot.arm_names))
+    if not isinstance(arm_names, list):
+        arm_names = []
+    result: Dict[str, Any] = {"grasping_mode": grasping_mode, "objects": {}, "arms": {}}
+
+    objects = dict(cans)
+    objects[_label(bucket, "bucket")] = bucket
+    for name, obj in objects.items():
+        if isinstance(obj, dict) and obj.get("status") in ("UNKNOWN", "BLOCKED"):
+            result["objects"][name] = dict(obj)
+            continue
         entry: Dict[str, Any] = {
             "pose_world": read_value(lambda obj=obj: pose_fn(obj)),
             "linear_velocity_world": read_value(obj.get_linear_velocity),
@@ -60,10 +76,10 @@ def observe(robot: Any, cans: Dict[str, Any], bucket: Any,
             entry["inside_bucket"] = read_value(lambda obj=obj: obj.states[inside_type].get_value(bucket))
             entry["grasp_by_arm"] = {
                 arm: read_value(lambda arm=arm, obj=obj: grasp_state(robot, arm, obj))
-                for arm in robot.arm_names
+                for arm in arm_names
             }
         result["objects"][name] = entry
-    for arm in robot.arm_names:
+    for arm in arm_names:
         def ag(arm=arm) -> Dict[str, Any]:
             held = robot._ag_obj_in_hand[arm]
             return {
@@ -81,15 +97,29 @@ def observe(robot: Any, cans: Dict[str, Any], bucket: Any,
 def transitions(previous: Dict[str, Any], current: Dict[str, Any],
                 can_names: List[str]) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
+    prev_objects = previous.get("objects", {}) if isinstance(previous, dict) else {}
+    curr_objects = current.get("objects", {}) if isinstance(current, dict) else {}
     for name in can_names:
-        before = previous["objects"][name]
-        after = current["objects"][name]
+        before = prev_objects.get(name)
+        after = curr_objects.get(name)
+        degraded = (
+            not isinstance(before, dict) or not isinstance(after, dict)
+            or "inside_bucket" not in before or "inside_bucket" not in after
+        )
+        if degraded:
+            # Missing predicate keys stay UNKNOWN/BLOCKED; do not synthesize
+            # False/zero observations or raise a bare KeyError.
+            events.append({"event": "observation_degraded", "object": name,
+                           "code": "missing_predicate_keys"})
+            continue
         if before["inside_bucket"] is False and after["inside_bucket"] is True:
             events.append({"event": "inside_entered", "object": name})
         if before["inside_bucket"] is True and after["inside_bucket"] is False:
             events.append({"event": "inside_exited", "object": name})
-        for arm, state in after["grasp_by_arm"].items():
-            old = before["grasp_by_arm"][arm]
+        old_grasps = before.get("grasp_by_arm") or {}
+        new_grasps = after.get("grasp_by_arm") or {}
+        for arm, state in new_grasps.items():
+            old = old_grasps.get(arm) or {}
             if old.get("name") == "FALSE" and state.get("name") == "TRUE":
                 events.append({"event": "sdk_grasp_started", "object": name, "arm": arm})
             if old.get("name") == "TRUE" and state.get("name") == "FALSE":
