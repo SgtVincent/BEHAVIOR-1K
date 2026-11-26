@@ -124,6 +124,12 @@ class FakeEnv:
         return {}, 0.0, False, False, {}
 
 
+def _valid_certificate(**overrides) -> dict:
+    cert = {"validated": True, "backend": "curobo_v2-fake", "receipt": "rcpt-1"}
+    cert.update(overrides)
+    return cert
+
+
 class FakeExecutor:
     def __init__(self) -> None:
         self.plans: list[dict] = []
@@ -131,7 +137,10 @@ class FakeExecutor:
     def plan(self, args):
         self.plans.append(args)
         command = np.full(23, 0.05, dtype=np.float64)
-        return {"action23": native23_action(command), "certificate": {"primitive": args["primitive"]}}
+        return {
+            "action23": native23_action(command),
+            "certificate": _valid_certificate(receipt=f"rcpt-{args['primitive']}"),
+        }
 
 
 class FakeS2:
@@ -392,12 +401,66 @@ def test_plan_missing_action23_rejected_without_step():
     assert env.steps == []
 
 
-def test_plan_zero_vector_rejected_as_placeholder():
+def test_plan_all_zero_vector_with_valid_certificate_passes():
+    """A legal hold/initial absolute q-position is all zero; proven cert passes."""
     zero = native23_action(np.zeros(23))
-    op, env = _plan_test_operator(
-        _PlanReturningExecutor({"action23": zero, "certificate": {"ok": True}})
+    op, env, _, _ = _make_operator(
+        _loopback_obs(),
+        executor=_PlanReturningExecutor({"action23": zero, "certificate": _valid_certificate()}),
     )
-    with pytest.raises(ExecutorPlanRejected, match="zero_action_placeholder"):
+    op.reset_episode()
+    record = op.step()
+    assert record.action_dim == 23
+    assert len(env.steps) == 1
+    assert env.steps[0] == [0.0] * 23
+
+
+def test_plan_backend_receipt_identity_also_proves_certificate():
+    """Alternate evidence path: backend + trajectory_id, no validated flag."""
+    command = np.full(23, 0.05)
+    cert = {"backend": "curobo_v2-fake", "trajectory_id": "traj-42"}
+    op, env, _, _ = _make_operator(
+        _loopback_obs(),
+        executor=_PlanReturningExecutor({"action23": native23_action(command), "certificate": cert}),
+    )
+    op.reset_episode()
+    record = op.step()
+    assert record.action_dim == 23
+    assert len(env.steps) == 1
+
+
+def test_plan_unverified_certificate_rejected():
+    command = np.full(23, 0.05)
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({
+            "action23": native23_action(command),
+            "certificate": {"validated": False},
+        })
+    )
+    with pytest.raises(ExecutorPlanRejected, match="certificate_unverified"):
+        op.step()
+    assert env.steps == []
+
+
+def test_plan_placeholder_mode_certificate_rejected():
+    command = np.full(23, 0.05)
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({
+            "action23": native23_action(command),
+            "certificate": _valid_certificate(mode="placeholder"),
+        })
+    )
+    with pytest.raises(ExecutorPlanRejected, match="certificate_mode_rejected"):
+        op.step()
+    assert env.steps == []
+
+
+def test_plan_explicit_placeholder_meta_action_rejected():
+    action = native23_action(np.full(23, 0.05), meta={"placeholder": True})
+    op, env = _plan_test_operator(
+        _PlanReturningExecutor({"action23": action, "certificate": _valid_certificate()})
+    )
+    with pytest.raises(ExecutorPlanRejected, match="placeholder_action"):
         op.step()
     assert env.steps == []
 

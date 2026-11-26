@@ -55,15 +55,58 @@ class ExecutorPlanRejected(RuntimeError):
     """The bound executor returned a rejected/invalid plan.
 
     Raised when the executor raises, omits the tagged action, omits the
-    certificate, returns a non-tagged action, or returns an all-zero
-    placeholder command. A rejected plan must never be turned into a
-    zero-action env.step; the caller records the rejection instead.
+    certificate, returns a non-tagged action, or returns a certificate without
+    solver provenance (validated flag or backend receipt/trajectory identity).
+    A rejected plan must never be turned into a zero-action env.step; the caller
+    records the rejection instead.
+
+    NOTE: an all-zero 23-vector is **not** treated as a placeholder on its own.
+    An absolute joint-position target can legitimately hold at zero; the gate
+    decides on certificate evidence, never on command magnitude.
     """
 
     def __init__(self, reason: str, detail: str = "") -> None:
         super().__init__(f"{reason}: {detail}" if detail else reason)
         self.reason = reason
         self.detail = detail
+
+
+# Certificate outcomes that can never represent a successfully solved plan.
+FORBIDDEN_CERTIFICATE_MODES = frozenset({
+    "placeholder", "unverified", "error", "rejected", "unknown", "failed", "none",
+})
+
+# Receipt identity fields that, together with a non-empty backend, prove the
+# plan came from a real solver call rather than an empty/local stand-in.
+_RECEIPT_FIELDS = ("receipt", "trajectory_id", "plan_id")
+
+
+def _certificate_evidence_reason(certificate: Dict[str, Any]) -> Optional[str]:
+    """Return a rejection reason when the certificate lacks solver provenance.
+
+    A plan is proven either by an explicit strict ``validated is True`` flag,
+    or by a backend receipt identity: non-empty ``backend`` plus one of
+    ``receipt`` / ``trajectory_id`` / ``plan_id``. Mode/status/outcome values in
+    :data:`FORBIDDEN_CERTIFICATE_MODES` reject outright.
+    """
+    mode = (
+        certificate.get("plan_mode")
+        or certificate.get("mode")
+        or certificate.get("status")
+        or certificate.get("outcome")
+    )
+    if isinstance(mode, str) and mode.strip().lower() in FORBIDDEN_CERTIFICATE_MODES:
+        return "certificate_mode_rejected"
+    if certificate.get("validated") is True:
+        return None
+    backend = certificate.get("backend")
+    receipt = next(
+        (certificate.get(field) for field in _RECEIPT_FIELDS if certificate.get(field)),
+        None,
+    )
+    if isinstance(backend, str) and backend.strip() and isinstance(receipt, str) and receipt.strip():
+        return None
+    return "certificate_unverified"
 
 
 @dataclass
@@ -253,10 +296,12 @@ class MomaEpisodeOperator:
 
     @staticmethod
     def _validate_plan(plan: Any) -> tuple[TaggedAction, Dict[str, Any]]:
-        """Reject an invalid/empty plan before any env.step is issued.
+        """Reject an invalid/unproven plan before any env.step is issued.
 
         The seam contract: ``{"action23": TaggedAction, "certificate": dict}``.
-        An all-zero vector is treated as a placeholder, not a solved command.
+        Rejection rests on missing evidence, not command magnitude: a finite
+        all-zero absolute joint-position target is a legal hold/initial pose and
+        passes when its certificate carries solver provenance.
         """
         if not isinstance(plan, dict):
             raise ExecutorPlanRejected("plan_not_dict", f"got {type(plan).__name__}")
@@ -270,9 +315,14 @@ class MomaEpisodeOperator:
         certificate = plan.get("certificate")
         if not isinstance(certificate, dict):
             raise ExecutorPlanRejected("certificate_missing", "certificate must be a dict")
-        if all(float(v) == 0.0 for v in action.to_list()):
+        evidence_reason = _certificate_evidence_reason(certificate)
+        if evidence_reason is not None:
             raise ExecutorPlanRejected(
-                "zero_action_placeholder", "action23 vector is all zero"
+                evidence_reason, "certificate carries no validated solver receipt"
+            )
+        if action.meta.get("placeholder") is True:
+            raise ExecutorPlanRejected(
+                "placeholder_action", "action meta flags an explicit placeholder"
             )
         return action, certificate
 
