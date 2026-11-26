@@ -283,6 +283,32 @@ def test_observe_missing_scope_objects_return_blocked_not_keyerror():
     assert set(obs["robot_state"]["arms"]) == {"left", "right"}
 
 
+def test_blocked_observation_short_circuits_before_s2_and_step():
+    scope = {BUCKET: SimpleNamespace(name=BUCKET)}  # cans absent: blocked scope
+    env = FakeEnv(scope)
+    adapter = SdkEnvironmentAdapter(env, 0)
+    robot = SdkRobotAccessor(FakeRobot())
+    s2 = FakeS2()
+    op = MomaEpisodeOperator(
+        EpisodeConfig(run_id="run-blocked-step", can_names=CANS, bucket_name=BUCKET, max_steps=10),
+        adapter,
+        robot,
+        observe_fn=lambda *a, **k: {},
+        transition_fn=lambda *a: [],
+        executor=FakeExecutor(),
+        s2_client=s2,
+        live_reads={"s2_cfg": CFG},
+    )
+    op.reset_episode()
+    record = op.step()
+
+    assert record.terminal is False
+    assert record.action_label is None
+    assert env.steps == []
+    assert s2.calls == 0
+    assert any(e["type"] == "boundary_blocked" for e in record.events)
+
+
 def test_closed_loop_requires_bddl_success_and_terminal_gate():
     op, _, _, _ = _make_operator(_terminal_obs())
     op.reset_episode()

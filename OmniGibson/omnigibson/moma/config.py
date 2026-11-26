@@ -167,8 +167,27 @@ class RunnerConfig:
             "write_video": self.write_video,
         }
 
+    # Overrides accepted by ``from_frozen_baseline``: runtime endpoint, output
+    # location and private local-cache paths only. Source initial-state paths,
+    # task criteria, controller/DOF timestep and scene/robot parameters are
+    # frozen from the a28 baseline and must not be swapped through this entry.
+    FROM_FROZEN_ALLOWED_OVERRIDES = frozenset({
+        "output_dir",
+        "asset_manifest_path",
+        "model_base_url",
+        "model_name",
+        "model_temperature",
+        "model_timeout_s",
+        "model_max_response_bytes",
+        "model_api_key_env",
+    })
+
     @classmethod
     def from_frozen_baseline(cls, run_id: str, **overrides: Any) -> "RunnerConfig":
-        """Build the a28 effective config; only output/asset paths may override."""
-        cfg = cls(run_id=run_id, **overrides)
-        return cfg
+        """Build the a28 effective config behind an explicit override whitelist."""
+        rejected = sorted(set(overrides) - cls.FROM_FROZEN_ALLOWED_OVERRIDES)
+        if rejected:
+            raise ValueError(
+                "frozen_baseline_override_rejected: " + ",".join(rejected)
+            )
+        return cls(run_id=run_id, **overrides)
