@@ -284,6 +284,7 @@ class DeltaTFReplayPolicy(LocalPolicy):
             receipt["curobo_profile"] = profile
         receipt["plans_attempted"] = getattr(self.primitives, "_plans_attempted", 0)
         receipt["plans_succeeded"] = getattr(self.primitives, "_plans_succeeded", 0)
+        receipt["curobo_plan_reports"] = getattr(self.primitives, "_plan_reports", [])
         return receipt
 
 
@@ -386,6 +387,7 @@ class LiveTargetDiagnosticPolicy(LocalPolicy):
             receipt["curobo_profile"] = profile
         receipt["plans_attempted"] = getattr(self.primitives, "_plans_attempted", 0)
         receipt["plans_succeeded"] = getattr(self.primitives, "_plans_succeeded", 0)
+        receipt["curobo_plan_reports"] = getattr(self.primitives, "_plan_reports", [])
         receipt["offsets"] = {k: list(v) for k, v in self._offsets.items()}
         return receipt
 

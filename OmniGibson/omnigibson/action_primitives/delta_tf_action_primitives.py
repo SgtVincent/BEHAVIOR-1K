@@ -321,6 +321,7 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         profile_receipt["obstacle_meshes"] = self._motion_generator._obstacle_report
         self._plans_attempted = 0
         self._plans_succeeded = 0
+        self._plan_reports = []
         self._curobo_profile_receipt = profile_receipt
         self._emb = CuRoboEmbodimentSelection.DEFAULT
         if self._emb not in self._motion_generator.mg:
@@ -345,6 +346,209 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
             for name, link in self.tool_links.items()
         }
         self.decoder = DeltaTFDecoder(anchors, self.representation)
+
+    # -- official MotionGenResult / IKResult diagnostics -----------------------
+    #
+    # The official wrapper normally returns only a success mask and joint
+    # paths, discarding the per-batch result status. These helpers call the
+    # official ``compute_trajectories(return_full_result=True)`` path and read
+    # the installed result object defensively: every recorded field is an
+    # attribute that exists on the official type; absent nested fields are
+    # recorded null rather than guessed.
+
+    @staticmethod
+    def _to_list(value):
+        if value is None:
+            return None
+        try:
+            if th.is_tensor(value):
+                return value.detach().cpu().tolist()
+        except TypeError:
+            pass
+        return list(value) if isinstance(value, (list, tuple)) else value
+
+    @staticmethod
+    def _finite_scalar(value):
+        if value is None:
+            return None
+        try:
+            if th.is_tensor(value):
+                value = value.detach().cpu().item()
+            value = float(value)
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        return value if bool(th.isfinite(th.tensor(value)).item()) else None
+
+    def _record_result(self, result, *, ik_only, collision_check):
+        record = {
+            "result_type": type(result).__name__,
+            "ik_only": bool(ik_only),
+            "ik_world_collision_check": bool(collision_check),
+            # IK-only probes are diagnostics only: their joint solution is
+            # never executed and a probe success is never a plan pass.
+            "diagnostic_only": bool(ik_only),
+        }
+        for attr in ("success", "position_error", "rotation_error", "error"):
+            if hasattr(result, attr):
+                record[attr] = self._to_list(getattr(result, attr))
+        for attr in ("solve_time", "ik_time", "graph_time", "trajopt_time",
+                     "finetune_time", "total_time", "cspace_error"):
+            if hasattr(result, attr):
+                record[attr] = self._finite_scalar(getattr(result, attr))
+        for attr in ("valid_query", "used_graph"):
+            if hasattr(result, attr):
+                record[attr] = bool(getattr(result, attr))
+        for attr in ("attempts", "trajopt_attempts"):
+            if hasattr(result, attr):
+                record[attr] = getattr(result, attr)
+        if hasattr(result, "status"):
+            status = getattr(result, "status")
+            record["status"] = str(status) if status is not None else None
+        if hasattr(result, "interpolated_plan"):
+            record["interpolated_plan_present"] = result.interpolated_plan is not None
+        if hasattr(result, "debug_info"):
+            record["debug_info_present"] = getattr(result, "debug_info") is not None
+        nested = {}
+        for attr in ("ik_result", "trajopt_result"):
+            sub = getattr(result, attr, None)
+            entry = {"present": sub is not None}
+            if sub is not None:
+                entry["result_type"] = type(sub).__name__
+                for sub_attr in ("success", "error"):
+                    if hasattr(sub, sub_attr):
+                        entry[sub_attr] = self._to_list(getattr(sub, sub_attr))
+            nested[attr] = entry
+        record["nested"] = nested
+        return record
+
+    @staticmethod
+    def _classify_status(status, valid_query):
+        if status is None:
+            return "no_status"
+        s = str(status).upper().replace(" ", "_").replace("-", "_")
+        if "WORLD_COLLISION" in s:
+            return "world_collision"
+        if "SELF_COLLISION" in s:
+            return "self_collision"
+        if "IK_FAIL" in s:
+            return "ik_unreachable"
+        if "GRAPH_FAIL" in s:
+            return "graph_fail"
+        if "TRAJOPT_FAIL" in s:
+            return "trajopt_fail"
+        if "DT_EXCEPTION" in s:
+            return "dt_exception"
+        if "INVALID_QUERY" in s:
+            return "invalid_query"
+        if valid_query is False:
+            return "invalid_query"
+        return "other"
+
+    def _record_targets(self, target_pos, target_quat, emb_sel, *, segment):
+        link_poses = {}
+        for link in target_pos.keys():
+            link_poses[link] = {
+                "position": target_pos[link][0].detach().cpu().tolist(),
+                "quaternion_xyzw": target_quat[link][0].detach().cpu().tolist(),
+            }
+        curobo_base = self._motion_generator.base_link[emb_sel]
+        base_pos, base_quat = self.robot.links[curobo_base].get_position_orientation()
+        measured = {}
+        for link in target_pos.keys():
+            m_pos, m_quat = self.robot.links[link].get_position_orientation()
+            measured[link] = {
+                "position": list(m_pos.detach().cpu().numpy()),
+                "quaternion_xyzw": list(m_quat.detach().cpu().numpy()),
+            }
+        return {
+            "segment": segment,
+            "embodiment": str(emb_sel),
+            "links_participating": sorted(link_poses.keys()),
+            "targets_world": link_poses,
+            "base_link": curobo_base,
+            "base_measured_world": {
+                "position": list(base_pos.detach().cpu().numpy()),
+                "quaternion_xyzw": list(base_quat.detach().cpu().numpy()),
+            },
+            "measured_link_poses_world": measured,
+            # This slice passes no motion_constraint; the official wrapper only
+            # builds a PoseCostMetric when one is supplied.
+            "motion_constraint": None,
+            "pose_cost_links": {
+                "ee_link": self._motion_generator.ee_link[emb_sel],
+                "additional_links": list(self._motion_generator.additional_links[emb_sel]),
+            },
+        }
+
+    def _run_plan(self, target_pos, target_quat, emb_sel, *, segment,
+                  ik_only=False, collision_check=True, update_obstacles=True):
+        """Run the official planner and return (success, paths, report).
+
+        The full official result objects are kept for the receipt. Execution
+        paths come from the official ``result.get_paths()``; IK-only runs never
+        produce a path here. Probes reuse the world already built by the main
+        plan, so they skip the obstacle update to avoid duplicating mesh
+        report entries.
+        """
+        report = self._record_targets(target_pos, target_quat, emb_sel, segment=segment)
+        mg = self._motion_generator
+        results = mg.compute_trajectories(
+            target_pos=target_pos,
+            target_quat=target_quat,
+            is_local=False,
+            emb_sel=emb_sel,
+            ik_only=ik_only,
+            ik_world_collision_check=collision_check,
+            skip_obstacle_update=not update_obstacles,
+            return_full_result=True,
+        )
+        num_targets = next(iter(target_pos.values())).shape[0]
+        batch_size = mg.batch_size
+        successes, paths, records = [], [], []
+        for i, result in enumerate(results):
+            end_idx = batch_size
+            if i == len(results) - 1 and num_targets % batch_size:
+                end_idx = num_targets % batch_size
+            success = result.success[:end_idx]
+            successes.append(success)
+            if not ik_only:
+                if getattr(result, "interpolated_plan", None) is None:
+                    paths.extend([None] * end_idx)
+                else:
+                    paths.extend(result.get_paths()[:end_idx])
+            records.append(self._record_result(
+                result, ik_only=ik_only, collision_check=collision_check
+            ))
+        success_cat = th.cat(successes) if successes else th.tensor([], dtype=th.bool)
+        report["full_result"] = records
+        report["ik_only"] = bool(ik_only)
+        report["success_any"] = bool(success_cat.any().item())
+        return success_cat, paths, report
+
+    def _diagnose_failure(self, plan_report, probe_coll, probe_nocoll):
+        statuses = [r.get("status") for r in plan_report["full_result"]]
+        valids = [r.get("valid_query") for r in plan_report["full_result"]]
+        plan_class = [
+            self._classify_status(status, valid)
+            for status, valid in zip(statuses, valids)
+        ]
+        coll_ok = bool(probe_coll["success_any"])
+        nocoll_ok = bool(probe_nocoll["success_any"])
+        if nocoll_ok and not coll_ok:
+            ik_split = "reachable_joint_but_collision_blocked"
+        elif not nocoll_ok:
+            ik_split = "ik_unreachable"
+        elif coll_ok:
+            ik_split = "collision_free_ik_seed_exists"
+        else:
+            ik_split = "indeterminate"
+        return {
+            "plan_status_class": plan_class,
+            "ik_split": ik_split,
+            "ik_probe_world_collision_success": coll_ok,
+            "ik_probe_no_collision_success": nocoll_ok,
+            "note": "IK-only probes are diagnostics; no probe joint solution is executed.",
+        }
 
     def _navigate_base(self, displacement):
         """Plan and execute the holonomic base through the official BASE
@@ -381,15 +585,13 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
             for k, v in target_quat.items()
         }
         self._plans_attempted += 1
-        success, paths = self._motion_generator.compute_trajectories(
-            target_pos=target_pos,
-            target_quat=target_quat,
-            is_local=False,
-            ik_only=False,
-            ik_world_collision_check=True,
-            skip_obstacle_update=False,
-            emb_sel=CuRoboEmbodimentSelection.BASE,
+        success, paths, report = self._run_plan(
+            target_pos,
+            target_quat,
+            CuRoboEmbodimentSelection.BASE,
+            segment="base",
         )
+        self._plan_reports.append(report)
         ok = th.where(success)[0]
         if len(ok) == 0:
             raise ActionPrimitiveError(
@@ -427,12 +629,30 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         pos = {k: v[0].unsqueeze(0) for k, v in targets.items()}
         quat = {k: v[1].unsqueeze(0) for k, v in targets.items()}
         self._plans_attempted += 1
-        success, paths = self._motion_generator.compute_trajectories(
-            target_pos=pos, target_quat=quat, is_local=False, emb_sel=self._emb,
-            ik_only=False, ik_world_collision_check=True, skip_obstacle_update=False,
+        success, paths, report = self._run_plan(
+            pos, quat, self._emb, segment="arm_chest",
         )
+        self._plan_reports.append(report)
         ok = th.where(success)[0]
         if len(ok) == 0:
+            # Same live env / state: official IK-only probes split an
+            # unreachable joint target from a collision-blocked seed. These
+            # probes are diagnostic only; their solution is never executed,
+            # they are never counted as a plan pass, and the executed plan
+            # keeps its world collision check enabled.
+            _, _, probe_coll = self._run_plan(
+                pos, quat, self._emb, segment="arm_chest_ik_probe_world_collision",
+                ik_only=True, collision_check=True, update_obstacles=False,
+            )
+            _, _, probe_nocoll = self._run_plan(
+                pos, quat, self._emb, segment="arm_chest_ik_probe_no_collision",
+                ik_only=True, collision_check=False, update_obstacles=False,
+            )
+            report["ik_probe_world_collision"] = probe_coll
+            report["ik_probe_no_collision"] = probe_nocoll
+            report["failure_classification"] = self._diagnose_failure(
+                report, probe_coll, probe_nocoll
+            )
             raise ActionPrimitiveError(ActionPrimitiveError.Reason.PLANNING_ERROR, "Official cuRobo rejected the target")
         q = self._motion_generator.path_to_joint_trajectory(paths[int(ok[0])], get_full_js=True, emb_sel=self._emb).cpu()
         if q.ndim != 2 or len(q) == 0 or not th.isfinite(q).all():
