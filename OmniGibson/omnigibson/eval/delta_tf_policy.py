@@ -62,6 +62,16 @@ def persist_run_failure(evaluator, json_dir, task_name, rollout_id, exc):
         if getattr(state, "video_writer", None) is not None:
             evaluator._set_video_writer(state, None)
             flushed = True
+    policy = getattr(evaluator, "policy", None)
+    receipt = None
+    if policy is not None and hasattr(policy, "bound_receipt"):
+        receipt = policy.bound_receipt()
+        receipt["exhaustion_notice"] = getattr(evaluator, "_exhaustion_notice", None)
+    steps_taken = getattr(evaluator, "_steps_taken", 0)
+    trials_recorded = getattr(evaluator, "n_trials", 0)
+    plans_attempted = receipt.get("plans_attempted", 0) if receipt else 0
+    plans_succeeded = receipt.get("plans_succeeded", 0) if receipt else 0
+    commands_issued = receipt.get("commands_issued", 0) if receipt else 0
     failure = {
         "task": task_name,
         "rollout_id": rollout_id,
@@ -69,17 +79,18 @@ def persist_run_failure(evaluator, json_dir, task_name, rollout_id, exc):
         "error_type": type(exc).__name__,
         "error_message": str(exc),
         "traceback": traceback.format_exc(),
-        "trials_recorded": getattr(evaluator, "n_trials", 0),
-        "plan_succeeded": False,
-        "command_issued": False,
-        "physics_step": False,
+        "trials_recorded": trials_recorded,
+        "steps_taken": steps_taken,
+        "plans_attempted": plans_attempted,
+        "plans_succeeded": plans_succeeded,
+        "commands_issued": commands_issued,
+        # Booleans are derived from the real counters above, not assumed False.
+        "plan_succeeded": plans_succeeded > 0,
+        "command_issued": commands_issued > 0,
+        "physics_step": steps_taken > 0,
         "video_flushed": flushed,
     }
-    policy = getattr(evaluator, "policy", None)
-    receipt = None
-    if policy is not None and hasattr(policy, "bound_receipt"):
-        receipt = policy.bound_receipt()
-        receipt["exhaustion_notice"] = getattr(evaluator, "_exhaustion_notice", None)
+    if receipt is not None:
         receipt["failure"] = failure
     if json_dir is not None:
         failure_path = os.path.join(json_dir, f"{task_name}_failure_{rollout_id}.json")
@@ -229,6 +240,7 @@ class DeltaTFReplayPolicy(LocalPolicy):
         self._index = 0
         self._generator = None
         self._anchored = False
+        self._commands_issued = 0
 
     def forward(self, obs, *args, **kwargs):
         # BatchedEvaluator(1) still expects a leading batch dimension.
@@ -249,13 +261,17 @@ class DeltaTFReplayPolicy(LocalPolicy):
             action = th.as_tensor(action, dtype=th.float32).detach().cpu()
             if action.shape != (self.action_dim,) or not th.isfinite(action).all():
                 raise ValueError("Upstream primitive yielded an invalid controller command")
+            self._commands_issued += 1
             return action.unsqueeze(0)
 
     def bound_receipt(self):
         receipt = {"index": self._index, "rows": len(self.rows), **self._source_receipt}
+        receipt["commands_issued"] = self._commands_issued
         profile = getattr(self.primitives, "_curobo_profile_receipt", None)
         if profile is not None:
             receipt["curobo_profile"] = profile
+        receipt["plans_attempted"] = getattr(self.primitives, "_plans_attempted", 0)
+        receipt["plans_succeeded"] = getattr(self.primitives, "_plans_succeeded", 0)
         return receipt
 
 
@@ -306,6 +322,7 @@ class LiveTargetDiagnosticPolicy(LocalPolicy):
         self._generator = None
         self._anchored = False
         self._row = None
+        self._commands_issued = 0
 
     def _build_diagnostic_row(self):
         robot = self.primitives.robot
@@ -346,13 +363,17 @@ class LiveTargetDiagnosticPolicy(LocalPolicy):
             action = th.as_tensor(action, dtype=th.float32).detach().cpu()
             if action.shape != (self.action_dim,) or not th.isfinite(action).all():
                 raise ValueError("Upstream primitive yielded an invalid controller command")
+            self._commands_issued += 1
             return action.unsqueeze(0)
 
     def bound_receipt(self):
         receipt = {"index": self._index, "rows": 1, **self._source_receipt}
+        receipt["commands_issued"] = self._commands_issued
         profile = getattr(self.primitives, "_curobo_profile_receipt", None)
         if profile is not None:
             receipt["curobo_profile"] = profile
+        receipt["plans_attempted"] = getattr(self.primitives, "_plans_attempted", 0)
+        receipt["plans_succeeded"] = getattr(self.primitives, "_plans_succeeded", 0)
         receipt["offsets"] = {k: list(v) for k, v in self._offsets.items()}
         return receipt
 
@@ -378,7 +399,7 @@ class PrimitiveEvaluator(BatchedEvaluator):
         synthesized; already taken steps remain the only evidence.
         """
         try:
-            return super()._step_fn(active_env_indices)
+            terminated, truncated = super()._step_fn(active_env_indices)
         except StopIteration as exc:
             terminated = th.zeros(self.num_envs, dtype=th.bool)
             truncated = th.zeros(self.num_envs, dtype=th.bool)
@@ -386,4 +407,6 @@ class PrimitiveEvaluator(BatchedEvaluator):
                 truncated[idx] = True
             self._exhaustion_notice = str(exc)
             return terminated, truncated
+        self._steps_taken = getattr(self, "_steps_taken", 0) + 1
+        return terminated, truncated
 

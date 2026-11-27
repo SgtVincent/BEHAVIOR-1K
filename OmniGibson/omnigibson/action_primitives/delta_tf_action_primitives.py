@@ -99,37 +99,96 @@ def _build_peer_curobo_profile(robot, chest_link):
     return str(peer_path), receipt
 
 
+#: Relative shear residual above which the world affine cannot be represented as
+#: official-mesh-rotation . diag(scale). Above it, the mesh affine is baked into
+#: robot-frame vertices instead of using a silent norm-scale approximation.
+MESH_AFFINE_SHEAR_TOL = 1e-4
+
+
 class _PeerCuRoboMotionGenerator(CuRoboMotionGenerator):
     """Parallel MotionGenerator adapter for the 2026 GeomPrim API.
 
     Upstream ``update_obstacles`` reads ``collision_mesh.get_world_scale()``,
     which the 2026 ``GeomPrim`` no longer exposes (trace 308: AttributeError at
     curobo.py:305). This subclass keeps the official obstacle-world / robot
-    world flow and only replaces the mesh scale extraction: the full world affine
-    (parent chain included) is read through the official
-    ``usd_utils.get_world_pose_with_scale`` via ``XFormPrim.scaled_transform``,
-    and the per-axis world scale is recovered from its linear block.
+    world flow and replaces only the per-mesh affine/scale construction.
+
+    The full world affine (parent chain included) is read through the official
+    ``usd_utils.get_world_pose_with_scale`` via ``XFormPrim.scaled_transform``.
+    Against the official mesh-pose rotation ``R``, ``S = R.T @ L``: its diagonal
+    is the signed per-axis scale (reflection sign kept on its original axis),
+    and its off-diagonal is the shear residual. If the residual is within
+    tolerance the diagonal-scale path is exact; otherwise the full affine is
+    baked into robot-frame vertices with identity pose and unit scale. Column
+    norms alone are never used as an approximate scale.
 
     No shared upstream file is edited, and there is no global monkey patch. The
-    obstacle body mirrors the upstream baseline ``bd049de`` method; if an
-    upstream bugfix lands, this parallel adapter is superseded by it.
+    ``update_obstacles`` body mirrors upstream baseline ``bd049de``
+    (curobo.py:265-311); only the mesh construction differs, so it can be
+    followed/dropped when an upstream bugfix lands.
     """
 
-    @staticmethod
-    def _world_mesh_scale(collision_mesh):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._obstacle_report = []
+
+    def _build_obstacle_mesh(self, collision_mesh, robot_transform):
+        obj_pos, obj_quat = collision_mesh.get_position_orientation()
+        obj_pose = T.pose2mat((obj_pos, obj_quat))
+        pose = robot_transform @ obj_pose
+        pos, orn = T.mat2pose(pose)
+        orn = orn[[3, 0, 1, 2]]
+
         affine = th.as_tensor(
             collision_mesh.scaled_transform, dtype=th.float32
         ).detach().cpu()
         linear = affine[:3, :3]
-        # Column norms are the local-axis scale magnitudes after the world
-        # rotation; preserve a reflected handedness by flipping one axis sign.
-        scale = th.linalg.norm(linear, dim=0)
-        if th.linalg.det(linear).item() < 0:
-            scale = scale.clone()
-            scale[0] = -scale[0]
-        return scale
+        rot_world = T.quat2mat(obj_quat)
+        decomposed = rot_world.T @ linear
+        scale = th.diag(decomposed).clone()
+        offdiag = decomposed - th.diag(th.diag(decomposed))
+        shear = float(th.max(th.abs(offdiag)).item())
+        ref_scale = max(1.0, float(th.max(th.abs(scale)).item()))
+        points = collision_mesh.points.detach().cpu()
+        faces = collision_mesh.faces.detach().cpu()
+
+        meta = {
+            "name": collision_mesh.prim_path,
+            "shear_residual": shear,
+            "shear_tolerance": MESH_AFFINE_SHEAR_TOL,
+        }
+        if shear <= MESH_AFFINE_SHEAR_TOL * ref_scale:
+            meta["mode"] = "diagonal_scale"
+            meta["scale"] = scale.tolist()
+            vertices, mesh_pose, mesh_scale = points, th.cat([pos, orn]).tolist(), scale.numpy()
+        else:
+            # Bake the full official affine into robot-frame vertices; identity
+            # pose, unit scale. Only the official world affine and robot
+            # transform are used here.
+            world_pts = T.transform_points(points, affine)
+            world_h = th.cat([world_pts, th.ones((len(world_pts), 1))], dim=1)
+            robot_pts = (robot_transform @ world_h.T).T[:, :3]
+            if not th.isfinite(robot_pts).all():
+                raise ValueError("Baked obstacle mesh vertices are non-finite")
+            meta["mode"] = "baked_affine"
+            meta["scale"] = [1.0, 1.0, 1.0]
+            vertices = robot_pts
+            mesh_pose = th.cat([th.zeros(3), th.tensor([1.0, 0.0, 0.0, 0.0])]).tolist()
+            mesh_scale = th.ones(3).numpy()
+
+        mesh = lazy.curobo.geom.types.Mesh(
+            name=collision_mesh.prim_path,
+            pose=mesh_pose,
+            vertices=vertices.numpy(),
+            faces=faces.numpy(),
+            scale=mesh_scale,
+        )
+        self._obstacle_report.append(meta)
+        return mesh
 
     def update_obstacles(self, ignore_objects=None):
+        # Body mirrors upstream curobo.py:265-311 at baseline bd049de; follow
+        # upstream when that method changes. Only the mesh constructor differs.
         obstacles = {"cuboid": None, "sphere": None, "mesh": [], "cylinder": None, "capsule": None}
         robot_transform = T.pose_inv(T.pose2mat(self.robot.root_link.get_position_orientation()))
 
@@ -152,18 +211,9 @@ class _PeerCuRoboMotionGenerator(CuRoboMotionGenerator):
                     assert (
                         collision_mesh.geom_type == "Mesh"
                     ), f"collision_mesh {collision_mesh.prim_path} is not a mesh, but a {collision_mesh.geom_type}"
-                    obj_pose = T.pose2mat(collision_mesh.get_position_orientation())
-                    pose = robot_transform @ obj_pose
-                    pos, orn = T.mat2pose(pose)
-                    orn = orn[[3, 0, 1, 2]]
-                    m = lazy.curobo.geom.types.Mesh(
-                        name=collision_mesh.prim_path,
-                        pose=th.cat([pos, orn]).tolist(),
-                        vertices=collision_mesh.points.numpy(),
-                        faces=collision_mesh.faces.numpy(),
-                        scale=self._world_mesh_scale(collision_mesh).numpy(),
+                    obstacles["mesh"].append(
+                        self._build_obstacle_mesh(collision_mesh, robot_transform)
                     )
-                    obstacles["mesh"].append(m)
 
         world = lazy.curobo.geom.types.WorldConfig(**obstacles)
         world = world.get_collision_check_world()
@@ -268,6 +318,9 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
             batch_size=batch_size,
         )
         profile_receipt["embodiments"] = sorted(str(k) for k in cfg_paths.keys())
+        profile_receipt["obstacle_meshes"] = self._motion_generator._obstacle_report
+        self._plans_attempted = 0
+        self._plans_succeeded = 0
         self._curobo_profile_receipt = profile_receipt
         self._emb = CuRoboEmbodimentSelection.DEFAULT
         if self._emb not in self._motion_generator.mg:
@@ -327,6 +380,7 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
             k: th.stack([v for _ in range(self._motion_generator.batch_size)])
             for k, v in target_quat.items()
         }
+        self._plans_attempted += 1
         success, paths = self._motion_generator.compute_trajectories(
             target_pos=target_pos,
             target_quat=target_quat,
@@ -346,6 +400,7 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         ).cpu()
         if q.ndim != 2 or len(q) == 0 or not th.isfinite(q).all():
             raise ValueError("Official BASE planner returned an invalid trajectory")
+        self._plans_succeeded += 1
         yield from self._execute_motion_plan(q, ignore_physics=False, ignore_failure=False)
 
     def apply(self, action):
@@ -371,6 +426,7 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         targets = {self.tool_links[name]: T.mat2pose(base @ pose) for name, pose in decoded["poses"].items()}
         pos = {k: v[0].unsqueeze(0) for k, v in targets.items()}
         quat = {k: v[1].unsqueeze(0) for k, v in targets.items()}
+        self._plans_attempted += 1
         success, paths = self._motion_generator.compute_trajectories(
             target_pos=pos, target_quat=quat, is_local=False, emb_sel=self._emb,
             ik_only=False, ik_world_collision_check=True, skip_obstacle_update=False,
@@ -385,4 +441,5 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         fixed_idx = th.cat((self.robot.base_control_idx, *[self.robot.gripper_control_idx[a] for a in ("left", "right")])).long()
         if not th.allclose(q[:, fixed_idx], current_q[fixed_idx].expand(len(q), -1), atol=1e-4):
             raise ValueError("Planner moved fixed base/gripper joints; this slice cannot execute that plan")
+        self._plans_succeeded += 1
         yield from self._execute_motion_plan(q, ignore_physics=False, ignore_failure=False)
