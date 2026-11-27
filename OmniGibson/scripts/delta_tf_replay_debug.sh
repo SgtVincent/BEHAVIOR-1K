@@ -70,6 +70,11 @@ if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$SLICE_COMMIT" "$HEAD_COMMIT"
   exit 2
 fi
 
+# Prefer this worktree's OmniGibson package over any shared editable install;
+# the entry asserts the resolved package file lives under this worktree.
+# No shared conda / site-packages is modified.
+export PYTHONPATH="$REPO_ROOT/OmniGibson${PYTHONPATH:+:$PYTHONPATH}"
+
 mkdir -p "$OUTPUT_DIR"
 
 CMD=(

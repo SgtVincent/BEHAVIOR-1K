@@ -26,6 +26,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
+import omnigibson
 from omnigibson.eval.delta_tf_policy import PrimitiveEvaluator
 from omnigibson.eval.evaluator import resolve_instance_ids
 from omnigibson.eval.utils.eval_utils import DEFAULT_EVAL_SEED, seed_everything
@@ -33,6 +34,24 @@ from omnigibson.macros import gm
 from omnigibson.utils.ui_utils import create_module_logger
 
 logger = create_module_logger(module_name=__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _assert_baseline_worktree() -> None:
+    """Reject a shared editable install resolving outside this baseline worktree.
+
+    The runner shell prepends the worktree ``OmniGibson`` directory to
+    ``PYTHONPATH``; this assertion fails closed if the imported package still
+    points elsewhere. No shared installation is modified.
+    """
+    expected_pkg = _REPO_ROOT / "OmniGibson" / "omnigibson"
+    loaded = Path(omnigibson.__file__).resolve()
+    if not str(loaded).startswith(str(expected_pkg) + os.sep):
+        raise SystemExit(
+            f"omnigibson resolved outside baseline worktree: {loaded} "
+            f"(expected under {expected_pkg})"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +106,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    _assert_baseline_worktree()
     args = parse_args()
     if args.num_envs != 1:
         raise ValueError("The delta-TF replay slice only supports --num-envs 1.")

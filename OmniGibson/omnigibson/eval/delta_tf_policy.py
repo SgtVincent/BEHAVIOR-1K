@@ -204,7 +204,11 @@ class DeltaTFReplayPolicy(LocalPolicy):
             return action.unsqueeze(0)
 
     def bound_receipt(self):
-        return {"index": self._index, "rows": len(self.rows), **self._source_receipt}
+        receipt = {"index": self._index, "rows": len(self.rows), **self._source_receipt}
+        profile = getattr(self.primitives, "_curobo_profile_receipt", None)
+        if profile is not None:
+            receipt["curobo_profile"] = profile
+        return receipt
 
 
 class PrimitiveEvaluator(BatchedEvaluator):

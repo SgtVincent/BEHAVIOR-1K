@@ -140,6 +140,41 @@ challenge-observation-compliant model benchmarks.
     a decoder output that is not tagged `joint-native23`.
   - `py_compile`, `bash -n` and AST-isolated import resolution pass. No GPU run,
     no physical step, no live-server handshake, no business PASS.
+- Round 2026-11-27 (round 4, field trace 302 + live readback 303, local Mac CPU):
+  - Field first GPU trace reached policy construction and failed gate (a):
+    official DEFAULT cuRobo kinematics `link_names` advertised only
+    `left_eef_link` (ee) + `right_eef_link`; the requested chest
+    `torso_link4` was missing. No constraint was silently dropped.
+  - Live readback 303 (sha256 `6aeff519…48fbfa1`) fixes the robot truth:
+    robot_r1 / r1pro, action_dim 25, 28 qpos; controller order
+    base, trunk, arm_left, gripper_left, arm_right, gripper_right; base
+    HolonomicBaseJointController velocity dof [0,1,5]; trunk/arms
+    JointController position; two fingers per hand dof [24,25] / [26,27];
+    no delta, no impedance. `torso_link4`, left/right EEF and base_link
+    exist among 44 links. Joint position/velocity limits are null and must
+    be read live from the official controller; no defaults are filled.
+  - Gate (a) minimal fix: `_build_peer_curobo_profile` loads the official
+    DEFAULT yaml (PyYAML `safe_load`), appends only `torso_link4` to
+    `kinematics.link_names` (de-duplicated), and dumps a per-run temp peer
+    yaml; the official `CuRoboMotionGenerator` receives it through the
+    official `robot_cfg_path` override with `use_default_embodiment_only`.
+    Upstream core/yaml are untouched; the shared install is not written to;
+    no 700-line static copy is maintained. Receipt records source yaml path,
+    source sha256, added link, resulting link_names and peer yaml path.
+  - Editable-binding patch: both runner shells prepend the worktree
+    `OmniGibson` dir to `PYTHONPATH`; both entries fail closed if the loaded
+    `omnigibson.__file__` resolves outside this worktree. No shared conda /
+    site-customize is modified.
+  - Gate (b) moving-base and gate (c) changing gripper width remain
+    `NotImplementedError` before planning; neither channel is deleted or
+    skipped. Row0 yaw 4.563e-6 and 7918/13333 moving rows, 5651/13333
+    grip-changing rows from 303 are real unsupported motion, not removable
+    channels.
+  - `py_compile`, `bash -n` and AST-isolated resolution pass; a local
+    yaml load/merge/dump round-trip mirror test passes. **No new physical
+    step, no new plan, no video, no business PASS.** The warp 1.12 per-run
+    preload shim stays field-side versioned and must later be bound into
+    the baseline shell; it is never written to the shared site-customize.
 
 ## Open items (not yet verified)
 
@@ -163,9 +198,14 @@ challenge-observation-compliant model benchmarks.
   three-can termination remain open.
 - Converted-dir lane: the manifest fixed-start anchors are recorded in the
   receipt but their agreement with the live frame0 pose is not yet checked
-  against a real reset; frame0 state readback still needs live site truth.
-  Tool link names (chest = `torso_link4`) and controller group layout must be
-  confirmed against live robot introspection; peer defaults are not acceptance.
+  against a real reset; the 303 readback has `anchor_residual_base_relative=null`
+  because the probe v2 did not compute it. Real anchor binding is still done
+  in the primitive `bind_anchors` step via the official inverse transform;
+  this null is not a frame0 pass. Tool link names (chest = `torso_link4`) and
+  the six-group controller layout were confirmed by live readback 303; joint
+  position/velocity limits read null there and must be read live from the
+  official controller — no default is filled. Finger qpos ↔ metre-width real
+  range is still unverified.
 - Beyond the fixed-base / unchanged-gripper first slice, moving-base and
   grasp-phase width changes must be bound through upstream Controller/MotionGen;
   metres width must be normalised into the controller range, never sent as

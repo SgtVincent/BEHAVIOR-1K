@@ -4,10 +4,14 @@ No IK, trajectory optimizer, collision exporter or physics loop is implemented
 here. The decoder accepts the BRVLA execution23 layout, NOT native joint23.
 Saved pairwise deltas and model chunk-cumulative deltas are distinct inputs.
 """
+import hashlib
+import pathlib
+import tempfile
 from enum import IntEnum
 
 import gymnasium as gym
 import torch as th
+import yaml
 
 import omnigibson.utils.transform_utils as T
 from omnigibson.action_primitives.action_primitive_set_base import (
@@ -28,6 +32,53 @@ class DeltaTFAction(IntEnum):
 #: ``GRIPPER_RANGE_M``). Widths are metres, not finger joint qpos; the future
 #: grasp-phase binding must normalise the width into the controller range.
 GRIPPER_RANGE_M = 0.05
+
+
+def _build_peer_curobo_profile(robot, chest_link):
+    """Reuse the official DEFAULT cuRobo config and register the chest link as
+    a planning kinematics link.
+
+    The upstream yaml and curobo core are not edited. The merged profile is
+    materialized in a per-run temp directory and handed to the official
+    ``CuRoboMotionGenerator`` through its ``robot_cfg_path`` override. Every
+    non-chest section is copied verbatim from the official yaml; the only
+    mutation is appending ``chest_link`` to ``kinematics.link_names`` when it
+    is absent.
+    """
+    official = robot.curobo_path
+    if isinstance(official, dict):
+        official_path = official.get(CuRoboEmbodimentSelection.DEFAULT)
+    else:
+        official_path = official
+    if not official_path:
+        raise ValueError("No official DEFAULT cuRobo profile path resolved")
+    official_path = pathlib.Path(official_path)
+    if not official_path.exists():
+        raise ValueError(f"Official cuRobo profile absent: {official_path}")
+
+    source_sha256 = hashlib.sha256(official_path.read_bytes()).hexdigest()
+    config = yaml.safe_load(official_path.read_text(encoding="utf-8"))
+    if config is None:
+        raise ValueError(f"Official cuRobo profile empty: {official_path}")
+    robot_cfg = config.get("robot_cfg", config)
+    kinematics = robot_cfg["kinematics"]
+    link_names = list(kinematics.get("link_names") or [])
+    if chest_link not in link_names:
+        link_names.append(chest_link)
+    kinematics["link_names"] = link_names
+
+    profile_dir = pathlib.Path(tempfile.mkdtemp(prefix="b1k_curobo_peer_"))
+    peer_path = profile_dir / "r1pro_default_chest.yaml"
+    peer_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    receipt = {
+        "source_yaml": str(official_path),
+        "source_sha256": source_sha256,
+        "added_link": chest_link,
+        "link_names": list(link_names),
+        "peer_yaml": str(peer_path),
+    }
+    return str(peer_path), receipt
 
 
 class DeltaTFDecoder:
@@ -111,7 +162,15 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         if any(link not in robot.links for link in self.tool_links.values()):
             raise ValueError("All tool links must be present in the live robot")
         self._enable_head_tracking = False
-        self._motion_generator = CuRoboMotionGenerator(robot, batch_size=batch_size)
+        peer_profile, self._curobo_profile_receipt = _build_peer_curobo_profile(
+            robot, self.tool_links["chest"]
+        )
+        self._motion_generator = CuRoboMotionGenerator(
+            robot,
+            robot_cfg_path={CuRoboEmbodimentSelection.DEFAULT: peer_profile},
+            use_default_embodiment_only=True,
+            batch_size=batch_size,
+        )
         self._emb = CuRoboEmbodimentSelection.DEFAULT
         if self._emb not in self._motion_generator.mg:
             available = sorted(str(k) for k in self._motion_generator.mg.keys())
