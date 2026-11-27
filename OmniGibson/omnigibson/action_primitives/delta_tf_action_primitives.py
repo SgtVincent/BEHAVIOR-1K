@@ -5,6 +5,7 @@ here. The decoder accepts the BRVLA execution23 layout, NOT native joint23.
 Saved pairwise deltas and model chunk-cumulative deltas are distinct inputs.
 """
 import hashlib
+import os
 import pathlib
 import tempfile
 from enum import IntEnum
@@ -67,7 +68,20 @@ def _build_peer_curobo_profile(robot, chest_link):
         link_names.append(chest_link)
     kinematics["link_names"] = link_names
 
-    profile_dir = pathlib.Path(tempfile.mkdtemp(prefix="b1k_curobo_peer_"))
+    # Managed run directory only: B1K_PEER_PROFILE_DIR (runner-provided, under
+    # /dev/shm lane or the run artifact dir), otherwise a TMPDIR-isolated temp
+    # dir. Never fall back to an unrelated shared /tmp location; NAS is not
+    # used for run-time assets.
+    managed_dir = os.environ.get("B1K_PEER_PROFILE_DIR")
+    if managed_dir:
+        profile_dir = pathlib.Path(managed_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        dir_kind = "managed_env"
+    else:
+        profile_dir = pathlib.Path(
+            tempfile.mkdtemp(prefix="b1k_curobo_peer_", dir=os.environ.get("TMPDIR") or None)
+        )
+        dir_kind = "tmpdir_isolated"
     peer_path = profile_dir / "r1pro_default_chest.yaml"
     peer_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
@@ -77,6 +91,8 @@ def _build_peer_curobo_profile(robot, chest_link):
         "added_link": chest_link,
         "link_names": list(link_names),
         "peer_yaml": str(peer_path),
+        "profile_dir": str(profile_dir),
+        "profile_dir_kind": dir_kind,
     }
     return str(peer_path), receipt
 

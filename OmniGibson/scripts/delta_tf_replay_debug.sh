@@ -70,6 +70,40 @@ if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$SLICE_COMMIT" "$HEAD_COMMIT"
   exit 2
 fi
 
+# Managed scratch: /dev/shm lane when available, otherwise the run output
+# dir's tmp subtree. Peer cuRobo profile and the warp shim live here only;
+# nothing is written to a shared site-customize or the NAS.
+RUN_TMP="${B1K_RUN_TMPDIR:-}"
+if [[ -z "$RUN_TMP" ]]; then
+  if [[ -d /dev/shm && -w /dev/shm ]]; then
+    RUN_TMP="/dev/shm/b1k_replay_${USER:-user}_$$"
+  else
+    RUN_TMP="$OUTPUT_DIR/tmp"
+  fi
+fi
+mkdir -p "$RUN_TMP/peer_profile" "$RUN_TMP/warp_shim" "$RUN_TMP/tmp"
+export TMPDIR="$RUN_TMP/tmp"
+export B1K_PEER_PROFILE_DIR="$RUN_TMP/peer_profile"
+
+# Per-run warp 1.12 preload shim (retained 303 content, sha256
+# b516931a65a594d1ea0af3dbe79c6e6cb10d80f5a419b1f84d55493bce427054);
+# scratch-only, never written to shared site-packages.
+if [[ "${WARP_SHIM:-1}" != "0" ]]; then
+  cat > "$RUN_TMP/warp_shim/sitecustomize.py" <<'SHIM'
+import sys
+import torch as _torch  # noqa: F401
+for _m in list(sys.modules):
+    if _m == "warp" or _m.startswith("warp."):
+        del sys.modules[_m]
+import warp as _wp
+import warp.torch  # noqa: F401
+_wp.init()
+SHIM
+  SHIM_SHA="$(sha256sum "$RUN_TMP/warp_shim/sitecustomize.py" | cut -d' ' -f1)"
+  echo "Per-run warp shim sha256: $SHIM_SHA ($RUN_TMP/warp_shim/sitecustomize.py)"
+  export PYTHONPATH="$RUN_TMP/warp_shim${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 # Prefer this worktree's OmniGibson package over any shared editable install;
 # the entry asserts the resolved package file lives under this worktree.
 # No shared conda / site-packages is modified.

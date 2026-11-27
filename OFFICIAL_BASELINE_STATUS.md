@@ -175,6 +175,43 @@ challenge-observation-compliant model benchmarks.
     step, no new plan, no video, no business PASS.** The warp 1.12 per-run
     preload shim stays field-side versioned and must later be bound into
     the baseline shell; it is never written to the shared site-customize.
+- Round 2026-11-27 (round 5, local Mac, CPU only; live-target first-plan
+  diagnostic, managed scratch, warp runner bootstrap):
+  - New peer `LiveTargetDiagnosticPolicy` + `delta_tf_diagnostic_entry.py`
+    + `delta_tf_diagnostic_debug.sh`. The policy builds one synthetic
+    execution23 row from live link poses: small nonzero left/right/chest
+    local translations (defaults 2 cm / 2 cm / 1 cm, zero rotations),
+    zero base displacement, grip widths held at the live finger qpos mean.
+    It still flows through the official primitives, cuRobo MotionGen and
+    Controller execution; the upstream evaluator owns stepping, metrics
+    and video. Receipt marks `replay_pass=False`, `frame0_pass=False`,
+    `scientific_pass=False`; no manifest/npy/checkpoint/stats/preprocessing
+    is read.
+  - Profile scratch dir: `_build_peer_curobo_profile` honors
+    `B1K_PEER_PROFILE_DIR` (runner-provided `/dev/shm` lane or run artifact
+    dir), otherwise an isolated `TMPDIR` tempdir; the old default `/tmp`
+    fallback is removed. Receipt records `profile_dir` and
+    `profile_dir_kind`.
+  - All three runner shells create a managed scratch dir (`/dev/shm` lane
+    when writable, else `<OUTPUT_DIR>/tmp`), export `TMPDIR`, and write the
+    frozen 303 warp 1.12 preload `sitecustomize.py` into a per-run scratch
+    `warp_shim` dir (sha256 `b516931a65a594d1ea0af3dbe79c6e6cb10d80f5a419b1f84d55493bce427054`,
+    verified byte-identical); `WARP_SHIM=0` disables. Nothing is written to
+    shared site-packages or the NAS.
+  - Official base-channel API evidence (no self-built pipeline): upstream
+    `_navigate_to_pose` plans the base 2D pose through the separate
+    `CuRoboEmbodimentSelection.BASE` embodiment with target key
+    `base_footprint_link_name`; arm/EEF targets use DEFAULT/ARM in a
+    separate sequential plan (`_plan_joint_motion` selects embodiment).
+    `_navigate_to_pose_direct` is the holonomic velocity-feedback fallback,
+    not a cuRobo base-pose plan. This peer MG currently constructs
+    `use_default_embodiment_only=True`, so the BASE profile is absent and
+    gate (b) remains `NotImplementedError`. A minimal official base binding
+    would add the BASE embodiment/profile and submit the base target under
+    it in a separate plan; the 1e-7 threshold is not loosened and the base
+    channel is not dropped.
+  - `py_compile`, `bash -n` and AST-isolated resolution pass. **No new
+    physical step, plan, video or business PASS.**
 
 ## Open items (not yet verified)
 

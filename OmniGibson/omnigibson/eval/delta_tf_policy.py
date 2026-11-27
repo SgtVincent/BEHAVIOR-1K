@@ -26,7 +26,10 @@ import numpy as np
 import torch as th
 from hydra.utils import instantiate
 
-from omnigibson.action_primitives.delta_tf_action_primitives import DeltaTFActionPrimitives
+from omnigibson.action_primitives.delta_tf_action_primitives import (
+    GRIPPER_RANGE_M,
+    DeltaTFActionPrimitives,
+)
 from omnigibson.eval.evaluator import BatchedEvaluator
 from omnigibson.eval.policies import LocalPolicy
 
@@ -208,6 +211,93 @@ class DeltaTFReplayPolicy(LocalPolicy):
         profile = getattr(self.primitives, "_curobo_profile_receipt", None)
         if profile is not None:
             receipt["curobo_profile"] = profile
+        return receipt
+
+
+class LiveTargetDiagnosticPolicy(LocalPolicy):
+    """First-plan smoke diagnostic on the live robot; NOT a replay / frame0 /
+    scientific pass.
+
+    One synthetic execution23 row is built from live link poses: small nonzero
+    local translations for left/right/chest, zero base displacement, and grip
+    widths held at the live finger qpos mean. It still flows through the
+    official primitives, cuRobo MotionGen and controller execution; the
+    evaluator owns stepping, metrics and video. No original episode data,
+    source anchors, or frame0 state are read or restored here.
+    """
+
+    DEFAULT_OFFSETS = {
+        "left": (0.02, 0.0, 0.0),
+        "right": (0.0, 0.02, 0.0),
+        "chest": (0.0, 0.0, 0.01),
+    }
+
+    def __init__(self, env, robot, tool_links, representation="pairwise_delta", offsets=None, **kwargs):
+        super().__init__(action_dim=robot.action_dim)
+        self.primitives = DeltaTFActionPrimitives(
+            env, robot, tool_links, representation=representation
+        )
+        self._offsets = dict(self.DEFAULT_OFFSETS)
+        if offsets:
+            self._offsets.update(offsets)
+        self._source_receipt = {
+            "source": "live_diagnostic",
+            "scientific_pass": False,
+            "replay_pass": False,
+            "frame0_pass": False,
+            "note": "Synthetic live small-offset target; no source episode, anchor or frame0 restore.",
+        }
+        self.reset()
+
+    def reset(self):
+        self._index = 0
+        self._generator = None
+        self._anchored = False
+        self._row = None
+
+    def _build_diagnostic_row(self):
+        robot = self.primitives.robot
+        widths = []
+        for arm in ("left", "right"):
+            measured = robot.get_joint_positions()[robot.gripper_control_idx[arm]]
+            widths.append(float(th.clamp(measured.mean(), 0.0, GRIPPER_RANGE_M).item()))
+        row = th.zeros(ACTION23, dtype=th.float32)
+        for name, sl in (("left", slice(0, 6)), ("right", slice(6, 12)), ("chest", slice(17, 23))):
+            dx, dy, dz = self._offsets[name]
+            row[sl] = th.tensor([dx, dy, dz, 0.0, 0.0, 0.0], dtype=th.float32)
+        row[12:14] = th.tensor(widths, dtype=th.float32)
+        row[14:17] = th.zeros(3, dtype=th.float32)
+        if not th.isfinite(row).all():
+            raise ValueError("Diagnostic row is non-finite")
+        return row
+
+    def forward(self, obs, *args, **kwargs):
+        if not self._anchored:
+            self.primitives.bind_anchors()
+            self._anchored = True
+        while True:
+            if self._generator is None:
+                if self._index >= 1:
+                    raise StopIteration("Live diagnostic target exhausted; this is not task success")
+                self._row = self._build_diagnostic_row()
+                self._generator = self.primitives.apply(self._row)
+            try:
+                action = next(self._generator)
+            except StopIteration:
+                self._index += 1
+                self._generator = None
+                continue
+            action = th.as_tensor(action, dtype=th.float32).detach().cpu()
+            if action.shape != (self.action_dim,) or not th.isfinite(action).all():
+                raise ValueError("Upstream primitive yielded an invalid controller command")
+            return action.unsqueeze(0)
+
+    def bound_receipt(self):
+        receipt = {"index": self._index, "rows": 1, **self._source_receipt}
+        profile = getattr(self.primitives, "_curobo_profile_receipt", None)
+        if profile is not None:
+            receipt["curobo_profile"] = profile
+        receipt["offsets"] = {k: list(v) for k, v in self._offsets.items()}
         return receipt
 
 
