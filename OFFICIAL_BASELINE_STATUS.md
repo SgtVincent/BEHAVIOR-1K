@@ -52,10 +52,19 @@ Sources:
 ## Input and authority
 
 The decoder input is execution23: left pose6, right pose6, two gripper widths in
-metres, base dx/dy/dyaw, chest pose6. This is NOT the native23 joint command.
+metres (frozen range 0..0.05 m; width is never finger qpos), base dx/dy/dyaw,
+chest pose6. This is NOT the native23 joint command.
 Use explicit `pairwise_delta` for saved conversion rows or `chunk_cumulative`
 for model chunk targets. Anchor rebinding is explicit at each run/chunk, never
 silently refreshed per control step.
+
+Saved converted episode contract (`brvla_saved_execution23_v1`,
+`pairwise_delta`, `<f4`, Nx23, 30 Hz): `manifest.json` + `actions.npy`, columns
+left 0:6 / right 6:12 / continuous_gripper 12:14 / move 14:17 / chest 17:23;
+fixed run-local start anchors live in `chunks[0].anchors`; chest link is
+`torso_link4` (manifest `provenance.chest_link`). The replay lane reads the
+original npy with schema/representation/shape/digest gates; the model lane's
+`physical23_same_anchor_cumulative` rows are never mixed into this loader.
 
 No source joint-angle fallback, state teleport, disabled collision checks or
 fabricated planner certification is allowed. `add_member` registers an IK
@@ -116,6 +125,21 @@ challenge-observation-compliant model benchmarks.
 - **Round 2 also has no GPU run, no physical step, no model forward and no
   business PASS.** The decoder seam is absent, so every server row is held and
   zero simulator steps are taken by design.
+- Round 2026-11-27 (round 3, local Mac, CPU only):
+  - Replay loader reads the original `manifest.json` + `actions.npy` directory
+    and gates schema (`brvla_saved_execution23_v1`), representation
+    (`pairwise_delta`), shape, float32 dtype and manifest/action digest; an
+    optional compatibility npz shim remains as a fallback. Manifest field
+    names, slices, anchors, dt and `chest_link=torso_link4` were checked against
+    the retained original converted-manifest sample.
+  - Gripper widths are gated to the frozen 0..0.05 m range; widths are metres,
+    not finger joint qpos.
+  - WS policy parity with the retained bridge contract: `set_action_dim` refuses
+    any width other than 23; image lineage records `channels`; every bound
+    proprio slice records a 64-hex `source_sha256`; the boundary guard rejects
+    a decoder output that is not tagged `joint-native23`.
+  - `py_compile`, `bash -n` and AST-isolated import resolution pass. No GPU run,
+    no physical step, no live-server handshake, no business PASS.
 
 ## Open items (not yet verified)
 
@@ -137,6 +161,15 @@ challenge-observation-compliant model benchmarks.
 - Original checkpoint model inference, source/frame0 identity, moving-base /
   gripper phases, held-object planning, action-clock preservation and the
   three-can termination remain open.
+- Converted-dir lane: the manifest fixed-start anchors are recorded in the
+  receipt but their agreement with the live frame0 pose is not yet checked
+  against a real reset; frame0 state readback still needs live site truth.
+  Tool link names (chest = `torso_link4`) and controller group layout must be
+  confirmed against live robot introspection; peer defaults are not acceptance.
+- Beyond the fixed-base / unchanged-gripper first slice, moving-base and
+  grasp-phase width changes must be bound through upstream Controller/MotionGen;
+  metres width must be normalised into the controller range, never sent as
+  finger qpos or used to skip a grasp phase.
 - Frozen-model WS slice (round 2), not yet verified on a live server:
   - The native-joint decoder seam is absent; `CheckpointActionBlocked` holds
     every row and takes zero steps until a verified IK-target23 → joint-native23
@@ -164,9 +197,10 @@ challenge-observation-compliant model benchmarks.
    embodiment.
 3. Launch one single-env debug rollout through the versioned peer runner:
    `bash OmniGibson/scripts/delta_tf_replay_debug.sh` with `TASK_NAME`,
-   `NPZ_PATH`, `ARRAY_KEY`, `TOOL_LINKS_JSON` exported (see script header). It
-   sha-gates to this slice's commit, binds the peer joint-profile
-   `eval/r1pro_delta_tf_debug.yaml`, and calls
+   `CONVERTED_DIR` (manifest.json + actions.npy) and `TOOL_LINKS_JSON` exported
+   (see script header; optional `MANIFEST_SHA256` / `ACTIONS_SHA256` pins, or the
+   npz compatibility fallback). It sha-gates to this slice's commit, binds the
+   peer joint-profile `eval/r1pro_delta_tf_debug.yaml`, and calls
    `python -m omnigibson.eval.delta_tf_replay_entry` with `--write-video`.
    Keep `write_video=True` and retain a decodable MP4 plus the result JSON.
 4. First gate: one real delta-TF target reaches collision-aware planning,

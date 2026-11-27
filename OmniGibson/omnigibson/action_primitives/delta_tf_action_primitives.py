@@ -24,6 +24,12 @@ class DeltaTFAction(IntEnum):
     MOVE = 0
 
 
+#: Frozen replay continuous-gripper width range in metres (original producer
+#: ``GRIPPER_RANGE_M``). Widths are metres, not finger joint qpos; the future
+#: grasp-phase binding must normalise the width into the controller range.
+GRIPPER_RANGE_M = 0.05
+
+
 class DeltaTFDecoder:
     """Fixed-anchor execution23 -> absolute link poses, body displacement, widths.
 
@@ -59,8 +65,10 @@ class DeltaTFDecoder:
         row = th.as_tensor(row, dtype=th.float32).detach().cpu()
         if row.shape != (23,) or not th.isfinite(row).all():
             raise ValueError("A finite execution23 row is required, not native joint actions")
-        if th.any(row[12:14] < 0):
-            raise ValueError("Gripper widths must be nonnegative metres")
+        if th.any(row[12:14] < 0) or th.any(row[12:14] > GRIPPER_RANGE_M + 1e-6):
+            raise ValueError(
+                f"Gripper widths must be metres in [0, {GRIPPER_RANGE_M}]"
+            )
         poses = {}
         for name, sl in (("left", slice(0, 6)), ("right", slice(6, 12)), ("chest", slice(17, 23))):
             p = row[sl]

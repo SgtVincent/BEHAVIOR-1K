@@ -36,6 +36,12 @@ ACTION23 = 23
 LEGACY_PROPRIO_WIDTH = 256
 POST1_PROPRIO_WIDTH = 61
 
+# Schema labels share the 23 width but not semantics: the frozen server row is
+# an IK-target23 physical plan; only a verified joint-native23 command may reach
+# the controller boundary.
+JOINT_NATIVE23 = "joint-native23"
+IK_TARGET23 = "IK-target23"
+
 # Official post1 61-d proprio order, verified against
 # ``omnigibson.eval.utils.eval_utils.PROPRIOCEPTION_INDICES["R1Pro"]``.
 POST1_SL = {
@@ -201,8 +207,12 @@ class CheckpointWsPolicy(WebsocketPolicy):
     # -- evaluator policy interface ------------------------------------------
 
     def set_action_dim(self, action_dim: Optional[int]) -> None:
-        if action_dim is not None:
-            self._eval_action_dim = int(action_dim)
+        if action_dim is not None and int(action_dim) != ACTION23:
+            raise CheckpointWsContractError(
+                f"evaluator action_dim={action_dim} != frozen {ACTION23}; "
+                "refuse to construct a mismatched policy"
+            )
+        self._eval_action_dim = None if action_dim is None else int(action_dim)
 
     def reset(self) -> None:
         super().reset()
@@ -295,7 +305,13 @@ class CheckpointWsPolicy(WebsocketPolicy):
                 raise CheckpointWsContractError(f"missing frozen camera key {cam_key}")
             arr, shape, digest = self._image_to_wire(obs[cam_key])
             images[cam_key] = arr
-            image_lineage.append({"role": role, "key": cam_key, "shape": shape, "sha256": digest})
+            image_lineage.append({
+                "role": role,
+                "key": cam_key,
+                "shape": shape,
+                "channels": shape[-1],
+                "sha256": digest,
+            })
 
         wire: Dict[str, Any] = {
             self._prop_key: legacy,
@@ -330,11 +346,13 @@ class CheckpointWsPolicy(WebsocketPolicy):
             "legacy_key": "robot_lin_vel", "legacy_slice": [152, 155],
             "post1_key": "base_qvel", "post1_slice": [0, 2],
             "role": "bound", "frame": "robot_local_base",
+            "source_sha256": _sha_bytes(bv[0:2]),
         })
         lineage["bindings"].append({
             "legacy_key": "robot_ang_vel", "legacy_slice": [155, 158],
             "post1_key": "base_qvel", "post1_slice": [2, 3],
             "role": "bound", "frame": "robot_local_base",
+            "source_sha256": _sha_bytes(bv[2:3]),
         })
         # Planar-holonomic-base profile zeros: no vertical / roll / pitch DOF.
         lineage["profile_zero"].append({
@@ -357,6 +375,7 @@ class CheckpointWsPolicy(WebsocketPolicy):
                     "post1_key": post1_key,
                     "post1_slice": [POST1_SL[post1_key].start, POST1_SL[post1_key].stop],
                     "role": role,
+                    "source_sha256": _sha_bytes(src),
                 })
             else:
                 legacy[sl] = [0.0] * (sl.stop - sl.start)
@@ -421,7 +440,14 @@ class CheckpointWsPolicy(WebsocketPolicy):
         return [float(v) for v in row], shape
 
     def _validate_native(self, native: Any) -> List[float]:
-        plain = _to_plain(native)
+        label = getattr(native, "label", None)
+        if label is not None and label != JOINT_NATIVE23:
+            raise CheckpointActionBlocked(
+                f"decoder handed back {label!r} at the step boundary; "
+                "only a verified joint-native23 command may reach env.step"
+            )
+        vector = getattr(native, "vector", None)
+        plain = _to_plain(vector if vector is not None else native)
         if isinstance(plain, list) and plain and isinstance(plain[0], list):
             plain = plain[0]
         if not isinstance(plain, list) or len(plain) != ACTION23 or not _finite(plain):

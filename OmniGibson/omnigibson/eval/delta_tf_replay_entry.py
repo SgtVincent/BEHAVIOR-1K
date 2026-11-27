@@ -7,9 +7,11 @@ and delegates physics stepping, metrics and video to the upstream
 
 WIP boundaries (same as ``delta_tf_policy.py``):
 - Single logical environment only.
-- Converted execution23 npz rows are replayed through upstream cuRobo MotionGen
-  planning and feedback execution; this is a tracking diagnostic, not a
-  time-faithful replay certificate.
+- Converted execution23 rows are read from the original ``manifest.json`` +
+  ``actions.npy`` directory (``brvla_saved_execution23_v1``, pairwise_delta),
+  or an optional compatibility npz shim; replayed through upstream cuRobo
+  MotionGen planning and feedback execution. This is a tracking diagnostic, not
+  a time-faithful replay certificate.
 - Moving base / changing gripper width are rejected before planning.
 - Finite input exhaustion is a diagnostic exit, never task success.
 
@@ -46,8 +48,11 @@ def parse_args() -> argparse.Namespace:
             "profile; the MultiFinger gripper profile is not compatible."
         ),
     )
-    parser.add_argument("--npz-path", required=True, help="Converted execution23 replay npz.")
-    parser.add_argument("--array-key", required=True, help="Array key inside the replay npz.")
+    parser.add_argument("--converted-dir", default=None, help="Original converted episode directory holding manifest.json + actions.npy.")
+    parser.add_argument("--manifest-sha256", default=None, help="Expected manifest.json sha256 (optional pin).")
+    parser.add_argument("--actions-sha256", default=None, help="Expected actions.npy sha256 (optional pin).")
+    parser.add_argument("--npz-path", default=None, help="Compatibility replay npz (alternative to --converted-dir).")
+    parser.add_argument("--array-key", default=None, help="Array key inside the compatibility npz.")
     parser.add_argument(
         "--tool-links",
         required=True,
@@ -102,15 +107,29 @@ def main() -> None:
     if set(tool_links) != {"left", "right", "chest"}:
         raise ValueError("tool_links must map exactly left, right and chest.")
 
+    if not args.converted_dir and not args.npz_path:
+        raise ValueError("Provide either --converted-dir or --npz-path/--array-key.")
+    if args.npz_path and not args.array_key:
+        raise ValueError("--array-key is required with --npz-path.")
+
     robot_config = OmegaConf.load(str(Path(args.robot_config).expanduser()))
 
     model_cfg = {
         "_target_": "omnigibson.eval.delta_tf_policy.DeltaTFReplayPolicy",
-        "npz_path": args.npz_path,
-        "array_key": args.array_key,
         "tool_links": tool_links,
         "representation": args.representation,
     }
+    if args.converted_dir:
+        model_cfg.update({
+            "converted_dir": args.converted_dir,
+            "manifest_sha256": args.manifest_sha256,
+            "actions_sha256": args.actions_sha256,
+        })
+    else:
+        model_cfg.update({
+            "npz_path": args.npz_path,
+            "array_key": args.array_key,
+        })
     cfg = OmegaConf.create(
         {
             "env_wrapper": {"_target_": "omnigibson.eval.wrappers.DefaultWrapper"},

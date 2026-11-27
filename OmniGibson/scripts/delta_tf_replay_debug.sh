@@ -16,13 +16,18 @@
 #
 # Required inputs (no private paths are hardcoded here):
 #   TASK_NAME        BEHAVIOR task name, e.g. collecting_childrens_toys
-#   NPZ_PATH         Converted execution23 replay npz (Nx23)
-#   ARRAY_KEY        Array key inside the npz
+#   CONVERTED_DIR    Original converted episode dir: manifest.json + actions.npy
+#                    (schema brvla_saved_execution23_v1, pairwise_delta)
 #   TOOL_LINKS_JSON  JSON: {"left":"<link>","right":"<link>","chest":"<link>"}
 #                    Link names must match the live robot and the cuRobo profile.
+# Optional compatibility:
+#   NPZ_PATH / ARRAY_KEY  Wrapped npz shim preserving the original npy sha;
+#                         used only when CONVERTED_DIR is unset.
 #
 # Optional:
 #   REPRESENTATION   pairwise_delta | chunk_cumulative (default: pairwise_delta)
+#   MANIFEST_SHA256  Expected manifest.json sha256 pin (converted-dir lane)
+#   ACTIONS_SHA256  Expected actions.npy sha256 pin (converted-dir lane)
 #   ROBOT_CONFIG     Peer joint-profile yaml (default: eval/r1pro_delta_tf_debug.yaml)
 #   OUTPUT_DIR       (default: /tmp/b1k_delta_tf_replay)
 #   INSTANCE_INDICES (default: 0)
@@ -39,9 +44,15 @@ SLICE_COMMIT="${BASELINE_COMMIT:-7688958b8ce4079c193d6f73e2c8517a147c1a6a}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 : "${TASK_NAME:?TASK_NAME is required}"
-: "${NPZ_PATH:?NPZ_PATH is required}"
-: "${ARRAY_KEY:?ARRAY_KEY is required}"
 : "${TOOL_LINKS_JSON:?TOOL_LINKS_JSON is required}"
+if [[ -z "${CONVERTED_DIR:-}" && -z "${NPZ_PATH:-}" ]]; then
+  echo "Either CONVERTED_DIR or NPZ_PATH/ARRAY_KEY is required" >&2
+  exit 2
+fi
+if [[ -n "${NPZ_PATH:-}" && -z "${ARRAY_KEY:-}" ]]; then
+  echo "ARRAY_KEY is required with NPZ_PATH" >&2
+  exit 2
+fi
 
 REPRESENTATION="${REPRESENTATION:-pairwise_delta}"
 ROBOT_CONFIG="${ROBOT_CONFIG:-$REPO_ROOT/OmniGibson/omnigibson/eval/r1pro_delta_tf_debug.yaml}"
@@ -65,8 +76,6 @@ CMD=(
   "$OMNI_PYTHON" -m omnigibson.eval.delta_tf_replay_entry
   --task-name "$TASK_NAME"
   --robot-config "$ROBOT_CONFIG"
-  --npz-path "$NPZ_PATH"
-  --array-key "$ARRAY_KEY"
   --tool-links "$TOOL_LINKS_JSON"
   --representation "$REPRESENTATION"
   --instance-indices $INSTANCE_INDICES
@@ -75,6 +84,13 @@ CMD=(
   --video-fps "$VIDEO_FPS"
   --write-video
 )
+if [[ -n "${CONVERTED_DIR:-}" ]]; then
+  CMD+=(--converted-dir "$CONVERTED_DIR")
+  [[ -n "${MANIFEST_SHA256:-}" ]] && CMD+=(--manifest-sha256 "$MANIFEST_SHA256")
+  [[ -n "${ACTIONS_SHA256:-}" ]] && CMD+=(--actions-sha256 "$ACTIONS_SHA256")
+else
+  CMD+=(--npz-path "$NPZ_PATH" --array-key "$ARRAY_KEY")
+fi
 if [[ -n "${MAX_STEPS:-}" ]]; then
   CMD+=(--max-steps "$MAX_STEPS")
 fi
