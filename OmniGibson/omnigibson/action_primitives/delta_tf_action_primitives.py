@@ -322,6 +322,7 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         self._plans_attempted = 0
         self._plans_succeeded = 0
         self._plan_reports = []
+        self._fk_closure_report = None
         self._curobo_profile_receipt = profile_receipt
         self._emb = CuRoboEmbodimentSelection.DEFAULT
         if self._emb not in self._motion_generator.mg:
@@ -346,6 +347,8 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
             for name, link in self.tool_links.items()
         }
         self.decoder = DeltaTFDecoder(anchors, self.representation)
+        # Read-only FK / joint-map closure check; does not move the simulator.
+        self.run_fk_closure_diagnostic()
 
     # -- official MotionGenResult / IKResult diagnostics -----------------------
     #
@@ -549,6 +552,162 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
             "ik_probe_no_collision_success": nocoll_ok,
             "note": "IK-only probes are diagnostics; no probe joint solution is executed.",
         }
+
+    # -- FK closure diagnostic: SDK joints/frame vs official cuRobo kinematics -
+    #
+    # This lane does not write any joint state back to the simulator and does
+    # not execute any probe solution. It only compares the official cspace
+    # joint ordering / forward kinematics against the live SDK transforms, then
+    # asks the official IK solver to reach poses exported from that same
+    # official FK model. A discrepancy here points at a frame/profile/joint-map
+    # bug rather than asserting the goal is mathematically unreachable.
+
+    def _joint_map_report(self, emb_sel):
+        kin = self._motion_generator.mg[emb_sel].kinematics
+        sdk_names = list(self.robot.joints.keys())
+        cu_names = list(kin.joint_names)
+        try:
+            locked = list(kin.kinematics_config.lock_jointstate.joint_names)
+        except AttributeError:
+            locked = []
+        joint_map = []
+        for cu in cu_names:
+            sdk_idx = sdk_names.index(cu) if cu in sdk_names else None
+            joint_map.append({
+                "cspace_joint": cu,
+                "sdk_idx": sdk_idx,
+                "present_in_sdk": sdk_idx is not None,
+                "locked": cu in locked,
+            })
+        return {
+            "sdk_joint_names": sdk_names,
+            "cspace_joint_names": cu_names,
+            "locked_joint_names": locked,
+            "joint_map": joint_map,
+            "sdk_missing_in_cspace": [n for n in sdk_names if n not in cu_names],
+        }
+
+    def _ordered_joint_state(self, q_pos, emb_sel):
+        mg = self._motion_generator
+        js = lazy.curobo.types.state.JointState(
+            position=mg._tensor_args.to_device(q_pos.reshape(1, -1)),
+            joint_names=mg.robot_joint_names,
+        )
+        return js.get_ordered_joint_state(mg.mg[emb_sel].kinematics.joint_names)
+
+    def _fk_link_poses(self, q_pos, emb_sel):
+        ordered = self._ordered_joint_state(q_pos, emb_sel)
+        state = self._motion_generator.mg[emb_sel].kinematics.compute_kinematics(ordered)
+        poses = {}
+        for link_name, pose in state.link_poses.items():
+            pos = pose.position.reshape(-1)[:3].detach().cpu()
+            quat_wxyz = pose.quaternion.reshape(-1)[:4].detach().cpu()
+            poses[link_name] = (pos, quat_wxyz[[1, 2, 3, 0]])
+        return poses
+
+    def _sdk_relative_pose(self, link, base_link):
+        world_pos, world_quat = self.robot.links[link].get_position_orientation()
+        base_pos, base_quat = self.robot.links[base_link].get_position_orientation()
+        rel_mat = T.pose_inv(T.pose2mat((base_pos, base_quat))) @ T.pose2mat((world_pos, world_quat))
+        rel_pos, rel_quat = T.mat2pose(rel_mat)
+        return rel_pos.detach().cpu(), rel_quat.detach().cpu()
+
+    @staticmethod
+    def _rotation_rad(quat1, quat0):
+        rel = T.quat_distance(quat1, quat0)
+        return float(2.0 * th.atan2(th.linalg.norm(rel[:3]), rel[3].clamp(min=1e-12)).item())
+
+    def _fk_closure_link_report(self, q_pos, emb_sel):
+        base_link = self._motion_generator.base_link[emb_sel]
+        fk_poses = self._fk_link_poses(q_pos, emb_sel)
+        closure = {}
+        for _, link in self.tool_links.items():
+            sdk_pos, sdk_quat = self._sdk_relative_pose(link, base_link)
+            if link in fk_poses:
+                fk_pos, fk_quat = fk_poses[link]
+                closure[link] = {
+                    "fk_position": fk_pos.tolist(),
+                    "fk_quaternion_xyzw": fk_quat.tolist(),
+                    "sdk_relative_position": sdk_pos.tolist(),
+                    "sdk_relative_quaternion_xyzw": sdk_quat.tolist(),
+                    "pos_error_m": float(th.linalg.norm(fk_pos - sdk_pos).item()),
+                    "rot_error_rad": self._rotation_rad(fk_quat, sdk_quat),
+                }
+            else:
+                closure[link] = {
+                    "fk_present": False,
+                    "sdk_relative_position": sdk_pos.tolist(),
+                }
+        return base_link, closure
+
+    def _perturbed_q(self, q_pos, delta=0.01):
+        """Small nonzero perturbation on actuated trunk/arm joints only.
+
+        The perturbed configuration lives in memory for FK export; it is never
+        written to the simulator. Base, gripper and locked joints are skipped,
+        and the result is clamped to the official SDK joint limits.
+        """
+        whitelist = set(self.robot.trunk_control_idx)
+        for arm_idx in self.robot.arm_control_idx.values():
+            whitelist.update(arm_idx)
+        lower = getattr(self.robot, "joint_lower_limits", None)
+        upper = getattr(self.robot, "joint_upper_limits", None)
+        q = q_pos.detach().cpu().clone()
+        for idx in whitelist:
+            candidate = q[idx] + delta
+            if lower is not None and upper is not None:
+                candidate = th.clamp(candidate, lower[idx], upper[idx])
+            q[idx] = candidate
+        return q
+
+    def _fk_goal_probe(self, q_pos, emb_sel, label):
+        base_link = self._motion_generator.base_link[emb_sel]
+        base_pos, base_quat = self.robot.links[base_link].get_position_orientation()
+        base_mat = T.pose2mat((base_pos, base_quat))
+        fk_poses = self._fk_link_poses(q_pos, emb_sel)
+        target_pos, target_quat = {}, {}
+        for _, link in self.tool_links.items():
+            if link not in fk_poses:
+                continue
+            fk_pos, fk_quat = fk_poses[link]
+            world_mat = base_mat @ T.pose2mat((fk_pos, fk_quat))
+            w_pos, w_quat = T.mat2pose(world_mat)
+            target_pos[link] = w_pos.detach().cpu().unsqueeze(0)
+            target_quat[link] = w_quat.detach().cpu().unsqueeze(0)
+        if not target_pos:
+            return {"label": label, "error": "official FK returned none of the tool links"}
+        # IK-only, world collision kept on; diagnostic only, no path executed.
+        _, _, probe = self._run_plan(
+            target_pos, target_quat, emb_sel, segment=label,
+            ik_only=True, collision_check=True, update_obstacles=False,
+        )
+        return probe
+
+    def run_fk_closure_diagnostic(self):
+        """Populate ``self._fk_closure_report`` without moving the simulator."""
+        report = {"embodiment": str(self._emb), "diagnostic_only": True, "error": None}
+        try:
+            report["joint_map"] = self._joint_map_report(self._emb)
+            q_pos = self.robot.get_joint_positions().detach().cpu()
+            base_link, closure = self._fk_closure_link_report(q_pos, self._emb)
+            report["base_link"] = base_link
+            report["link_closure"] = closure
+            report["closure_max_pos_error_m"] = max(
+                v.get("pos_error_m", 0.0) for v in closure.values()
+            )
+            report["closure_max_rot_error_rad"] = max(
+                v.get("rot_error_rad", 0.0) for v in closure.values()
+            )
+            report["fk_goal_probes"] = {
+                "current_q": self._fk_goal_probe(q_pos, self._emb, "fk_closure_current_q"),
+                "perturbed_q": self._fk_goal_probe(
+                    self._perturbed_q(q_pos), self._emb, "fk_closure_perturbed_q"
+                ),
+            }
+        except Exception as exc:  # record the closure failure; do not synthesize a pass
+            report["error"] = f"{type(exc).__name__}: {exc}"
+        self._fk_closure_report = report
+        return report
 
     def _navigate_base(self, displacement):
         """Plan and execute the holonomic base through the official BASE

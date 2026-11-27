@@ -254,6 +254,29 @@ challenge-observation-compliant model benchmarks.
   - 308 live limits: 28 joints finite; fingers `[0, 0.050000000745]`; base
     output `±0.75 / ±1.0`; JointController command limits read `None`, not
     zero-filled. Awaiting the next bounded GPU rerun for real plan/step/video.
+- Round 2026-11-27 (round 9, field trace r9, local Mac CPU only):
+  - Real trace: `MotionGenStatus.IK_FAIL`, `valid_query=True`,
+    `trajopt_attempts=0` (IK produced no trajopt seed); collision-ON and
+    collision-OFF IK-only probes both fail all 8 seeds, position error floor
+    `6.11–6.95 mm`, rotation error up to `0.02359 rad`. Not a collision-blocked
+    seed; classified joint-space IK reachability failure on the simultaneous
+    3-link goal. `commands_issued=0`, `control_steps=0`, `physical_steps=null`,
+    no MP4. The solve failure is not asserted to be mathematical unreachable:
+    profile/seed/frame/joint-map remain candidate causes.
+  - New peer FK closure diagnostic (read-only; no simulator joint write, no
+    probe path executed): SDK joint names/qpos mapped by name to the official
+    cspace joint order with locked-joint and missing-name records; per-tool-link
+    official `compute_kinematics` pose compared against the SDK world→curobo-base
+    relative transform (position error metres, rotation error radians). Two
+    diagnostic IK-only probes reuse poses exported from that same official FK
+    model: current-q zero-change goal and a small clamped trunk/arm perturbed-q
+    goal. Multi-link targets are kept, collision stays enabled on any executed
+    plan; the synthetic +2/+2/+1 cm offsets are not treated as a mandatory
+    reachable task.
+  - Same-class bounded budget: r8 + r9 = 2 of 3 boots; one bounded trace
+    remains. A third no-path result must escalate root cause rather than repeat.
+    Segment ② native23 and segment ③ Agent+MP remain unimplemented and
+    unverified; no business PASS is claimed.
 
 ## Open items (not yet verified)
 
