@@ -16,8 +16,11 @@ Keep upstream core files unchanged. Add peer modules in the existing package:
     upstream feedback execution. No custom IK/trajectory optimizer/exporter.
 - `omnigibson/eval/delta_tf_policy.py`
   - `DeltaTFReplayPolicy` derives from `LocalPolicy`.
-  - `PrimitiveEvaluator` derives from `BatchedEvaluator`, changing only its
-    policy factory to supply the already created environment and robot.
+  - `PrimitiveEvaluator` derives from `BatchedEvaluator`: the policy factory
+    supplies the already created environment and robot, and peer
+    instrumentation catches policy `StopIteration` exhaustion so the official
+    record path writes the result JSON and flushes video; pre-completion
+    exceptions persist a bound failure receipt.
   - Upstream evaluator remains owner of physics stepping, metrics and video.
 - `omnigibson/eval/delta_tf_replay_entry.py`
   - Peer runner that mirrors the official `omnigibson.eval.eval` cfg shape and
@@ -73,15 +76,30 @@ preprocessing and chunk/history clock contracts must be retained for model eval.
 
 ## Current limitations (intentional fail-closed boundaries)
 
-This first code slice only supports fixed-base, unchanged-gripper pose targets
-with all requested left/right/chest tool links present in the upstream profile.
-Changing the base or gripper currently raises `NotImplementedError` before plan
-execution. The planner result must also preserve those fixed joints.
+Latest field traces (r8, r9) still produce no executed plan: r9 returned
+`MotionGenStatus.IK_FAIL` with `valid_query=True`, `trajopt_attempts=0`,
+`commands_issued=0`, `control_steps=0`, `physical_steps=null`, no MP4. The IK
+solve failure is not asserted to be mathematical unreachability;
+profile/seed/frame/joint-map remain candidate causes, and the round-10 FK
+closure diagnostic (commit `404e7e2`) has not yet been run on GPU.
 
-Consequently, this slice **cannot yet replay an entire converted demonstration,
-complete original-model physical eval or reproduce picking_up_trash**. No model
-server/Agent policy is connected here yet. Source initial-state migration,
-source/frame0 identity, moving-base/gripper phases, held-object planning,
+- Base: the official BASE embodiment is bound and planned as a separate
+  sequential `_navigate_base` segment before the arm/chest plan, but it has
+  not yet been verified on a real GPU trace; a missing BASE profile still
+  fails closed. The two segments are not a synchronous full-body plan.
+- Gripper: width-changing commands are still rejected before planning; the
+  diagnostic holds current finger qpos. The finger-qpos ↔ metre-width range
+  is unverified against a real controller.
+- The simultaneous left/right/chest 3-link goal is kept as-is; no link is
+  dropped and there is no source-joint fallback. The synthetic +2/+2/+1 cm
+  offsets of the diagnostic row are not a mandatory reachable task.
+- Exhaustion (`StopIteration`) and pre-completion failures are recorded as
+  diagnostic exits with receipt/JSON/video flush; they are not task success.
+
+Consequently, this slice **cannot yet replay an entire converted
+demonstration, complete original-model physical eval or reproduce
+picking_up_trash**. No model server/Agent policy is connected here yet. Source
+initial-state migration, source/frame0 identity, held-object planning,
 model action-clock preservation and three-can termination remain open.
 
 Waypoint feedback execution is not equivalent to preserving each source row's
@@ -263,6 +281,12 @@ challenge-observation-compliant model benchmarks.
     3-link goal. `commands_issued=0`, `control_steps=0`, `physical_steps=null`,
     no MP4. The solve failure is not asserted to be mathematical unreachable:
     profile/seed/frame/joint-map remain candidate causes.
+  - Offline CPU check on r9 recorded poses (no curobo FK): world-frame and
+    base-relative residual norms match because a rigid transform preserves
+    norm; this only rules out a rigid-coordinate residual-norm/scale
+    decomposition artifact. It does not rule out all cuRobo FK or
+    goal-assembly artifacts, and it does not prove the goal is mathematically
+    unreachable.
   - New peer FK closure diagnostic (read-only; no simulator joint write, no
     probe path executed): SDK joint names/qpos mapped by name to the official
     cspace joint order with locked-joint and missing-name records; per-tool-link
@@ -309,10 +333,11 @@ challenge-observation-compliant model benchmarks.
   position/velocity limits read null there and must be read live from the
   official controller — no default is filled. Finger qpos ↔ metre-width real
   range is still unverified.
-- Beyond the fixed-base / unchanged-gripper first slice, moving-base and
-  grasp-phase width changes must be bound through upstream Controller/MotionGen;
-  metres width must be normalised into the controller range, never sent as
-  finger qpos or used to skip a grasp phase.
+- The base segment is bound through the official BASE embodiment but remains
+  unverified on a real trace; grasp-phase width changes must still be bound
+  through upstream Controller/MotionGen; metres width must be normalised into
+  the controller range, never sent as finger qpos or used to skip a grasp
+  phase.
 - Frozen-model WS slice (round 2), not yet verified on a live server:
   - The native-joint decoder seam is absent; `CheckpointActionBlocked` holds
     every row and takes zero steps until a verified IK-target23 → joint-native23
