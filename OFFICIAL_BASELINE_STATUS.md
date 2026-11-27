@@ -117,11 +117,12 @@ challenge-observation-compliant model benchmarks.
    arms/trunk/grippers, HolonomicBaseJointController base); confirm the cuRobo
    profile advertises the requested left/right/chest links and the available
    embodiment.
-3. Launch one single-env debug rollout through the peer runner:
-   `python -m omnigibson.eval.delta_tf_replay_entry --task-name <task>
-   --robot-config <joint-profile.yaml> --npz-path <converted.npz>
-   --array-key <key> --tool-links '<json>' --representation pairwise_delta
-   --num-envs 1 --write-video --output-dir <writable dir>`.
+3. Launch one single-env debug rollout through the versioned peer runner:
+   `bash OmniGibson/scripts/delta_tf_replay_debug.sh` with `TASK_NAME`,
+   `NPZ_PATH`, `ARRAY_KEY`, `TOOL_LINKS_JSON` exported (see script header). It
+   sha-gates to this slice's commit, binds the peer joint-profile
+   `eval/r1pro_delta_tf_debug.yaml`, and calls
+   `python -m omnigibson.eval.delta_tf_replay_entry` with `--write-video`.
    Keep `write_video=True` and retain a decodable MP4 plus the result JSON.
 4. First gate: one real delta-TF target reaches collision-aware planning,
    physical feedback execution and a decodable video; fixed base/gripper joints
