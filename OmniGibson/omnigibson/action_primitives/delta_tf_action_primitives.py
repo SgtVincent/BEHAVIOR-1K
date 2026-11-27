@@ -105,6 +105,12 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         self._enable_head_tracking = False
         self._motion_generator = CuRoboMotionGenerator(robot, batch_size=batch_size)
         self._emb = CuRoboEmbodimentSelection.DEFAULT
+        if self._emb not in self._motion_generator.mg:
+            available = sorted(str(k) for k in self._motion_generator.mg.keys())
+            raise ValueError(
+                f"Upstream cuRobo profile has no DEFAULT embodiment; available={available}. "
+                "Bind a matching robot curobo profile; do not silently fall back to another embodiment."
+            )
         supported = set(self._motion_generator.additional_links[self._emb]) | {self._motion_generator.ee_link[self._emb]}
         if not set(tool_links.values()) <= supported:
             raise ValueError("Upstream cuRobo profile lacks requested tool links; no silent constraint drop")
