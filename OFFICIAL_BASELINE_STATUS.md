@@ -212,6 +212,30 @@ challenge-observation-compliant model benchmarks.
     channel is not dropped.
   - `py_compile`, `bash -n` and AST-isolated resolution pass. **No new
     physical step, plan, video or business PASS.**
+- Round 2026-11-27 (round 6, local Mac, CPU only; grip hold semantics,
+  exhaustion evidence, BASE embodiment base channel):
+  - Grip hold corrected: the diagnostic policy holds current finger qpos via
+    the official plan and issues no new grip target. The execution23 grip
+    slots carry a qpos hold reference, not a physical metre-width command.
+    Receipt flags: `grip_mode=hold_current_finger_qpos`,
+    `grip_physical_range_unverified=true`, `grip_metre_width_claim=false`.
+    gate (c) changing-width rejection remains intact.
+  - Exhaustion evidence: `PrimitiveEvaluator._step_fn` catches policy
+    `StopIteration`, marks active envs truncated so the official `record_fn`
+    writes the result JSON and flushes the video writer; no further actions
+    are synthesized. Each entry writes a `*_receipt_<rollout>.json` from
+    `bound_receipt()`, including the exhaustion notice.
+  - BASE embodiment restored: the MotionGenerator loads all official
+    embodiments, with only DEFAULT overridden by the peer chest yaml. A new
+    `_navigate_base` segment plans the holonomic base through the official
+    BASE embodiment (`base_footprint_link_name` target) and executes it
+    BEFORE the arm/chest DEFAULT plan. The two are sequential segments, not a
+    synchronous full-body plan; clock/frame0/science gates are unchanged.
+    If the BASE profile is absent the base branch still fails closed.
+  - `py_compile`, `bash -n` and AST-isolated resolution pass. **No new
+    physical step, plan, video or business PASS.** Passes are judged only from
+    real video/plan evidence; segment 2 native23 and segment 3 remain
+    unimplemented and unverified.
 
 ## Open items (not yet verified)
 

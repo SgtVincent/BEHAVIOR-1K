@@ -245,7 +245,14 @@ class LiveTargetDiagnosticPolicy(LocalPolicy):
             "scientific_pass": False,
             "replay_pass": False,
             "frame0_pass": False,
-            "note": "Synthetic live small-offset target; no source episode, anchor or frame0 restore.",
+            "grip_mode": "hold_current_finger_qpos",
+            "grip_physical_range_unverified": True,
+            "grip_metre_width_claim": False,
+            "note": (
+                "Synthetic live small-offset target; no source episode, anchor or frame0 restore. "
+                "Grip joints are held at their current finger qpos through the official plan; "
+                "no new grip target is issued. Finger qpos is NOT a verified physical metre width."
+            ),
         }
         self.reset()
 
@@ -257,6 +264,10 @@ class LiveTargetDiagnosticPolicy(LocalPolicy):
 
     def _build_diagnostic_row(self):
         robot = self.primitives.robot
+        # Hold the current finger qpos as the grip reference. These slot values
+        # populate the execution23 grip channels so the unchanged-grip guard
+        # passes; they are a qpos hold reference, NOT a physical metre-width
+        # command, and the metre range is unverified (see receipt flags).
         widths = []
         for arm in ("left", "right"):
             measured = robot.get_joint_positions()[robot.gripper_control_idx[arm]]
@@ -314,4 +325,20 @@ class PrimitiveEvaluator(BatchedEvaluator):
             raise ValueError("This baseline slice requires one logical environment")
         robot = self.instance_eval_states[0].env_accessor.robot
         return instantiate(self.cfg.model, env=self.env, robot=robot)
+
+    def _step_fn(self, active_env_indices):
+        """Catch policy input exhaustion so the official record_fn still runs:
+        the active env is marked truncated, the result JSON is written and the
+        video writer flushed by the upstream loop. No further actions are
+        synthesized; already taken steps remain the only evidence.
+        """
+        try:
+            return super()._step_fn(active_env_indices)
+        except StopIteration as exc:
+            terminated = th.zeros(self.num_envs, dtype=th.bool)
+            truncated = th.zeros(self.num_envs, dtype=th.bool)
+            for idx in active_env_indices:
+                truncated[idx] = True
+            self._exhaustion_notice = str(exc)
+            return terminated, truncated
 

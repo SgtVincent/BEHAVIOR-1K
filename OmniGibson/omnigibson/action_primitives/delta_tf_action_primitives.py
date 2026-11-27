@@ -178,15 +178,24 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         if any(link not in robot.links for link in self.tool_links.values()):
             raise ValueError("All tool links must be present in the live robot")
         self._enable_head_tracking = False
-        peer_profile, self._curobo_profile_receipt = _build_peer_curobo_profile(
-            robot, self.tool_links["chest"]
-        )
+        peer_profile, profile_receipt = _build_peer_curobo_profile(robot, self.tool_links["chest"])
+        official_paths = robot.curobo_path
+        if isinstance(official_paths, dict):
+            cfg_paths = dict(official_paths)
+        else:
+            cfg_paths = {CuRoboEmbodimentSelection.DEFAULT: official_paths}
+        # The peer yaml overrides DEFAULT only; BASE/ARM keep their official
+        # upstream profiles so the base channel can plan through the official
+        # BASE embodiment as a separate sequential segment.
+        cfg_paths[CuRoboEmbodimentSelection.DEFAULT] = peer_profile
         self._motion_generator = CuRoboMotionGenerator(
             robot,
-            robot_cfg_path={CuRoboEmbodimentSelection.DEFAULT: peer_profile},
-            use_default_embodiment_only=True,
+            robot_cfg_path=cfg_paths,
+            use_default_embodiment_only=False,
             batch_size=batch_size,
         )
+        profile_receipt["embodiments"] = sorted(str(k) for k in cfg_paths.keys())
+        self._curobo_profile_receipt = profile_receipt
         self._emb = CuRoboEmbodimentSelection.DEFAULT
         if self._emb not in self._motion_generator.mg:
             available = sorted(str(k) for k in self._motion_generator.mg.keys())
@@ -211,6 +220,61 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         }
         self.decoder = DeltaTFDecoder(anchors, self.representation)
 
+    def _navigate_base(self, displacement):
+        """Plan and execute the holonomic base through the official BASE
+        embodiment, mirroring upstream ``_navigate_to_pose``.
+
+        This is a standalone base segment executed before the arm/chest plan;
+        the two are not a synchronous full-body trajectory. The body-relative
+        ``displacement`` (dx, dy, dyaw) is rotated into the world frame from
+        the current base yaw. Raises if the BASE embodiment profile is absent
+        or the planner rejects the target; the base channel is never dropped
+        or threshold-loosened.
+        """
+        if CuRoboEmbodimentSelection.BASE not in self._motion_generator.mg:
+            raise NotImplementedError(
+                "Moving-base requires the official BASE cuRobo embodiment; absent in this profile"
+            )
+        base_pos, base_quat = self.robot.links[self.robot.base_footprint_link_name].get_position_orientation()
+        yaw = T.quat2euler(base_quat)[2]
+        cos, sin = th.cos(yaw), th.sin(yaw)
+        dx, dy, dyaw = displacement
+        world_x = (base_pos[0] + cos * dx - sin * dy).item()
+        world_y = (base_pos[1] + sin * dx + cos * dy).item()
+        world_yaw = (yaw + dyaw).item()
+
+        pose_3d = self._get_robot_pose_from_2d_pose((world_x, world_y, world_yaw))
+        target_pos = {self.robot.base_footprint_link_name: pose_3d[0]}
+        target_quat = {self.robot.base_footprint_link_name: pose_3d[1]}
+        target_pos = {
+            k: th.stack([v for _ in range(self._motion_generator.batch_size)])
+            for k, v in target_pos.items()
+        }
+        target_quat = {
+            k: th.stack([v for _ in range(self._motion_generator.batch_size)])
+            for k, v in target_quat.items()
+        }
+        success, paths = self._motion_generator.compute_trajectories(
+            target_pos=target_pos,
+            target_quat=target_quat,
+            is_local=False,
+            ik_only=False,
+            ik_world_collision_check=True,
+            skip_obstacle_update=False,
+            emb_sel=CuRoboEmbodimentSelection.BASE,
+        )
+        ok = th.where(success)[0]
+        if len(ok) == 0:
+            raise ActionPrimitiveError(
+                ActionPrimitiveError.Reason.PLANNING_ERROR, "Official cuRobo BASE rejected the base target"
+            )
+        q = self._motion_generator.path_to_joint_trajectory(
+            paths[int(ok[0])], get_full_js=True, emb_sel=CuRoboEmbodimentSelection.BASE
+        ).cpu()
+        if q.ndim != 2 or len(q) == 0 or not th.isfinite(q).all():
+            raise ValueError("Official BASE planner returned an invalid trajectory")
+        yield from self._execute_motion_plan(q, ignore_physics=False, ignore_failure=False)
+
     def apply(self, action):
         return self.apply_ref(DeltaTFAction.MOVE, action)
 
@@ -220,12 +284,12 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         if self.decoder is None:
             raise ValueError("Bind run/chunk anchors explicitly after the initial state is restored")
         decoded = self.decoder.decode(row)
-        # Reject unsupported motion before spending time constructing a plan.
-        # These channels must participate in collision planning, not be patched
-        # onto a trajectory afterwards. This first slice intentionally handles
-        # fixed-base, unchanged-gripper targets only.
-        if th.any(decoded["base_displacement"].abs() > 1e-7):
-            raise NotImplementedError("Moving-base delta TF requires an upstream multi-link base target binding")
+        # Base motion plans through the official BASE embodiment as a separate
+        # sequential segment BEFORE the arm/chest plan; it is not a synchronous
+        # full-body plan. Original clock / frame0 / science gates are unchanged.
+        base_disp = decoded["base_displacement"]
+        if th.any(base_disp.abs() > 1e-7):
+            yield from self._navigate_base(base_disp)
         for i, arm in enumerate(("left", "right")):
             measured = self.robot.get_joint_positions()[self.robot.gripper_control_idx[arm]]
             if not th.allclose(measured, decoded["gripper_widths"][i].expand_as(measured), atol=1e-4):

@@ -149,6 +149,12 @@ def main() -> None:
                 video_fps=args.video_fps,
             )
             results.extend(rollout_results.values())
+            if hasattr(evaluator.policy, "bound_receipt"):
+                receipt = evaluator.policy.bound_receipt()
+                receipt["exhaustion_notice"] = getattr(evaluator, "_exhaustion_notice", None)
+                receipt_path = os.path.join(json_dir, f"{args.task_name}_receipt_{rollout_id}.json")
+                with open(receipt_path, "w", encoding="utf-8") as f:
+                    json.dump(receipt, f, indent=2, default=float)
 
     n = len(results)
     n_success = sum(r["success"] for r in results)
