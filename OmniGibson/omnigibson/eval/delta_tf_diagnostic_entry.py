@@ -25,7 +25,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from omnigibson.eval.delta_tf_policy import PrimitiveEvaluator
+from omnigibson.eval.delta_tf_policy import PrimitiveEvaluator, persist_run_failure
 from omnigibson.eval.delta_tf_replay_entry import _assert_baseline_worktree
 from omnigibson.eval.evaluator import resolve_instance_ids
 from omnigibson.eval.utils.eval_utils import DEFAULT_EVAL_SEED, seed_everything
@@ -140,14 +140,21 @@ def main() -> None:
     results = []
     with PrimitiveEvaluator(cfg) as evaluator:
         for rollout_id in range(args.num_rollouts):
-            rollout_results = evaluator.run(
-                [int(i) for i in instance_ids],
-                write_video=args.write_video,
-                video_path=video_dir,
-                metrics_dir=json_dir,
-                rollout_id=rollout_id,
-                video_fps=args.video_fps,
-            )
+            try:
+                rollout_results = evaluator.run(
+                    [int(i) for i in instance_ids],
+                    write_video=args.write_video,
+                    video_path=video_dir,
+                    metrics_dir=json_dir,
+                    rollout_id=rollout_id,
+                    video_fps=args.video_fps,
+                )
+            except Exception as exc:
+                # Persist receipt + failure JSON and flush any open video writer,
+                # then re-raise: the error is not swallowed and no action/step
+                # is synthesized.
+                persist_run_failure(evaluator, json_dir, args.task_name, rollout_id, exc)
+                raise
             results.extend(rollout_results.values())
             if hasattr(evaluator.policy, "bound_receipt"):
                 receipt = evaluator.policy.bound_receipt()

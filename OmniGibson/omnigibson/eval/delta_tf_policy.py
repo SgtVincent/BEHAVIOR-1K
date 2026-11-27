@@ -20,7 +20,9 @@ lane; they are never read through this replay policy.
 """
 import hashlib
 import json
+import os
 import pathlib
+import traceback
 
 import numpy as np
 import torch as th
@@ -45,6 +47,49 @@ def _sha256_file(path: pathlib.Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def persist_run_failure(evaluator, json_dir, task_name, rollout_id, exc):
+    """Persist a pre-completion failure without swallowing it.
+
+    Writes the policy bound receipt and a failure JSON, and flushes/closes any
+    already-open official video writer through the evaluator's official setter.
+    The caller re-raises the exception: no action is synthesized, no step is
+    invented, and the failure is not reported as success.
+    """
+    flushed = False
+    for state in getattr(evaluator, "instance_eval_states", []):
+        if getattr(state, "video_writer", None) is not None:
+            evaluator._set_video_writer(state, None)
+            flushed = True
+    failure = {
+        "task": task_name,
+        "rollout_id": rollout_id,
+        "failed": True,
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        "traceback": traceback.format_exc(),
+        "trials_recorded": getattr(evaluator, "n_trials", 0),
+        "plan_succeeded": False,
+        "command_issued": False,
+        "physics_step": False,
+        "video_flushed": flushed,
+    }
+    policy = getattr(evaluator, "policy", None)
+    receipt = None
+    if policy is not None and hasattr(policy, "bound_receipt"):
+        receipt = policy.bound_receipt()
+        receipt["exhaustion_notice"] = getattr(evaluator, "_exhaustion_notice", None)
+        receipt["failure"] = failure
+    if json_dir is not None:
+        failure_path = os.path.join(json_dir, f"{task_name}_failure_{rollout_id}.json")
+        with open(failure_path, "w", encoding="utf-8") as f:
+            json.dump(failure, f, indent=2, default=float)
+        if receipt is not None:
+            receipt_path = os.path.join(json_dir, f"{task_name}_receipt_{rollout_id}.json")
+            with open(receipt_path, "w", encoding="utf-8") as f:
+                json.dump(receipt, f, indent=2, default=float)
+    return failure
 
 
 class DeltaTFReplayPolicy(LocalPolicy):

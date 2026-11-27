@@ -236,6 +236,24 @@ challenge-observation-compliant model benchmarks.
     physical step, plan, video or business PASS.** Passes are judged only from
     real video/plan evidence; segment 2 native23 and segment 3 remain
     unimplemented and unverified.
+- Round 2026-11-27 (round 7, trace 308 real-error fix, local Mac CPU only):
+  - 308 first forward crashed in upstream `update_obstacles` at the 2026
+    `GeomPrim.get_world_scale()` AttributeError before any plan/command/step,
+    with no result JSON and no MP4. Peer `_PeerCuRoboMotionGenerator`
+    subclasses the official generator and overrides only mesh scale extraction:
+    full world affine from the official `scaled_transform`
+    (`usd_utils.get_world_pose_with_scale`, parent chain included), per-axis
+    scale from the linear block with reflection sign preserved. The obstacle
+    body mirrors baseline `bd049de`; no upstream file edited, no global
+    monkey patch.
+  - Entry failure persistence: on a pre-completion exception,
+    `persist_run_failure` writes the bound receipt and a `*_failure_<id>.json`
+    (error type/message/traceback, trials recorded, plan/command/step/video
+    flags) and flushes any open official video writer, then the exception is
+    re-raised; no action is synthesized.
+  - 308 live limits: 28 joints finite; fingers `[0, 0.050000000745]`; base
+    output `±0.75 / ±1.0`; JointController command limits read `None`, not
+    zero-filled. Awaiting the next bounded GPU rerun for real plan/step/video.
 
 ## Open items (not yet verified)
 

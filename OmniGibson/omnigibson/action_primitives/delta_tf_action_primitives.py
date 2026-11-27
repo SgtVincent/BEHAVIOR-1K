@@ -14,6 +14,8 @@ import gymnasium as gym
 import torch as th
 import yaml
 
+import omnigibson as og
+import omnigibson.lazy as lazy
 import omnigibson.utils.transform_utils as T
 from omnigibson.action_primitives.action_primitive_set_base import (
     ActionPrimitiveError,
@@ -95,6 +97,77 @@ def _build_peer_curobo_profile(robot, chest_link):
         "profile_dir_kind": dir_kind,
     }
     return str(peer_path), receipt
+
+
+class _PeerCuRoboMotionGenerator(CuRoboMotionGenerator):
+    """Parallel MotionGenerator adapter for the 2026 GeomPrim API.
+
+    Upstream ``update_obstacles`` reads ``collision_mesh.get_world_scale()``,
+    which the 2026 ``GeomPrim`` no longer exposes (trace 308: AttributeError at
+    curobo.py:305). This subclass keeps the official obstacle-world / robot
+    world flow and only replaces the mesh scale extraction: the full world affine
+    (parent chain included) is read through the official
+    ``usd_utils.get_world_pose_with_scale`` via ``XFormPrim.scaled_transform``,
+    and the per-axis world scale is recovered from its linear block.
+
+    No shared upstream file is edited, and there is no global monkey patch. The
+    obstacle body mirrors the upstream baseline ``bd049de`` method; if an
+    upstream bugfix lands, this parallel adapter is superseded by it.
+    """
+
+    @staticmethod
+    def _world_mesh_scale(collision_mesh):
+        affine = th.as_tensor(
+            collision_mesh.scaled_transform, dtype=th.float32
+        ).detach().cpu()
+        linear = affine[:3, :3]
+        # Column norms are the local-axis scale magnitudes after the world
+        # rotation; preserve a reflected handedness by flipping one axis sign.
+        scale = th.linalg.norm(linear, dim=0)
+        if th.linalg.det(linear).item() < 0:
+            scale = scale.clone()
+            scale[0] = -scale[0]
+        return scale
+
+    def update_obstacles(self, ignore_objects=None):
+        obstacles = {"cuboid": None, "sphere": None, "mesh": [], "cylinder": None, "capsule": None}
+        robot_transform = T.pose_inv(T.pose2mat(self.robot.root_link.get_position_orientation()))
+
+        if og.sim.floor_plane is not None:
+            prim = og.sim.floor_plane.prim.GetChildren()[0]
+            m = lazy.curobo.util.usd_helper.get_mesh_attrs(
+                prim, cache=self.usd_help._xform_cache, transform=robot_transform.numpy()
+            )
+            obstacles["mesh"].append(m)
+
+        for obj in self.robot.scene.objects:
+            if obj == self.robot:
+                continue
+            if obj.visual_only:
+                continue
+            if ignore_objects is not None and obj in ignore_objects:
+                continue
+            for link in obj.links.values():
+                for collision_mesh in link.collision_meshes.values():
+                    assert (
+                        collision_mesh.geom_type == "Mesh"
+                    ), f"collision_mesh {collision_mesh.prim_path} is not a mesh, but a {collision_mesh.geom_type}"
+                    obj_pose = T.pose2mat(collision_mesh.get_position_orientation())
+                    pose = robot_transform @ obj_pose
+                    pos, orn = T.mat2pose(pose)
+                    orn = orn[[3, 0, 1, 2]]
+                    m = lazy.curobo.geom.types.Mesh(
+                        name=collision_mesh.prim_path,
+                        pose=th.cat([pos, orn]).tolist(),
+                        vertices=collision_mesh.points.numpy(),
+                        faces=collision_mesh.faces.numpy(),
+                        scale=self._world_mesh_scale(collision_mesh).numpy(),
+                    )
+                    obstacles["mesh"].append(m)
+
+        world = lazy.curobo.geom.types.WorldConfig(**obstacles)
+        world = world.get_collision_check_world()
+        self.mg[CuRoboEmbodimentSelection.DEFAULT].update_world(world)
 
 
 class DeltaTFDecoder:
@@ -188,7 +261,7 @@ class DeltaTFActionPrimitives(StarterSemanticActionPrimitives):
         # upstream profiles so the base channel can plan through the official
         # BASE embodiment as a separate sequential segment.
         cfg_paths[CuRoboEmbodimentSelection.DEFAULT] = peer_profile
-        self._motion_generator = CuRoboMotionGenerator(
+        self._motion_generator = _PeerCuRoboMotionGenerator(
             robot,
             robot_cfg_path=cfg_paths,
             use_default_embodiment_only=False,
