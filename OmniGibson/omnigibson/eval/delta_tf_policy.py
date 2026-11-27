@@ -39,6 +39,12 @@ from omnigibson.eval.policies import LocalPolicy
 SAVED_SCHEMA = "brvla_saved_execution23_v1"
 SAVED_REPRESENTATION = "pairwise_delta"
 ACTION23 = 23
+# Control loop runs at the sim-step frequency; physics substeps run faster.
+# This slice observes control rounds and policy actions only; it does not count
+# cumulative physics substeps, so physical_steps is reported null rather than
+# inferred from the control counter.
+CONTROL_HZ = 30
+PHYSICS_HZ = 120
 
 
 def _sha256_file(path: pathlib.Path) -> str:
@@ -67,7 +73,7 @@ def persist_run_failure(evaluator, json_dir, task_name, rollout_id, exc):
     if policy is not None and hasattr(policy, "bound_receipt"):
         receipt = policy.bound_receipt()
         receipt["exhaustion_notice"] = getattr(evaluator, "_exhaustion_notice", None)
-    steps_taken = getattr(evaluator, "_steps_taken", 0)
+    control_steps = getattr(evaluator, "_control_steps", 0)
     trials_recorded = getattr(evaluator, "n_trials", 0)
     plans_attempted = receipt.get("plans_attempted", 0) if receipt else 0
     plans_succeeded = receipt.get("plans_succeeded", 0) if receipt else 0
@@ -80,14 +86,20 @@ def persist_run_failure(evaluator, json_dir, task_name, rollout_id, exc):
         "error_message": str(exc),
         "traceback": traceback.format_exc(),
         "trials_recorded": trials_recorded,
-        "steps_taken": steps_taken,
+        # One control step = one successful evaluator `_step_fn` round, i.e. one
+        # `env.step` call with one policy action. Physics substeps run at
+        # PHYSICS_HZ inside that call and are not counted here.
+        "control_steps": control_steps,
+        "physical_steps": None,
+        "control_hz": CONTROL_HZ,
+        "physics_hz": PHYSICS_HZ,
         "plans_attempted": plans_attempted,
         "plans_succeeded": plans_succeeded,
         "commands_issued": commands_issued,
         # Booleans are derived from the real counters above, not assumed False.
         "plan_succeeded": plans_succeeded > 0,
         "command_issued": commands_issued > 0,
-        "physics_step": steps_taken > 0,
+        "env_step_applied": control_steps > 0,
         "video_flushed": flushed,
     }
     if receipt is not None:
@@ -407,6 +419,6 @@ class PrimitiveEvaluator(BatchedEvaluator):
                 truncated[idx] = True
             self._exhaustion_notice = str(exc)
             return terminated, truncated
-        self._steps_taken = getattr(self, "_steps_taken", 0) + 1
+        self._control_steps = getattr(self, "_control_steps", 0) + 1
         return terminated, truncated
 
