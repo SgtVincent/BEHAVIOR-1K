@@ -33,6 +33,13 @@ from omnigibson.eval.policies import WebsocketPolicy
 # ---- frozen wire contract (read from the retained original bridge sources) --
 
 ACTION23 = 23
+# Live r1/r1pro controller width from readback 303: 25 action channels over the
+# controller order base, trunk, arm_left, gripper_left, arm_right, gripper_right.
+# The frozen 23-wide row is NOT isomorphic to this 25-dim controller vector; the
+# seam must build the 25-dim vector through an explicit per-Controller DOF map
+# (official q_to_action, live base/gripper indices), with both grip fingers
+# mapped for real and no padding.
+CONTROLLER_ACTION_DIM = 25
 LEGACY_PROPRIO_WIDTH = 256
 POST1_PROPRIO_WIDTH = 61
 
@@ -207,10 +214,15 @@ class CheckpointWsPolicy(WebsocketPolicy):
     # -- evaluator policy interface ------------------------------------------
 
     def set_action_dim(self, action_dim: Optional[int]) -> None:
+        # The frozen wire row is 23-wide; the live controller is 25-dim. They are
+        # not isomorphic, so binding against the 25-dim evaluator waits for the
+        # explicit 23->25 DOF map seam. Until then a mismatched width fails
+        # closed rather than padding or re-labeling the row.
         if action_dim is not None and int(action_dim) != ACTION23:
             raise CheckpointWsContractError(
-                f"evaluator action_dim={action_dim} != frozen {ACTION23}; "
-                "refuse to construct a mismatched policy"
+                f"evaluator action_dim={action_dim} != frozen row width "
+                f"{ACTION23}; controller width is {CONTROLLER_ACTION_DIM} and the "
+                "explicit DOF map seam is absent; refuse to construct"
             )
         self._eval_action_dim = None if action_dim is None else int(action_dim)
 
@@ -440,6 +452,9 @@ class CheckpointWsPolicy(WebsocketPolicy):
         return [float(v) for v in row], shape
 
     def _validate_native(self, native: Any) -> List[float]:
+        # Validates the pre-map native23 row only. The later seam must expose a
+        # separate 25-dim controller vector built by the explicit DOF map; the
+        # 23 row must not be padded or presented as the 25 controller command.
         label = getattr(native, "label", None)
         if label is not None and label != JOINT_NATIVE23:
             raise CheckpointActionBlocked(

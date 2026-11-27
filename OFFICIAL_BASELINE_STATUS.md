@@ -251,9 +251,10 @@ challenge-observation-compliant model benchmarks.
 - Gripper qpos vs metre-width unit contract is unverified against a real
   controller; the unchanged-gripper guard may need a controller-command-level
   comparison.
-- Input exhaustion / planner failure currently propagates as an uncaught
-  exception through the official loop; no diagnostic result JSON is recorded
-  yet. This must not be reported as task success.
+- Input exhaustion: round 6 `PrimitiveEvaluator._step_fn` catches policy
+  `StopIteration` and marks the env truncated so the official `record_fn`
+  writes the result JSON and flushes the video; planner failure still propagates
+  and must not be reported as task success.
 - Original checkpoint model inference, source/frame0 identity, moving-base /
   gripper phases, held-object planning, action-clock preservation and the
   three-can termination remain open.
@@ -286,6 +287,30 @@ challenge-observation-compliant model benchmarks.
   - The original server must be launched from its unchanged serving directory
     with the original checkpoint, stats and preprocessing; this client slice
     does not start or reload that server.
+
+## Segment contract guardrails (fixed 2026-11-27, post round 6 handoff)
+
+These are fail-closed boundaries for later bounded work after the first real
+trace; they do not change the source clock, source data, frame0 or tracking
+gates.
+
+- Moving-base anchor rebinding: after a base segment, arm anchors must be
+  re-bound through the official inverse transform so the original pairwise
+  `same_anchor_cumulative` replay physical targets are preserved. The current
+  base-relative anchor approximation after a base move is a known gap and must
+  not be counted as a business pass. This rebind is a bounded fix after the
+  first trace; source clock and chunk/anchor ordering are unchanged.
+- Segment ② action conversion: a legacy 23-wide row reaches the live 25-dim
+  controller only through an explicit per-Controller DOF map built on the
+  official `q_to_action` and the live controller order/base/gripper indices
+  from readback 303. Both grip fingers are mapped for real; no padding, no
+  zero-filled DOF slots in place of a mapping. The old native23 vector is NOT
+  isomorphic to the current 25-action controller vector and must not be
+  labeled as such; any gap in the DOF map fails closed before `env.step`.
+- Segment ③ Agent service: the repro backend stays the retained
+  `fake_rule_service_not_llm` deterministic rule service. Do not swap to a
+  real LLM endpoint; the receipt records the rule-service mode honestly, and
+  real-LLM status remains unverified.
 
 ## Minimal real-GPU entry plan (not executed locally)
 
